@@ -1,0 +1,52 @@
+{
+  "compilerOptions": {
+    "target": "ES2017",
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "noImplicitAny": false,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "react-jsx",
+    "incremental": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "paths": {
+      "@/*": [
+        "./src/*"
+      ],
+      "@najiki/payments/*": ["./apps/payments/*"],
+      "@najiki/messaging/*": ["./apps/messaging/*"],
+      "@najiki/notifications/*": ["./apps/notifications/*"],
+      "@najiki/dashboard/*": ["./apps/dashboard/*"],
+      "@najiki/ui/*": ["./packages/ui/*"],
+      "@najiki/database/*": ["./packages/database/*"],
+      "@najiki/auth/*": ["./packages/auth/*"],
+      "@najiki/shared/*": ["./packages/shared/*"],
+      "@najiki/types/*": ["./packages/types/*"],
+      "@najiki/sdk/*": ["./packages/sdk/*"]
+    }
+  },
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    ".next/types/**/*.ts",
+    ".next/dev/types/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}

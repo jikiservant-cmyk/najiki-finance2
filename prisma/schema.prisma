@@ -1,0 +1,203 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+  schemas   = ["public"]
+}
+
+model Application {
+  id                String   @id @default(cuid())
+  code              String   @unique
+  name              String
+  baseUrl           String   @map("base_url")
+  webhookPath       String   @map("webhook_path") @default("/api/internal/payment-completed")
+  internalSecretRef String   @map("internal_secret_ref")
+  apiKey            String?  @unique @map("api_key")
+  isActive          Boolean  @map("is_active") @default(true)
+  createdAt         DateTime @map("created_at") @default(now())
+  updatedAt         DateTime @map("updated_at") @updatedAt
+
+  tenants               Tenant[]
+  paymentTypes          PaymentType[]
+  paymentIntents        PaymentIntent[]
+  internalNotifications InternalNotification[]
+
+  @@map("applications")
+  @@schema("public")
+}
+
+model Provider {
+  id             String   @id @default(cuid())
+  code           String   @unique
+  name           String
+  credentialsRef String   @map("credentials_ref")
+  isActive       Boolean  @map("is_active") @default(true)
+  createdAt      DateTime @map("created_at") @default(now())
+  updatedAt      DateTime @map("updated_at") @updatedAt
+
+  tenants        Tenant[]
+  paymentIntents PaymentIntent[]
+  webhookLogs    WebhookLog[]
+
+  @@map("providers")
+  @@schema("public")
+}
+
+model Tenant {
+  id                String      @id @default(cuid())
+  applicationId     String      @map("application_id")
+  application       Application @relation(fields: [applicationId], references: [id])
+  code              String
+  name              String
+  defaultProviderId String?     @map("default_provider_id")
+  defaultProvider   Provider?   @relation(fields: [defaultProviderId], references: [id])
+  isActive          Boolean     @map("is_active") @default(true)
+  createdAt         DateTime    @map("created_at") @default(now())
+  updatedAt         DateTime    @map("updated_at") @updatedAt
+
+  paymentIntents PaymentIntent[]
+
+  @@unique([applicationId, code])
+  @@map("tenants")
+  @@schema("public")
+}
+
+model PaymentType {
+  id            String      @id @default(cuid())
+  applicationId String      @map("application_id")
+  application   Application @relation(fields: [applicationId], references: [id])
+  code          String
+  description   String?
+  createdAt     DateTime    @map("created_at") @default(now())
+
+  paymentIntents PaymentIntent[]
+
+  @@unique([applicationId, code])
+  @@map("payment_types")
+  @@schema("public")
+}
+
+model PaymentIntent {
+  id            String       @id @default(cuid())
+  applicationId String       @map("application_id")
+  application   Application  @relation(fields: [applicationId], references: [id])
+  tenantId      String?      @map("tenant_id")
+  tenant        Tenant?      @relation(fields: [tenantId], references: [id])
+  paymentTypeId String?      @map("payment_type_id")
+  paymentType   PaymentType? @relation(fields: [paymentTypeId], references: [id])
+
+  externalEntityId String? @map("external_entity_id")
+  reference        String  @unique
+  idempotencyKey   String  @map("idempotency_key") @unique
+
+  amount      Decimal @db.Decimal(14, 2)
+  currency    String  @default("UGX")
+  phoneNumber String? @map("phone_number")
+
+  providerId        String   @map("provider_id")
+  provider          Provider @relation(fields: [providerId], references: [id])
+  providerPaymentId String?  @map("provider_payment_id")
+
+  status        String  @default("pending")
+  metadata      String  @default("{}")
+  failureReason String? @map("failure_reason")
+
+  createdAt   DateTime  @map("created_at") @default(now())
+  updatedAt   DateTime  @map("updated_at") @updatedAt
+  completedAt DateTime? @map("completed_at")
+
+  transactions          PaymentTransaction[]
+  webhookLogs           WebhookLog[]
+  internalNotifications InternalNotification[]
+
+  @@index([applicationId])
+  @@index([tenantId])
+  @@index([status])
+  @@index([createdAt])
+  @@index([providerPaymentId])
+  // FIX: composite index speeds up dashboard per-app, per-status queries 
+  @@index([applicationId, status, createdAt])
+  @@map("payment_intents")
+  @@schema("public")
+}
+
+model PaymentTransaction {
+  id                  String        @id @default(cuid())
+  paymentIntentId     String        @map("payment_intent_id")
+  paymentIntent       PaymentIntent @relation(fields: [paymentIntentId], references: [id])
+  status              String
+  rawProviderResponse String?       @map("raw_provider_response")
+  note                String?
+  createdAt           DateTime      @map("created_at") @default(now())    
+
+  @@index([paymentIntentId])
+  @@index([createdAt])
+  @@map("payment_transactions")
+  @@schema("public")
+}
+
+model WebhookLog {
+  id              String         @id @default(cuid())
+  providerId      String         @map("provider_id")
+  provider        Provider       @relation(fields: [providerId], references: [id])
+  paymentIntentId String?        @map("payment_intent_id")
+  paymentIntent   PaymentIntent? @relation(fields: [paymentIntentId], references: [id])
+
+  payload       String
+  headers       String?
+  // FIX: SHA-256(provider+signature+body) — unique key for idempotency dedup
+  // Prevents duplicate processing when LivePay retries a webhook
+  signatureHash   String?  @unique @map("signature_hash")
+  signatureValid  Boolean  @map("signature_valid")
+  processed       Boolean  @default(false)
+  processingError String?  @map("processing_error")
+  createdAt       DateTime @map("created_at") @default(now())
+
+  @@index([providerId])
+  @@index([paymentIntentId])
+  @@index([createdAt])
+  @@map("webhook_logs")
+  @@schema("public")
+}
+
+model InternalNotification {
+  id               String   @id @default(cuid())
+  paymentIntentId  String   @map("payment_intent_id")
+  paymentIntent    PaymentIntent @relation(fields: [paymentIntentId], references: [id])
+  applicationId    String   @map("application_id")
+  application      Application @relation(fields: [applicationId], references: [id])
+
+  url              String
+  payload          String
+
+  status           String   @default("pending")
+  attemptCount     Int      @map("attempt_count") @default(0)
+  maxAttempts      Int      @map("max_attempts") @default(5)
+
+  lastAttemptAt    DateTime? @map("last_attempt_at")
+  nextRetryAt      DateTime? @map("next_retry_at")
+  lastResponseStatus Int?  @map("last_response_status")
+  lastResponseBody  String?  @map("last_response_body")
+
+  createdAt        DateTime @map("created_at") @default(now())
+  updatedAt        DateTime @map("updated_at") @updatedAt
+
+  @@index([paymentIntentId])
+  @@index([status, nextRetryAt])
+  @@map("internal_notifications")
+  @@schema("public")
+}
+
+model AdminProfile {
+  id               String   @id
+  role             String   @default("super_admin")
+  createdAt        DateTime @map("created_at") @default(now())
+  updatedAt        DateTime @map("updated_at") @updatedAt
+
+  @@map("admin_profiles")
+  @@schema("public")
+}
