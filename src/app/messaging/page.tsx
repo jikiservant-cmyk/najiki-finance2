@@ -100,38 +100,11 @@ export default function MessagingDashboard() {
   const [data, setData] = useState<MessagingDashboardData | null>(null)
   const [loading, setLoading] = useState(true)
 
-  // MOCK DATA for Interface building
-  useEffect(() => {
-    setTimeout(() => {
-      setData({
-        totalSent: 12450,
-        totalCost: 373500,
-        statusCounts: { delivered: 11800, pending: 350, failed: 100, queued: 200 },
-        deliveryRate: '98.5',
-        appUsage: [
-          { code: 'school', name: 'School Fees App', count: 8500, cost: 255000 },
-          { code: 'sacco', name: 'Sacco Connect', count: 2100, cost: 63000 },
-          { code: 'church', name: 'Church Tithes', count: 1850, cost: 55500 },
-        ],
-        providerUsage: [
-          { code: 'africastalking', name: "Africa's Talking", count: 11000, cost: 330000 },
-          { code: 'twilio', name: 'Twilio (WhatsApp)', count: 1450, cost: 43500 },
-        ],
-        dailyVolume: Array.from({ length: 14 }).map((_, i) => ({
-          date: new Date(Date.now() - (13 - i) * 86400000).toISOString(),
-          volume: Math.floor(Math.random() * 1500) + 500,
-          failed: Math.floor(Math.random() * 50)
-        })),
-        recentMessages: [
-          { id: '1', reference: 'MSG-001', application: 'School Fees App', applicationCode: 'school', recipient: '+256770000001', status: 'delivered', providerCode: 'africastalking', createdAt: new Date(Date.now() - 10000).toISOString(), cost: 30 },
-          { id: '2', reference: 'MSG-002', application: 'Sacco Connect', applicationCode: 'sacco', recipient: '+256780000002', status: 'queued', providerCode: 'africastalking', createdAt: new Date(Date.now() - 45000).toISOString(), cost: 30 },
-          { id: '3', reference: 'MSG-003', application: 'School Fees App', applicationCode: 'school', recipient: '+256750000003', status: 'failed', providerCode: 'twilio', createdAt: new Date(Date.now() - 120000).toISOString(), cost: 50 },
-          { id: '4', reference: 'MSG-004', application: 'Church Tithes', applicationCode: 'church', recipient: '+256700000004', status: 'delivered', providerCode: 'africastalking', createdAt: new Date(Date.now() - 360000).toISOString(), cost: 30 },
-        ]
-      })
-      setLoading(false)
-    }, 1000)
+  const refresh = useCallback(async () => {
+    fetch('/api/messaging/dashboard').then(r => r.json()).then(d => { setData(d); setLoading(false) }).catch(() => setLoading(false))
   }, [])
+
+  useEffect(() => { refresh() }, [refresh])
 
   const safeData = data || {
     totalSent: 0,

@@ -16,7 +16,6 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "Na'jiki Tech — Payment Dashboard",
   description: "Na'jiki Tech payment service dashboard for SACCO, Church, and School platforms. Track revenue, transactions, and webhooks across all applications.",
-  keywords: ["Na'jiki Tech", "payment service", "fintech", "SACCO", "church", "school", "LivePay", "dashboard", "East Africa"],
   icons: {
     icon: "/logo.svg",
   },
@@ -33,7 +32,7 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground`}
       >
         {children}
-        <Toaster />
+        
       </body>
     </html>
   );
