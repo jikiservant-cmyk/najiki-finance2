@@ -143,6 +143,10 @@ export async function POST(request: Request) {
       },
     })
 
+    const host = request.headers.get('host') || 'localhost:3000'
+    const protocol = request.headers.get('x-forwarded-proto') || 'https'
+    const appBaseUrl = `${protocol}://${host}`
+
     const providerClient = getPaymentProvider(provider.code)
     const providerResponse = await providerClient.initiatePayment({
       amount: validatedBody.amount,
@@ -151,6 +155,7 @@ export async function POST(request: Request) {
       reference,
       description: `Payment for ${validatedBody.paymentTypeCode ?? 'payment'}`,
       metadata: { ...(validatedBody.metadata ?? {}), paymentIntentId: paymentIntent.id },
+      webhookUrl: `${appBaseUrl}/api/webhooks/${provider.code.toLowerCase()}`,
     })
 
     const [updatedIntent] = await db.$transaction([

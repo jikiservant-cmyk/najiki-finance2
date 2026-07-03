@@ -53,7 +53,8 @@ export async function POST(
     const isValidSignature = await providerClient.validateWebhookSignature(
       rawBody,
       signature,
-      Object.fromEntries(request.headers.entries())
+      Object.fromEntries(request.headers.entries()),
+      request.url
     )
 
     // Log receipt even for invalid signatures (audit trail)

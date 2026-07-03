@@ -32,6 +32,7 @@ export class LivePayProvider implements PaymentProvider {
         currency: params.currency || 'UGX',
         reference: params.reference,
         description: params.description || 'Payment',
+        webhookUrl: params.webhookUrl || `${process.env.NEXTAUTH_URL || 'http://localhost:3000'}/api/webhooks/livepay`,
       }
 
       const response = await fetch(`${this.baseUrl}/api/collect-money`, {
@@ -82,7 +83,8 @@ export class LivePayProvider implements PaymentProvider {
   async validateWebhookSignature(
     payload: string,
     signatureHeader: string,
-    headers?: Record<string, string>
+    headers?: Record<string, string>,
+    requestUrl?: string
   ): Promise<boolean> {
     try {
       if (!headers || !headers['x-webhook-signature']) {
@@ -102,8 +104,9 @@ export class LivePayProvider implements PaymentProvider {
       }
 
       const sortedKeys = Object.keys(params).sort()
-      const webhookUrl = process.env.NEXTAUTH_URL || 'http://localhost:3000'
-      let stringToSign = `${webhookUrl}/api/webhooks/livepay${timestamp}`
+      // Use the actual request URL if provided, otherwise fallback to NEXTAUTH_URL
+      const webhookUrl = requestUrl || `${process.env.NEXTAUTH_URL || 'http://localhost:3000'}/api/webhooks/livepay`
+      let stringToSign = `${webhookUrl}${timestamp}`
 
       for (const key of sortedKeys) {
         stringToSign += `${key}${params[key]}`
@@ -121,19 +124,23 @@ export class LivePayProvider implements PaymentProvider {
   }
 
   async parseWebhookPayload(payload: any): Promise<ParsedWebhook> {
-    const statusMap: Record<string, any> = {
-      'Success': 'success',
-      'Failed': 'failed',
+    const statusString = String(payload.status || '').toLowerCase()
+    
+    let status: ParsedWebhook['status'] = 'pending'
+    if (statusString === 'success' || statusString === 'successful') {
+      status = 'success'
+    } else if (statusString === 'failed' || statusString === 'failure') {
+      status = 'failed'
     }
 
     return {
       reference: payload.customer_reference,
       providerPaymentId: payload.internal_reference,
-      status: statusMap[payload.status] || 'pending',
+      status,
       amount: payload.amount,
       currency: payload.currency,
       metadata: payload,
-      failureReason: payload.status === 'Failed' ? 'Payment failed' : undefined,
+      failureReason: status === 'failed' ? 'Payment failed' : undefined,
     }
   }
 }

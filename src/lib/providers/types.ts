@@ -12,7 +12,7 @@ export interface PaymentProvider {
   checkPaymentStatus?(providerPaymentId: string): Promise<PaymentStatusResponse>
 
   // Validate webhook signature
-  validateWebhookSignature(payload: string, signature: string, headers?: Record<string, string>): Promise<boolean>
+  validateWebhookSignature(payload: string, signature: string, headers?: Record<string, string>, requestUrl?: string): Promise<boolean>
 
   // Parse webhook payload into standard format
   parseWebhookPayload(payload: any): Promise<ParsedWebhook>
@@ -25,6 +25,7 @@ export interface InitiatePaymentParams {
   reference: string
   description?: string
   metadata?: Record<string, any>
+  webhookUrl?: string
 }
 
 export interface InitiatePaymentResponse {
