@@ -50,11 +50,16 @@ export async function POST(
       return NextResponse.json({ error: 'Provider not active' }, { status: 404 })
     }
 
+    const host = request.headers.get('x-forwarded-host') || request.headers.get('host') || 'localhost:3000'
+    const protocol = request.headers.get('x-forwarded-proto') || 'https'
+    const pathname = new URL(request.url).pathname
+    const publicUrl = `${protocol}://${host}${pathname}`
+
     const isValidSignature = await providerClient.validateWebhookSignature(
       rawBody,
       signature,
       Object.fromEntries(request.headers.entries()),
-      request.url
+      publicUrl
     )
 
     // Log receipt even for invalid signatures (audit trail)

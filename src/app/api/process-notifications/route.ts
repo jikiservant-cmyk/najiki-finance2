@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import { createHmac } from 'crypto'
 
 export async function POST() {
   try {
@@ -25,8 +26,12 @@ export async function POST() {
           headers: {
             'Content-Type': 'application/json',
             'X-Najiki-Notification': 'true',
+            ...(notification.application.apiKey && {
+              'X-Najiki-Signature': createHmac('sha256', notification.application.apiKey).update(notification.payload).digest('hex'),
+              'Authorization': `Bearer ${notification.application.apiKey}`,
+            }),
           },
-          body: JSON.stringify(notification.payload),
+          body: notification.payload,
         })
 
         if (response.ok) {

@@ -9,6 +9,7 @@
 
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import { createHmac } from 'crypto'
 
 const BATCH = 50
 const BACKOFF = [1, 2, 5, 15, 30] // minutes between retries (exponential-ish)
@@ -45,6 +46,10 @@ export async function POST(request: Request) {
           headers: {
             'Content-Type': 'application/json',
             'X-Notification-Attempt': String(notif.attemptCount + 1),
+            ...(notif.application.apiKey && {
+              'X-Najiki-Signature': createHmac('sha256', notif.application.apiKey).update(notif.payload).digest('hex'),
+              'Authorization': `Bearer ${notif.application.apiKey}`,
+            }),
           },
           body: notif.payload,
           signal: controller.signal,
