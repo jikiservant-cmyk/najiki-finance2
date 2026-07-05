@@ -158,6 +158,7 @@ export async function POST(request: Request) {
     const host = request.headers.get('x-forwarded-host') || request.headers.get('host') || 'localhost:3000'
     const protocol = request.headers.get('x-forwarded-proto') || 'https'
     const appBaseUrl = process.env.NEXTAUTH_URL || `${protocol}://${host}`
+    const webhookUrl = `${appBaseUrl}/api/webhooks/${provider.code.toLowerCase()}`
 
     const providerClient = getPaymentProvider(provider.code)
     const providerResponse = await providerClient.initiatePayment({
@@ -167,7 +168,7 @@ export async function POST(request: Request) {
       reference,
       description: `Payment for ${validatedBody.paymentTypeCode ?? 'payment'}`,
       metadata: { ...(validatedBody.metadata ?? {}), paymentIntentId: paymentIntent.id },
-      webhookUrl: `${appBaseUrl}/api/webhooks/${provider.code.toLowerCase()}`,
+      webhookUrl,
     })
 
     const [updatedIntent] = await db.$transaction([
@@ -185,7 +186,7 @@ export async function POST(request: Request) {
           paymentIntentId: paymentIntent.id,
           status: providerResponse.status,
           rawProviderResponse: JSON.stringify(providerResponse),
-          note: 'PAYMENT_INITIATED',
+          note: `PAYMENT_INITIATED | Webhook URL: ${webhookUrl}`,
         },
       }),
     ])

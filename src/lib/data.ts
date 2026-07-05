@@ -340,8 +340,17 @@ export async function createWebhookLog(data: {
     throw new Error(`No provider found for webhook: ${data.provider}`)
   }
 
-  return db.webhookLog.create({
-    data: {
+  // Use upsert to gracefully handle retries of the same webhook delivery
+  return db.webhookLog.upsert({
+    where: { signatureHash: data.signatureHash },
+    update: {
+      payload: data.payload,
+      headers: JSON.stringify({ signature: data.signature, eventType: data.eventType }),
+      signatureValid: data.verified,
+      processed: data.processed,
+      providerId: provider.id,
+    },
+    create: {
       payload: data.payload,
       headers: JSON.stringify({ signature: data.signature, eventType: data.eventType }),
       signatureHash: data.signatureHash,
