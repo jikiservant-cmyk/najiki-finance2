@@ -155,9 +155,9 @@ export async function POST(request: Request) {
       },
     })
 
-    const host = request.headers.get('host') || 'localhost:3000'
+    const host = request.headers.get('x-forwarded-host') || request.headers.get('host') || 'localhost:3000'
     const protocol = request.headers.get('x-forwarded-proto') || 'https'
-    const appBaseUrl = `${protocol}://${host}`
+    const appBaseUrl = process.env.NEXTAUTH_URL || `${protocol}://${host}`
 
     const providerClient = getPaymentProvider(provider.code)
     const providerResponse = await providerClient.initiatePayment({
