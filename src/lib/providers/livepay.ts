@@ -87,38 +87,96 @@ export class LivePayProvider implements PaymentProvider {
     requestUrl?: string
   ): Promise<boolean> {
     try {
-      if (!headers || !headers['x-webhook-signature']) {
+      let sigValue = signatureHeader
+      if (!sigValue && headers) {
+        // Fallback to checking headers case-insensitively
+        const keys = Object.keys(headers)
+        const foundKey = keys.find(k => k.toLowerCase() === 'x-webhook-signature' || k.toLowerCase() === 'signature')
+        if (foundKey) {
+          sigValue = headers[foundKey]
+        }
+      }
+
+      if (!sigValue) {
+        console.warn('[LivePay] Webhook signature verification skipped: signature is missing')
         return false
       }
 
-      const signatureHeaderValue = headers['x-webhook-signature']
-      const [timestampPart, signaturePart] = signatureHeaderValue.split(',')
-      const timestamp = timestampPart.split('=')[1]
-      const receivedSignature = signaturePart.split('=')[1]
+      const parts = sigValue.split(',')
+      const timestampPart = parts.find(p => p.trim().startsWith('t='))
+      const signaturePart = parts.find(p => p.trim().startsWith('v='))
+
+      if (!timestampPart || !signaturePart) {
+        console.warn('[LivePay] Webhook signature verification failed: invalid signature format', sigValue)
+        return false
+      }
+
+      const timestamp = timestampPart.split('=')[1]?.trim()
+      const receivedSignature = signaturePart.split('=')[1]?.trim()
+
+      if (!timestamp || !receivedSignature) {
+        console.warn('[LivePay] Webhook signature verification failed: missing timestamp or signature value')
+        return false
+      }
 
       const webhookPayload = JSON.parse(payload)
       const params = {
-        status: webhookPayload.status,
-        customer_reference: webhookPayload.customer_reference,
-        internal_reference: webhookPayload.internal_reference,
+        status: webhookPayload.status || '',
+        customer_reference: webhookPayload.customer_reference || '',
+        internal_reference: webhookPayload.internal_reference || '',
       }
 
-      const sortedKeys = Object.keys(params).sort()
-      // Use the actual request URL if provided, otherwise fallback to NEXTAUTH_URL
-      const webhookUrl = requestUrl || `${process.env.NEXTAUTH_URL || 'http://localhost:3000'}/api/webhooks/livepay`
-      let stringToSign = `${webhookUrl}${timestamp}`
+      const sortedKeys = Object.keys(params).sort() as Array<keyof typeof params>
+      
+      // Determine possible webhook URLs to support dynamic local, preview, and production environments
+      const possibleWebhookUrls: string[] = []
+      
+      if (requestUrl) {
+        possibleWebhookUrls.push(requestUrl)
+        if (requestUrl.endsWith('/')) {
+          possibleWebhookUrls.push(requestUrl.slice(0, -1))
+        } else {
+          possibleWebhookUrls.push(requestUrl + '/')
+        }
+      }
+      
+      const nextAuthUrl = process.env.NEXTAUTH_URL
+      if (nextAuthUrl) {
+        const fallbackUrl = `${nextAuthUrl.replace(/\/$/, '')}/api/webhooks/livepay`
+        possibleWebhookUrls.push(fallbackUrl)
+        possibleWebhookUrls.push(`${fallbackUrl}/`)
+      }
+      
+      possibleWebhookUrls.push('https://ais-dev-euerua7hv3ffzjninpghye-159837012533.europe-west3.run.app/api/webhooks/livepay')
+      possibleWebhookUrls.push('https://ais-pre-euerua7hv3ffzjninpghye-159837012533.europe-west3.run.app/api/webhooks/livepay')
+      possibleWebhookUrls.push('http://localhost:3000/api/webhooks/livepay')
 
-      for (const key of sortedKeys) {
-        stringToSign += `${key}${params[key]}`
+      const uniqueUrls = Array.from(new Set(possibleWebhookUrls))
+
+      for (const webhookUrl of uniqueUrls) {
+        let stringToSign = `${webhookUrl}${timestamp}`
+        for (const key of sortedKeys) {
+          stringToSign += `${key}${params[key]}`
+        }
+
+        const expectedSignature = crypto
+          .createHmac('sha256', this.webhookSecret || '')
+          .update(stringToSign)
+          .digest('hex')
+
+        if (receivedSignature === expectedSignature) {
+          return true
+        }
       }
 
-      const expectedSignature = crypto
-        .createHmac('sha256', this.webhookSecret)
-        .update(stringToSign)
-        .digest('hex')
-
-      return receivedSignature === expectedSignature
-    } catch {
+      console.error(
+        `[LivePay] Webhook signature verification failed. Tried URLs:`, uniqueUrls,
+        `Payload:`, payload,
+        `Expected signature with secret length ${this.webhookSecret?.length || 0} did not match received ${receivedSignature}`
+      )
+      return false
+    } catch (err) {
+      console.error('[LivePay] Webhook signature verification failed with error:', err)
       return false
     }
   }
