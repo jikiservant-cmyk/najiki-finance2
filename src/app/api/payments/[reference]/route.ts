@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import { getPaymentProvider } from '@/lib/providers'
 
 export async function GET(
   request: Request,
@@ -41,10 +42,86 @@ export async function GET(
       return NextResponse.json({ error: 'Payment not found' }, { status: 404 })
     }
 
+    let currentStatus = paymentIntent.status
+    let currentFailureReason = paymentIntent.failureReason
+    let completedAt = paymentIntent.completedAt
+
+    // If still processing, see if we should poll the provider (max once every 15s)
+    if (paymentIntent.status === 'processing' && paymentIntent.provider?.code) {
+      const secondsSinceUpdate = (Date.now() - paymentIntent.updatedAt.getTime()) / 1000
+      
+      if (secondsSinceUpdate > 15) {
+        try {
+          const providerClient = getPaymentProvider(paymentIntent.provider.code)
+          if (providerClient.checkPaymentStatus) {
+            const statusResult = await providerClient.checkPaymentStatus(
+              paymentIntent.reference,
+              paymentIntent.currency,
+              paymentIntent.providerPaymentId || undefined
+            )
+
+            // If status changed to success or failed, update the DB
+            if (statusResult.status !== 'pending' && statusResult.status !== 'processing') {
+              const updatedIntent = await db.paymentIntent.update({
+                where: { id: paymentIntent.id },
+                data: {
+                  status: statusResult.status,
+                  failureReason: statusResult.failureReason || null,
+                  completedAt: statusResult.status === 'success' ? new Date() : null,
+                }
+              })
+              
+              await db.paymentTransaction.create({
+                data: {
+                  paymentIntentId: paymentIntent.id,
+                  status: statusResult.status,
+                  rawProviderResponse: JSON.stringify(statusResult),
+                  note: 'STATUS_SYNC_FROM_API',
+                }
+              })
+
+              await db.internalNotification.create({
+                data: {
+                  paymentIntentId: paymentIntent.id,
+                  applicationId: application.id,
+                  url: `${application.baseUrl}${application.webhookPath}`,
+                  payload: JSON.stringify({
+                    paymentIntentId: paymentIntent.id,
+                    reference: paymentIntent.reference,
+                    status: statusResult.status,
+                    amount: paymentIntent.amount,
+                    currency: paymentIntent.currency,
+                    providerPaymentId: statusResult.providerPaymentId || paymentIntent.providerPaymentId,
+                    failureReason: statusResult.failureReason,
+                  }),
+                  status: 'pending',
+                  attemptCount: 0,
+                  maxAttempts: 5,
+                  nextRetryAt: new Date(),
+                },
+              })
+
+              currentStatus = updatedIntent.status
+              currentFailureReason = updatedIntent.failureReason
+              completedAt = updatedIntent.completedAt
+            } else {
+               // Just touch updatedAt to reset the 15s throttle
+               await db.paymentIntent.update({
+                 where: { id: paymentIntent.id },
+                 data: { updatedAt: new Date() }
+               })
+            }
+          }
+        } catch (pollError) {
+          console.error('[Payment API] Error polling provider status:', pollError)
+        }
+      }
+    }
+
     return NextResponse.json({
       id:               paymentIntent.id,
       reference:        paymentIntent.reference,
-      status:           paymentIntent.status,
+      status:           currentStatus,
       amount:           Number(paymentIntent.amount), // Decimal → number for JSON
       currency:         paymentIntent.currency,
       phoneNumber:      paymentIntent.phoneNumber,
@@ -54,10 +131,10 @@ export async function GET(
       application:      paymentIntent.application,
       tenant:           paymentIntent.tenant,
       paymentType:      paymentIntent.paymentType,
-      failureReason:    paymentIntent.failureReason,
+      failureReason:    currentFailureReason,
       createdAt:        paymentIntent.createdAt,
       updatedAt:        paymentIntent.updatedAt,
-      completedAt:      paymentIntent.completedAt,
+      completedAt:      completedAt,
     })
   } catch (error) {
     console.error('Get payment error:', error)

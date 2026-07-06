@@ -9,7 +9,7 @@ export interface PaymentProvider {
   initiatePayment(params: InitiatePaymentParams): Promise<InitiatePaymentResponse>
 
   // Check payment status (optional, but some providers require it)
-  checkPaymentStatus?(providerPaymentId: string): Promise<PaymentStatusResponse>
+  checkPaymentStatus?(reference: string, currency?: string, providerPaymentId?: string): Promise<PaymentStatusResponse>
 
   // Validate webhook signature
   validateWebhookSignature(payload: string, signature: string, headers?: Record<string, string>, requestUrl?: string): Promise<boolean>

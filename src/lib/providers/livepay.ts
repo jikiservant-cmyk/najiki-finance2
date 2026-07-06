@@ -69,14 +69,54 @@ export class LivePayProvider implements PaymentProvider {
     }
   }
 
-  async checkPaymentStatus(providerPaymentId: string): Promise<PaymentStatusResponse> {
-    // LivePay doesn't have a documented status check endpoint, so we'll rely on webhooks
-    return {
-      success: true,
-      status: 'pending',
-      amount: 0,
-      currency: 'UGX',
-      providerPaymentId,
+  async checkPaymentStatus(reference: string, currency: string = 'UGX', providerPaymentId?: string): Promise<PaymentStatusResponse> {
+    try {
+      const url = new URL(`${this.baseUrl}/api/transaction-status`)
+      url.searchParams.append('accountNumber', this.accountNo)
+      url.searchParams.append('currency', currency)
+      url.searchParams.append('reference', reference)
+
+      const response = await fetch(url.toString(), {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.apiKey}`,
+        },
+      })
+
+      const data = await response.json()
+
+      if (response.ok && data.success) {
+        const statusString = String(data.status || '').toLowerCase()
+        let status: PaymentStatusResponse['status'] = 'pending'
+
+        if (statusString === 'success' || statusString === 'completed') {
+          status = 'success'
+        } else if (statusString === 'failed' || statusString === 'failure') {
+          status = 'failed'
+        }
+
+        return {
+          success: true,
+          status,
+          amount: data.amount,
+          currency: data.currency || currency,
+          providerPaymentId: data.internal_reference || providerPaymentId,
+        }
+      }
+
+      return {
+        success: false,
+        status: 'failed',
+        failureReason: data.message || 'Status check failed',
+      }
+    } catch (error) {
+      console.error('[LivePay] Error checking payment status:', error)
+      return {
+        success: false,
+        status: 'pending',
+        failureReason: error instanceof Error ? error.message : 'Unknown error',
+      }
     }
   }
 
