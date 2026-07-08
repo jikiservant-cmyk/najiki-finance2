@@ -106,7 +106,7 @@ export async function POST(request: Request) {
               currency: payment.currency,
               providerPaymentId: body.provider_reference ?? null,
               externalEntityId: payment.externalEntityId,
-              metadata: payment.metadata ? JSON.parse(JSON.stringify(payment.metadata)) : {},
+              metadata: (() => { try { return payment.metadata ? JSON.parse(payment.metadata) : {}; } catch(e) { return {}; } })(),
             }),
             status: 'pending',
             attemptCount: 0,

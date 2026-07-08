@@ -87,7 +87,7 @@ export async function POST(request: Request) {
                 providerPaymentId: statusResult.providerPaymentId || paymentIntent.providerPaymentId,
                 failureReason: statusResult.failureReason,
                 externalEntityId: paymentIntent.externalEntityId,
-                metadata: paymentIntent.metadata ? JSON.parse(JSON.stringify(paymentIntent.metadata)) : {},
+                metadata: (() => { try { return paymentIntent.metadata ? JSON.parse(paymentIntent.metadata) : {}; } catch(e) { return {}; } })(),
               }),
               status: 'pending',
               attemptCount: 0,

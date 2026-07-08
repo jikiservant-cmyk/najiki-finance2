@@ -185,7 +185,7 @@ export async function POST(
               providerPaymentId: parsedWebhook.providerPaymentId,
               failureReason: parsedWebhook.failureReason,
               externalEntityId: fullPaymentIntent.externalEntityId,
-              metadata: fullPaymentIntent.metadata ? JSON.parse(JSON.stringify(fullPaymentIntent.metadata)) : {},
+              metadata: (() => { try { return fullPaymentIntent.metadata ? JSON.parse(fullPaymentIntent.metadata) : {}; } catch(e) { return {}; } })(),
             }),
             status: 'pending',
             attemptCount: 0,
