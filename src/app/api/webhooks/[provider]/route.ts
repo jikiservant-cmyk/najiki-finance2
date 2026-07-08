@@ -184,6 +184,8 @@ export async function POST(
               currency: parsedWebhook.currency || paymentIntent.currency,
               providerPaymentId: parsedWebhook.providerPaymentId,
               failureReason: parsedWebhook.failureReason,
+              externalEntityId: fullPaymentIntent.externalEntityId,
+              metadata: fullPaymentIntent.metadata ? JSON.parse(JSON.stringify(fullPaymentIntent.metadata)) : {},
             }),
             status: 'pending',
             attemptCount: 0,
