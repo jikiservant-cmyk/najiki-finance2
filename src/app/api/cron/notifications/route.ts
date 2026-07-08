@@ -105,3 +105,6 @@ async function fail(
     },
   })
 }
+
+export const GET = POST
+
