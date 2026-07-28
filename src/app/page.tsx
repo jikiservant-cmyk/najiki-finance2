@@ -85,14 +85,14 @@ function BarChart({ data, maxVal, color, failData }: { data: number[]; maxVal: n
   const safeFailData = Array.isArray(failData) ? failData : []
   return (
     <div className="space-y-1">
-      <div className="flex items-end gap-1.5 h-24">
+      <div className="flex items-end gap-[1px] h-24 overflow-hidden">
         {safeData.map((v, i) => (
           <motion.div
             key={i}
             initial={{ height: 0 }}
             animate={{ height: `${Math.max(3, (v / maxVal) * 100)}%` }}
             transition={{ delay: 0.8 + i * 0.03, duration: 0.6, ease: [0.22, 1, 0.36, 1] }}
-            className="flex-1 min-w-[4px] rounded-t-md cursor-pointer transition-all"
+            className="flex-1 min-w-[1px] rounded-t-sm cursor-pointer transition-all"
             style={{ backgroundColor: v > 0 ? color : 'oklch(0.23 0.04 260)' }}
             onMouseEnter={() => setHoveredBar(i)}
             onMouseLeave={() => setHoveredBar(null)}
@@ -101,7 +101,7 @@ function BarChart({ data, maxVal, color, failData }: { data: number[]; maxVal: n
               <motion.div
                 initial={{ opacity: 0, y: 5 }}
                 animate={{ opacity: 1, y: 0 }}
-                className="relative -top-8 left-1/2 -translate-x-1/2 bg-card border border-border px-2 py-1 rounded text-[9px] font-mono text-foreground whitespace-nowrap"
+                className="relative -top-8 left-1/2 -translate-x-1/2 bg-card border border-border px-2 py-1 rounded text-[9px] font-mono text-foreground whitespace-nowrap z-10"
               >
                 {fmt(v)}
               </motion.div>
@@ -110,14 +110,14 @@ function BarChart({ data, maxVal, color, failData }: { data: number[]; maxVal: n
         ))}
       </div>
       {safeFailData && safeFailData.length > 0 && (
-        <div className="flex items-end gap-1.5 h-8">
+        <div className="flex items-end gap-[1px] h-8 overflow-hidden">
           {safeFailData.map((v, i) => (
             <motion.div
               key={i}
               initial={{ height: 0 }}
               animate={{ height: `${Math.max(v > 0 ? 15 : 0, (v / maxVal) * 100)}%` }}
               transition={{ delay: 1 + i * 0.03, duration: 0.5 }}
-              className="flex-1 min-w-[4px] rounded-t-sm"
+              className="flex-1 min-w-[1px] rounded-t-sm"
               style={{ backgroundColor: v > 0 ? '#f87171' : 'transparent' }}
             />
           ))}
@@ -130,12 +130,16 @@ function BarChart({ data, maxVal, color, failData }: { data: number[]; maxVal: n
 export default function HomePage() {
   const [data, setData] = useState<DashboardData | null>(null)
   const [loading, setLoading] = useState(true)
+  const [period, setPeriod] = useState('14d')
 
   const refresh = useCallback(async () => {
-    fetch('/api/dashboard').then(r => r.json()).then(d => { setData(d); setLoading(false) }).catch(() => setLoading(false))
-  }, [])
+    fetch(`/api/dashboard?period=${period}`).then(r => r.json()).then(d => { setData(d); setLoading(false) }).catch(() => setLoading(false))
+  }, [period])
 
-  useEffect(() => { refresh() }, [refresh])
+  useEffect(() => { 
+    setLoading(true)
+    refresh() 
+  }, [refresh, period])
 
   const { events, connected } = useRealtimeDashboard(refresh)
 
@@ -199,6 +203,17 @@ export default function HomePage() {
             >
               <p className="text-sm text-muted-foreground">Payment Service — multi-app, multi-tenant, multi-provider</p>
               <div className="flex items-center gap-3">
+                <select 
+                  value={period} 
+                  onChange={(e) => setPeriod(e.target.value)}
+                  className="bg-card border border-border/50 text-xs text-foreground px-2 py-1 rounded-md outline-none focus:border-primary/50"
+                >
+                  <option value="14d">Last 14 Days</option>
+                  <option value="1m">Last 1 Month</option>
+                  <option value="3m">Last 3 Months</option>
+                  <option value="1y">Last 1 Year</option>
+                  <option value="all">All Time</option>
+                </select>
                 {/* Realtime Connection Status */}
                 <div className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium ${
                   connected ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/20' : 'bg-red-500/15 text-red-400 border border-red-500/20'
@@ -357,7 +372,7 @@ export default function HomePage() {
             {/* Daily revenue + Provider */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
               <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 3.2 }} className="stat-card p-4 md:p-6 bg-card border border-border/50 rounded-xl">
-                <span className="text-[10px] font-mono tracking-[0.2em] text-muted-foreground uppercase block mb-4">Daily Revenue — 14 Days</span>
+                <span className="text-[10px] font-mono tracking-[0.2em] text-muted-foreground uppercase block mb-4">Daily Revenue</span>
                 <BarChart 
                   data={(Array.isArray(safeData.dailyRevenue) ? safeData.dailyRevenue : []).map(d => d.revenue)} 
                   maxVal={maxDaily} 
@@ -365,7 +380,7 @@ export default function HomePage() {
                   failData={(Array.isArray(safeData.dailyRevenue) ? safeData.dailyRevenue : []).map(d => d.failed)} 
                 />
                 <div className="flex justify-between mt-2">
-                  <span className="text-[10px] font-mono text-muted-foreground">14 days ago</span>
+                  <span className="text-[10px] font-mono text-muted-foreground">Past</span>
                   <span className="text-[10px] font-mono text-muted-foreground">Today</span>
                 </div>
               </motion.div>

@@ -30,7 +30,6 @@ export const CreatePaymentRequestSchema = z.object({
   amount: z.number().positive(),
   currency: z.string().length(3).default("UGX"),
 
-  // Required for mobile money providers to actually push the prompt.
   // Loose validation here (provider-specific formatting happens in the
   // gateway adapter, not at this boundary).
   phoneNumber: z.string().min(9).max(15),

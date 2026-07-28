@@ -11,6 +11,7 @@ import { db } from '@/lib/db'
 import { getPaymentProvider, getAvailableProviders } from '@/lib/providers'
 import { createWebhookLog, getPaymentByReference } from '@/lib/data'
 import { PrismaClient } from '@prisma/client'
+import { inngest } from '@/lib/inngest/client'
 
 export async function POST(
   request: Request,
@@ -201,6 +202,27 @@ export async function POST(
         data: { paymentIntentId: paymentIntent.id, processed: true },
       })
     })
+
+    // Emit the payment completed event to Inngest for asynchronous webhook and notification dispatch
+    if (normalizedStatus === 'success' || normalizedStatus === 'failed') {
+      await inngest.send({
+        name: 'payment.completed',
+        data: {
+          paymentIntentId: paymentIntent.id,
+          reference: paymentIntent.reference,
+          status: normalizedStatus,
+          amount: Number(parsedWebhook.amount || paymentIntent.amount),
+          currency: parsedWebhook.currency || paymentIntent.currency,
+          providerPaymentId: parsedWebhook.providerPaymentId,
+          failureReason: parsedWebhook.failureReason,
+          applicationId: fullPaymentIntent.applicationId,
+          webhookUrl: `${fullPaymentIntent.application.baseUrl}${fullPaymentIntent.application.webhookPath}`,
+          apiKey: fullPaymentIntent.application.apiKey,
+          externalEntityId: fullPaymentIntent.externalEntityId,
+          metadata: (() => { try { return fullPaymentIntent.metadata ? JSON.parse(fullPaymentIntent.metadata) : {}; } catch(e) { return {}; } })(),
+        }
+      })
+    }
 
     return NextResponse.json({ success: true })
   } catch (error) {

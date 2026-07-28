@@ -1,0 +1,15 @@
+[
+  {
+    "id": "sms_r771nrvgd",
+    "reference": "MSG-19F7B06F10A-BQL",
+    "recipient": "+1234567890",
+    "message": "Test SMS",
+    "status": "queued",
+    "applicationId": "cmqqq0fyy0005uugwc5986acz",
+    "applicationCode": "church",
+    "providerCode": "africastalking",
+    "cost": 50,
+    "createdAt": "2026-07-19T15:38:00.330Z",
+    "updatedAt": "2026-07-19T15:38:00.330Z"
+  }
+]

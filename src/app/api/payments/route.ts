@@ -11,6 +11,7 @@ import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
 import { createPaymentTransaction } from '@/lib/data'
 import { CreatePaymentRequestSchema } from '@/lib/schemas'
+import { inngest } from '@/lib/inngest/client'
 
 // Token bucket — 20 requests per IP per minute
 const buckets = new Map<string, { tokens: number; last: number }>()
@@ -160,46 +161,32 @@ export async function POST(request: Request) {
     const appBaseUrl = process.env.NEXTAUTH_URL || `${protocol}://${host}`
     const webhookUrl = `${appBaseUrl}/api/webhooks/${provider.code.toLowerCase()}`
 
-    const providerClient = getPaymentProvider(provider.code)
-    const providerResponse = await providerClient.initiatePayment({
-      amount: validatedBody.amount,
-      currency: validatedBody.currency,
-      phoneNumber: validatedBody.phoneNumber,
-      reference,
-      description: `Payment for ${validatedBody.paymentTypeCode ?? 'payment'}`,
-      metadata: { ...(validatedBody.metadata ?? {}), paymentIntentId: paymentIntent.id },
-      webhookUrl,
+    // Emit the payment requested event to Inngest to handle asynchronously
+    await inngest.send({
+      name: 'payment.requested',
+      data: {
+        paymentIntentId: paymentIntent.id,
+        amount: Number(validatedBody.amount),
+        currency: validatedBody.currency,
+        phoneNumber: validatedBody.phoneNumber,
+        reference,
+        providerCode: provider.code,
+        description: rawBody.description || `Payment for ${validatedBody.paymentTypeCode ?? 'payment'}`,
+        metadata: { ...(validatedBody.metadata ?? {}), paymentIntentId: paymentIntent.id },
+        webhookUrl,
+      }
     })
-
-    const [updatedIntent] = await db.$transaction([
-      db.paymentIntent.update({
-        where: { id: paymentIntent.id },
-        data: {
-          status: providerResponse.status,
-          providerPaymentId: providerResponse.providerPaymentId,
-          failureReason: providerResponse.failureReason,
-          completedAt: providerResponse.status === 'success' ? new Date() : null,
-        },
-      }),
-      db.paymentTransaction.create({
-        data: {
-          paymentIntentId: paymentIntent.id,
-          status: providerResponse.status,
-          rawProviderResponse: JSON.stringify(providerResponse),
-          note: `PAYMENT_INITIATED | Webhook URL: ${webhookUrl}`,
-        },
-      }),
-    ])
 
     return NextResponse.json({
-      paymentId: updatedIntent.id,
-      reference: updatedIntent.reference,
-      status: updatedIntent.status,
-    })
-  } catch (error) {
+      paymentId: paymentIntent.id,
+      reference: paymentIntent.reference,
+      status: 'pending',
+    }, { status: 202 })
+  } catch (error: any) {
     console.error('Create payment error:', error)
-    if (error instanceof Error && error.name === 'ZodError') {
-      return NextResponse.json({ error: 'Validation failed' }, { status: 400 })
+    if (error && (error.name === 'ZodError' || Array.isArray(error.issues))) {
+      const details = (error.issues || []).map((i: any) => `${i.path.join('.') || 'body'}: ${i.message}`)
+      return NextResponse.json({ error: 'Validation failed', details }, { status: 400 })
     }
     return NextResponse.json(
       { error: error instanceof Error ? error.message : 'Internal server error' },

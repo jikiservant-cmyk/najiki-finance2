@@ -9,7 +9,31 @@ import { db } from './db'
 
 // ─── DASHBOARD ────────────────────────────────────────────────────────────────
 
-export async function getDashboardData() {
+export async function getDashboardData(period: string = '14d') {
+  let dateFilter: Date | undefined = undefined;
+  const now = new Date();
+  let intervalStr = "14 days";
+  
+  if (period === '14d') {
+    dateFilter = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+    intervalStr = "14 days";
+  } else if (period === '1m') {
+    dateFilter = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    intervalStr = "30 days";
+  } else if (period === '3m') {
+    dateFilter = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+    intervalStr = "90 days";
+  } else if (period === '1y') {
+    dateFilter = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
+    intervalStr = "365 days";
+  } else if (period === 'all') {
+    dateFilter = undefined;
+    intervalStr = "100 years";
+  }
+
+  const baseWhere = dateFilter ? { createdAt: { gte: dateFilter } } : {};
+  const successWhere = { status: 'success', ...baseWhere };
+
   const [
     totalPayments,
     totalRevenueData,
@@ -23,33 +47,35 @@ export async function getDashboardData() {
     // FIX 1: one SQL query with GROUP BY DATE replaces the 28-query JS for-loop
     dailyRevenueRaw,
   ] = await Promise.all([
-    db.paymentIntent.count(),
+    db.paymentIntent.count({ where: baseWhere }),
 
     db.paymentIntent.aggregate({
-      where: { status: 'success' },
+      where: successWhere,
       _sum: { amount: true },
     }),
 
     db.paymentIntent.groupBy({
       by: ['status'],
+      where: baseWhere,
       _count: true,
     }),
 
     db.paymentIntent.groupBy({
       by: ['applicationId'],
-      where: { status: 'success' },
+      where: successWhere,
       _sum: { amount: true },
       _count: true,
     }),
 
     db.paymentIntent.groupBy({
       by: ['providerId'],
-      where: { status: 'success' },
+      where: successWhere,
       _sum: { amount: true },
       _count: true,
     }),
 
     db.paymentIntent.findMany({
+      where: baseWhere,
       include: {
         application: true,
         tenant: true,
@@ -62,35 +88,35 @@ export async function getDashboardData() {
 
     db.internalNotification.groupBy({
       by: ['status'],
+      where: baseWhere,
       _count: true,
     }),
 
     db.paymentIntent.groupBy({
       by: ['tenantId', 'applicationId'],
-      where: { status: 'success', tenantId: { not: null } },
+      where: { ...successWhere, tenantId: { not: null } },
       _sum: { amount: true },
       _count: true,
     }),
 
     db.paymentIntent.groupBy({
       by: ['applicationId', 'status'],
+      where: baseWhere,
       _count: true,
     }),
 
     // FIX 1: single raw SQL query — DB does the date bucketing and summing
-    // replaces: for (let d = 13; d >= 0; d--) { await Promise.all([aggregate, count]) }
-    // which fired 14 × 2 = 28 sequential round-trips per dashboard load
-    db.$queryRaw<{ date: string; revenue: number; count: bigint; failed: bigint }[]>`
+    db.$queryRawUnsafe<{ date: string; revenue: number; count: bigint; failed: bigint }[]>(`
       SELECT
         TO_CHAR(DATE_TRUNC('day', COALESCE(completed_at, created_at)), 'YYYY-MM-DD') AS date,
         COALESCE(SUM(CASE WHEN status = 'success' THEN amount ELSE 0 END), 0)         AS revenue,
         COUNT(CASE WHEN status = 'success' THEN 1 END)                                AS count,
         COUNT(CASE WHEN status = 'failed'  THEN 1 END)                                AS failed
       FROM payment_intents
-      WHERE created_at >= NOW() - INTERVAL '14 days'
+      WHERE created_at >= NOW() - INTERVAL '${intervalStr}'
       GROUP BY DATE_TRUNC('day', COALESCE(completed_at, created_at))
       ORDER BY date ASC
-    `,
+    `),
   ])
 
   const totalRevenue = totalRevenueData._sum.amount || 0
