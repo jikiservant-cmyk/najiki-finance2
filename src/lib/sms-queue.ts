@@ -3,6 +3,7 @@ import { smsStore, SmsRequest } from './sms-store'
 import { sendSmsViaProvider } from './sms'
 import { db } from './db'
 import { createHmac } from 'crypto'
+import { safeFetch } from './safe-fetch'
 
 const SMS_QUEUE_KEY = 'sms:queue'
 
@@ -89,7 +90,7 @@ export const smsQueue = {
           }
 
           try {
-            await fetch(webhookUrl, {
+            await safeFetch(webhookUrl, {
               method: 'POST',
               headers,
               body: payload
@@ -130,7 +131,7 @@ export const smsQueue = {
           }
 
           try {
-            await fetch(webhookUrl, { method: 'POST', headers, body: payload })
+            await safeFetch(webhookUrl, { method: 'POST', headers, body: payload })
           } catch (webhookErr) {
             console.error(`[smsQueue] Failed to dispatch failure webhook to ${webhookUrl}:`, webhookErr)
           }

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { createHmac } from 'crypto'
+import { safeFetch } from '@/lib/safe-fetch'
 
 export async function POST() {
   try {
@@ -21,7 +22,7 @@ export async function POST() {
         console.log(`Processing notification ${notification.id} to ${notification.url}`)
 
         // Send the notification
-        const response = await fetch(notification.url, {
+        const response = await safeFetch(notification.url, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',

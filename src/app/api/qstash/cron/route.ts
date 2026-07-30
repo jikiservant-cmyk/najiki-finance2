@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
 import { inngest } from '@/lib/inngest/client'
 import { createHmac } from 'crypto'
+import { safeFetch } from '@/lib/safe-fetch'
 
 export async function POST(request: Request) {
   try {
@@ -113,7 +114,7 @@ export async function POST(request: Request) {
           headers['Authorization'] = `Bearer ${notif.application.apiKey}`
         }
 
-        const res = await fetch(notif.url, { method: 'POST', headers, body: notif.payload })
+        const res = await safeFetch(notif.url, { method: 'POST', headers, body: notif.payload })
 
         if (res.ok) {
           await db.internalNotification.update({

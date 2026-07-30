@@ -4,6 +4,7 @@ import { db } from '../db'
 import { getPaymentProvider } from '../providers'
 import { createHmac } from 'crypto'
 import { sendSmsViaProvider } from '../sms'
+import { safeFetch } from '../safe-fetch'
 
 // 1. Send SMS background job
 export const handleSmsSendRequested = inngest.createFunction(
@@ -244,7 +245,7 @@ export const handlePaymentCompleted = inngest.createFunction(
           headers['Authorization'] = `Bearer ${apiKey}`
         }
 
-        const response = await fetch(webhookUrl, {
+        const response = await safeFetch(webhookUrl, {
           method: 'POST',
           headers,
           body: payload,
