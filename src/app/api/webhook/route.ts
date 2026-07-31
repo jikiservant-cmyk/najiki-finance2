@@ -18,6 +18,7 @@ import {
   createWebhookLog,
   updateWebhookLog,
 } from '@/lib/data'
+import { enqueueWebhookNotification } from '@/lib/payments'
 
 export async function POST(request: Request) {
   try {
@@ -90,29 +91,21 @@ export async function POST(request: Request) {
         },
       })
 
-      // FIX 3: Queue InternalNotification instead of the commented-out direct fetch.
-      // The cron worker at /api/cron/notifications drains this queue with retry + backoff.
+      // FIX 3: Queue via QStash
       if (newStatus === 'success' || newStatus === 'failed') {
-        await tx.internalNotification.create({
-          data: {
-            paymentIntentId: payment.id,
-            applicationId: payment.applicationId,
-            url: `${payment.application.baseUrl}${payment.application.webhookPath}`,
-            payload: JSON.stringify({
-              paymentIntentId: payment.id,
-              reference: payment.reference,
-              status: newStatus,
-              amount: body.amount ?? payment.amount,
-              currency: payment.currency,
-              providerPaymentId: body.provider_reference ?? null,
-              externalEntityId: payment.externalEntityId,
-              metadata: (() => { try { return payment.metadata ? JSON.parse(payment.metadata) : {}; } catch(e) { return {}; } })(),
-            }),
-            status: 'pending',
-            attemptCount: 0,
-            maxAttempts: 5,
-            nextRetryAt: new Date(),
-          },
+        await enqueueWebhookNotification({
+          paymentIntentId: payment.id,
+          reference: payment.reference,
+          status: newStatus,
+          amount: body.amount ?? payment.amount,
+          currency: payment.currency,
+          providerPaymentId: body.provider_reference ?? '',
+          failureReason: undefined,
+          applicationId: payment.applicationId,
+          webhookUrl: `${payment.application.baseUrl}${payment.application.webhookPath}`,
+          apiKey: payment.application.apiKey,
+          externalEntityId: payment.externalEntityId,
+          metadata: (() => { try { return payment.metadata ? JSON.parse(payment.metadata) : {}; } catch(e) { return {}; } })(),
         })
       }
 

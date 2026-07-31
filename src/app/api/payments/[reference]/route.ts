@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
+import { enqueueWebhookNotification } from '@/lib/payments'
 
 export async function GET(
   request: Request,
@@ -80,27 +81,19 @@ export async function GET(
                 }
               })
 
-              await db.internalNotification.create({
-                data: {
-                  paymentIntentId: paymentIntent.id,
-                  applicationId: application.id,
-                  url: `${application.baseUrl}${application.webhookPath}`,
-                  payload: JSON.stringify({
-                    paymentIntentId: paymentIntent.id,
-                    reference: paymentIntent.reference,
-                    status: statusResult.status,
-                    amount: paymentIntent.amount,
-                    currency: paymentIntent.currency,
-                    providerPaymentId: statusResult.providerPaymentId || paymentIntent.providerPaymentId,
-                    failureReason: statusResult.failureReason,
-                    externalEntityId: paymentIntent.externalEntityId,
-                    metadata: (() => { try { return paymentIntent.metadata ? JSON.parse(paymentIntent.metadata) : {}; } catch(e) { return {}; } })(),
-                  }),
-                  status: 'pending',
-                  attemptCount: 0,
-                  maxAttempts: 5,
-                  nextRetryAt: new Date(),
-                },
+              await enqueueWebhookNotification({
+                paymentIntentId: paymentIntent.id,
+                reference: paymentIntent.reference,
+                status: statusResult.status,
+                amount: Number(paymentIntent.amount),
+                currency: paymentIntent.currency,
+                providerPaymentId: statusResult.providerPaymentId || paymentIntent.providerPaymentId || '',
+                failureReason: statusResult.failureReason,
+                applicationId: application.id,
+                webhookUrl: `${application.baseUrl}${application.webhookPath}`,
+                apiKey: application.apiKey,
+                externalEntityId: paymentIntent.externalEntityId,
+                metadata: (() => { try { return paymentIntent.metadata ? JSON.parse(paymentIntent.metadata) : {}; } catch(e) { return {}; } })(),
               })
 
               currentStatus = updatedIntent.status

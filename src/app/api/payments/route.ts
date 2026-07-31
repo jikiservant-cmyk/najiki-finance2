@@ -2,33 +2,25 @@
 // Without this one bad client or attacker can flood the endpoint,
 // exhaust the DB connection pool, and create thousands of pending intents.
 //
-// Using a token-bucket per IP (in-process).
-// For multi-instance: swap for Upstash Redis + @upstash/ratelimit
+// Using Upstash Redis for distributed rate limiting.
 
-import { NextResponse } from 'next/server'
+import { NextResponse, after } from 'next/server'
 import { randomBytes } from 'crypto'
 import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
 import { createPaymentTransaction } from '@/lib/data'
 import { CreatePaymentRequestSchema } from '@/lib/schemas'
-import { inngest } from '@/lib/inngest/client'
+import { processPayment } from '@/lib/payments'
+import { Ratelimit } from '@upstash/ratelimit'
+import { Redis } from '@upstash/redis'
 
-// Token bucket — 20 requests per IP per minute
-const buckets = new Map<string, { tokens: number; last: number }>()
-const RATE = 20
-const WINDOW = 60_000
-
-function isRateLimited(ip: string): boolean {
-  const now = Date.now()
-  const b = buckets.get(ip) ?? { tokens: RATE, last: now }
-  const refill = Math.floor(((now - b.last) / WINDOW) * RATE)
-  b.tokens = Math.min(RATE, b.tokens + refill)
-  b.last = now
-  if (b.tokens <= 0) { buckets.set(ip, b); return true }
-  b.tokens--
-  buckets.set(ip, b)
-  return false
-}
+// Use Upstash Redis for distributed rate limiting
+const redis = Redis.fromEnv()
+const ratelimit = new Ratelimit({
+  redis,
+  limiter: Ratelimit.slidingWindow(20, '1 m'),
+  analytics: true,
+})
 
 // FIX: crypto-random reference — replaces Date.now().slice(-6)+Math.random()*10000
 // which had collision probability under burst load (same millisecond = same prefix)
@@ -55,7 +47,8 @@ export async function POST(request: Request) {
   const ip =
     request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? 'unknown'
 
-  if (isRateLimited(ip)) {
+  const { success } = await ratelimit.limit(ip)
+  if (!success) {
     return NextResponse.json(
       { error: 'Too many requests' },
       { status: 429, headers: { 'Retry-After': '60' } }
@@ -161,10 +154,9 @@ export async function POST(request: Request) {
     const appBaseUrl = process.env.NEXTAUTH_URL || `${protocol}://${host}`
     const webhookUrl = `${appBaseUrl}/api/webhooks/${provider.code.toLowerCase()}`
 
-    // Emit the payment requested event to Inngest to handle asynchronously
-    await inngest.send({
-      name: 'payment.requested',
-      data: {
+    // Process payment in background using Next.js after()
+    after(() => {
+      processPayment({
         paymentIntentId: paymentIntent.id,
         amount: Number(validatedBody.amount),
         currency: validatedBody.currency,
@@ -174,7 +166,7 @@ export async function POST(request: Request) {
         description: rawBody.description || `Payment for ${validatedBody.paymentTypeCode ?? 'payment'}`,
         metadata: { ...(validatedBody.metadata ?? {}), paymentIntentId: paymentIntent.id },
         webhookUrl,
-      }
+      }).catch(err => console.error('Background payment processing error:', err))
     })
 
     return NextResponse.json({
