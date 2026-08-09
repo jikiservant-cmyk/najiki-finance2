@@ -53,8 +53,8 @@ export async function POST(request: Request) {
     const appCode = application?.code || 'najiki'
     const appId = application?.id || undefined
 
-    // 1. Create the SMS request in our file-based store (no schema change!)
-    const smsRequest = smsStore.create({
+    // 1. Create the SMS request in our Redis store (no schema change!)
+    const smsRequest = await smsStore.create({
       recipient: to,
       message,
       applicationCode: appCode,

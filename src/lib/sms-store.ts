@@ -1,5 +1,4 @@
-import fs from 'fs'
-import path from 'path'
+import { redis } from './redis'
 
 export interface SmsRequest {
   id: string
@@ -16,30 +15,10 @@ export interface SmsRequest {
   updatedAt: string
 }
 
-const FILE_PATH = path.join(process.cwd(), 'sms-store.json')
-
-function readStore(): SmsRequest[] {
-  try {
-    if (fs.existsSync(FILE_PATH)) {
-      const data = fs.readFileSync(FILE_PATH, 'utf-8')
-      return JSON.parse(data)
-    }
-  } catch (error) {
-    console.error('Error reading SMS store:', error)
-  }
-  return []
-}
-
-function writeStore(data: SmsRequest[]) {
-  try {
-    fs.writeFileSync(FILE_PATH, JSON.stringify(data, null, 2), 'utf-8')
-  } catch (error) {
-    console.error('Error writing SMS store:', error)
-  }
-}
+const SMS_HASH_KEY = 'sms:data'
 
 export const smsStore = {
-  create: (params: {
+  create: async (params: {
     recipient: string
     message: string
     applicationCode: string
@@ -47,7 +26,6 @@ export const smsStore = {
     cost: number
     applicationId?: string
   }) => {
-    const list = readStore()
     const item: SmsRequest = {
       id: 'sms_' + Math.random().toString(36).substring(2, 11),
       reference: 'MSG-' + Date.now().toString(16).toUpperCase() + '-' + Math.random().toString(36).substring(2, 5).toUpperCase(),
@@ -61,26 +39,35 @@ export const smsStore = {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     }
-    list.unshift(item)
-    writeStore(list)
+    await redis.hset(SMS_HASH_KEY, { [item.id]: JSON.stringify(item) })
     return item
   },
-
-  getAll: () => {
-    return readStore()
+  
+  get: async (id: string) => {
+    const data = await redis.hget(SMS_HASH_KEY, id) as string | SmsRequest | null
+    if (data) {
+      // Depending on Upstash Redis client configuration, hget might return parsed JSON or a string.
+      // We handle both just in case.
+      return typeof data === 'string' ? JSON.parse(data) as SmsRequest : data as SmsRequest
+    }
+    return null
   },
 
-  updateStatus: (id: string, status: SmsRequest['status'], failureReason?: string) => {
-    const list = readStore()
-    const index = list.findIndex(item => item.id === id)
-    if (index !== -1) {
-      list[index].status = status
-      list[index].updatedAt = new Date().toISOString()
+  getAll: async () => {
+    const data = await redis.hvals(SMS_HASH_KEY) as Array<string | SmsRequest>
+    return data.map(item => (typeof item === 'string' ? JSON.parse(item) : item))
+  },
+
+  updateStatus: async (id: string, status: SmsRequest['status'], failureReason?: string) => {
+    const item = await smsStore.get(id)
+    if (item) {
+      item.status = status
+      item.updatedAt = new Date().toISOString()
       if (failureReason) {
-        list[index].failureReason = failureReason
+        item.failureReason = failureReason
       }
-      writeStore(list)
-      return list[index]
+      await redis.hset(SMS_HASH_KEY, { [id]: JSON.stringify(item) })
+      return item
     }
     return null
   },

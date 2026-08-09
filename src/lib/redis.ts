@@ -3,6 +3,7 @@ import { Redis } from '@upstash/redis'
 // Simple in-memory fallback for local development if Upstash keys are missing
 class MockRedis {
   private store: Record<string, string[]> = {}
+  private hashStore: Record<string, Record<string, string>> = {}
 
   async lpush(key: string, ...elements: string[]): Promise<number> {
     if (!this.store[key]) {
@@ -17,6 +18,28 @@ class MockRedis {
       return null
     }
     return this.store[key].pop() as unknown as T
+  }
+
+  async hset(key: string, fieldAndValues: Record<string, any>): Promise<number> {
+    if (!this.hashStore[key]) {
+      this.hashStore[key] = {}
+    }
+    let count = 0
+    for (const [f, v] of Object.entries(fieldAndValues)) {
+      this.hashStore[key][f] = JSON.stringify(v)
+      count++
+    }
+    return count
+  }
+
+  async hget<T>(key: string, field: string): Promise<T | null> {
+    if (!this.hashStore[key] || !this.hashStore[key][field]) return null
+    return JSON.parse(this.hashStore[key][field])
+  }
+
+  async hvals<T>(key: string): Promise<T[]> {
+    if (!this.hashStore[key]) return []
+    return Object.values(this.hashStore[key]).map(v => JSON.parse(v))
   }
 }
 

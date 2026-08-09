@@ -36,11 +36,10 @@ export const smsQueue = {
       }
 
       let application: any = null
-      let sms: SmsRequest | undefined
+      let sms: SmsRequest | undefined | null
 
       try {
-        const smsList = smsStore.getAll()
-        sms = smsList.find((s: SmsRequest) => s.id === smsId)
+        sms = await smsStore.get(smsId)
         
         if (!sms) {
           console.error(`SMS not found in store: ${smsId}`)
@@ -49,7 +48,7 @@ export const smsQueue = {
 
         console.log(`[smsQueue] Processing SMS ${smsId} for ${sms.recipient}`);
         // Update status to pending
-        smsStore.updateStatus(smsId, 'pending')
+        await smsStore.updateStatus(smsId, 'pending')
 
         if (sms.applicationId) {
           application = await db.application.findUnique({ where: { id: sms.applicationId } })
@@ -63,7 +62,7 @@ export const smsQueue = {
         console.log(`[smsQueue] Send result:`, result);
         
         // Update status to delivered
-        smsStore.updateStatus(smsId, 'delivered')
+        await smsStore.updateStatus(smsId, 'delivered')
         
         results.push({ smsId, success: true })
 
@@ -104,7 +103,7 @@ export const smsQueue = {
         console.error(`Failed to process SMS ${smsId}:`, error)
         
         // Update status to failed
-        smsStore.updateStatus(smsId, 'failed', error.message || 'Unknown error')
+        await smsStore.updateStatus(smsId, 'failed', error.message || 'Unknown error')
         
         results.push({ smsId, success: false, error: error.message })
 

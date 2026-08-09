@@ -4,7 +4,7 @@ import { db } from '@/lib/db'
 
 export async function GET(request: Request) {
   try {
-    const messages = smsStore.getAll()
+    const messages = await smsStore.getAll()
     const apps = await db.application.findMany()
     const appMap = new Map(apps.map(a => [a.code.toLowerCase(), a.name]))
 
