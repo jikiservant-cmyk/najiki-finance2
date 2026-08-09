@@ -68,11 +68,9 @@ export async function POST(request: Request) {
 
     // Trigger the worker asynchronously using Next.js 15 'after' API
     // so messages get processed without blocking the response
-    if (process.env.NODE_ENV === 'development' || !process.env.CRON_SECRET) {
-      after(() => {
-        smsQueue.processBatch(5).catch(err => console.error('Background worker error:', err))
-      })
-    }
+    after(() => {
+      smsQueue.processBatch(5).catch(err => console.error('Background worker error:', err))
+    })
 
     // 3. Return 202 Accepted fast-path
     return NextResponse.json({
