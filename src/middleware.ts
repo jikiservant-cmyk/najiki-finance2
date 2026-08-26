@@ -68,9 +68,9 @@ export async function middleware(request: NextRequest) {
     data: { user },
   } = await supabase.auth.getUser()
 
-  const publicRoutes = ['/login']
+  const publicRoutes = ['/login', '/offline']
   if (publicRoutes.includes(request.nextUrl.pathname)) {
-    if (user) {
+    if (user && request.nextUrl.pathname === '/login') {
       return NextResponse.redirect(new URL('/', request.url))
     }
     return response
@@ -85,6 +85,7 @@ export async function middleware(request: NextRequest) {
 
 export const config = {
   matcher: [
-    '/((?!_next/static|_next/image|favicon.ico|api/webhooks|api/cron|api/qstash|api/payments|api/messaging/send).*)',
+    '/((?!_next/static|_next/image|favicon.ico|manifest.json|manifest.webmanifest|sw.js|icons|logo.svg|robots.txt|api/webhooks|api/cron|api/qstash|api/payments|api/messaging/send).*)',
   ],
 }
+

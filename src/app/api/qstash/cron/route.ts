@@ -25,6 +25,7 @@ export async function POST(request: Request) {
       include: {
         provider: true,
         application: true,
+        tenant: true,
       },
       take: 50,
     })
@@ -33,7 +34,21 @@ export async function POST(request: Request) {
 
     for (const payment of pendingPayments) {
       try {
-        const providerClient = getPaymentProvider(payment.provider.code)
+        let customCredentials: any = undefined
+        if (payment.tenantId) {
+          const tenantConfig = await db.tenantProviderConfig.findFirst({
+            where: {
+              tenantId: payment.tenantId,
+              providerId: payment.providerId,
+              isActive: true,
+            },
+          })
+          if (tenantConfig?.configJson && typeof tenantConfig.configJson === 'object') {
+            customCredentials = tenantConfig.configJson
+          }
+        }
+
+        const providerClient = getPaymentProvider(payment.provider.code, customCredentials)
         if (providerClient.checkPaymentStatus) {
           const result = await providerClient.checkPaymentStatus(
             payment.reference,

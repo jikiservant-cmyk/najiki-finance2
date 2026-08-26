@@ -1,5 +1,6 @@
 import {
   PaymentProvider,
+  ProviderCredentials,
   InitiatePaymentParams,
   InitiatePaymentResponse,
   PaymentStatusResponse,
@@ -16,11 +17,11 @@ export class LivePayProvider implements PaymentProvider {
   private webhookSecret: string
   private baseUrl: string
 
-  constructor() {
-    this.apiKey = process.env.LIVEPAY_API_KEY || ''
-    this.accountNo = process.env.LIVEPAY_ACCOUNT_NO || ''
-    this.webhookSecret = process.env.LIVEPAY_WEBHOOK_SECRET || ''
-    this.baseUrl = process.env.LIVEPAY_BASE_URL || 'https://livepay.me'
+  constructor(config?: Partial<ProviderCredentials>) {
+    this.apiKey = config?.apiKey || config?.api_key || process.env.LIVEPAY_API_KEY || ''
+    this.accountNo = config?.accountNo || config?.account_number || config?.accountNumber || process.env.LIVEPAY_ACCOUNT_NO || ''
+    this.webhookSecret = config?.webhookSecret || config?.webhook_secret || process.env.LIVEPAY_WEBHOOK_SECRET || ''
+    this.baseUrl = config?.baseUrl || config?.base_url || process.env.LIVEPAY_BASE_URL || 'https://livepay.me'
   }
 
   async initiatePayment(params: InitiatePaymentParams): Promise<InitiatePaymentResponse> {

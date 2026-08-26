@@ -1,6 +1,14 @@
 // Payment Provider Interface
 // All payment providers (LivePay, MTN, Airtel, Pesapal) must implement this
 
+export interface ProviderCredentials {
+  apiKey?: string
+  accountNo?: string
+  webhookSecret?: string
+  baseUrl?: string
+  [key: string]: any
+}
+
 export interface PaymentProvider {
   code: string
   name: string

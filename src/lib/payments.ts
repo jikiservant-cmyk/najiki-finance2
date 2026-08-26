@@ -15,7 +15,27 @@ export async function processPayment(data: {
   const { paymentIntentId, amount, currency, phoneNumber, reference, providerCode, description, metadata, webhookUrl } = data
 
   try {
-    const providerClient = getPaymentProvider(providerCode)
+    // Check if there is an active tenant-specific config for this provider
+    let customCredentials: any = undefined
+    const payment = await db.paymentIntent.findUnique({
+      where: { id: paymentIntentId },
+      include: { application: true },
+    })
+
+    if (payment?.tenantId && payment?.providerId) {
+      const tenantConfig = await db.tenantProviderConfig.findFirst({
+        where: {
+          tenantId: payment.tenantId,
+          providerId: payment.providerId,
+          isActive: true,
+        },
+      })
+      if (tenantConfig?.configJson && typeof tenantConfig.configJson === 'object') {
+        customCredentials = tenantConfig.configJson
+      }
+    }
+
+    const providerClient = getPaymentProvider(providerCode, customCredentials)
     const providerResponse = await providerClient.initiatePayment({
       amount,
       currency,
@@ -47,11 +67,6 @@ export async function processPayment(data: {
     ])
 
     if (providerResponse.status === 'success' || providerResponse.status === 'failed') {
-      const payment = await db.paymentIntent.findUnique({
-        where: { id: paymentIntentId },
-        include: { application: true },
-      })
-      
       if (payment) {
         await enqueueWebhookNotification({
           paymentIntentId,
