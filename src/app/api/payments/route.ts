@@ -14,13 +14,20 @@ import { processPayment } from '@/lib/payments'
 import { Ratelimit } from '@upstash/ratelimit'
 import { Redis } from '@upstash/redis'
 
-// Use Upstash Redis for distributed rate limiting
-const redis = Redis.fromEnv()
-const ratelimit = new Ratelimit({
-  redis,
-  limiter: Ratelimit.slidingWindow(20, '1 m'),
-  analytics: true,
-})
+// Use Upstash Redis for distributed rate limiting if configured
+let ratelimit: Ratelimit | null = null;
+try {
+  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+    const redis = Redis.fromEnv()
+    ratelimit = new Ratelimit({
+      redis,
+      limiter: Ratelimit.slidingWindow(20, '1 m'),
+      analytics: true,
+    })
+  }
+} catch (e) {
+  console.warn('Failed to initialize rate limiter:', e)
+}
 
 // FIX: crypto-random reference — replaces Date.now().slice(-6)+Math.random()*10000
 // which had collision probability under burst load (same millisecond = same prefix)
@@ -47,12 +54,26 @@ export async function POST(request: Request) {
   const ip =
     request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? 'unknown'
 
-  const { success } = await ratelimit.limit(ip)
-  if (!success) {
-    return NextResponse.json(
-      { error: 'Too many requests' },
-      { status: 429, headers: { 'Retry-After': '60' } }
-    )
+  if (ratelimit) {
+    try {
+      // Enforce a strict 1-second timeout on the Redis rate limit check
+      // so it never stalls the payment API if Redis is slow or unresponsive.
+      const ratelimitPromise = ratelimit.limit(ip)
+      const timeoutPromise = new Promise<{success: boolean}>((_, reject) => 
+        setTimeout(() => reject(new Error('Rate limit timeout')), 1000)
+      )
+      
+      const { success } = await Promise.race([ratelimitPromise, timeoutPromise])
+      if (!success) {
+        return NextResponse.json(
+          { error: 'Too many requests' },
+          { status: 429, headers: { 'Retry-After': '60' } }
+        )
+      }
+    } catch (ratelimitError) {
+      console.warn('Rate limiter failed or timed out, bypassing:', ratelimitError)
+      // Bypass rate limiting if Redis is down/fails to prevent breaking payments
+    }
   }
 
   try {

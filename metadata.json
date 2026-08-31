@@ -1,0 +1,6 @@
+{
+  "name": "Na'jiki Tech Payment & Messaging Gateway",
+  "description": "Unified payment and messaging gateway for SACCO, Church, and School platforms.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
