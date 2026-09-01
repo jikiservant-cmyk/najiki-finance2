@@ -28,7 +28,7 @@ export class LivePayProvider implements PaymentProvider {
     try {
       const payload = {
         accountNumber: this.accountNo,
-        phoneNumber: params.phoneNumber,
+        phoneNumber: params.phoneNumber.replace(/[\s\-\(\)\+]/g, "").startsWith("0") ? "256" + params.phoneNumber.replace(/[\s\-\(\)\+]/g, "").slice(1) : params.phoneNumber.replace(/[\s\-\(\)\+]/g, ""),
         amount: params.amount,
         currency: params.currency || 'UGX',
         reference: params.reference,

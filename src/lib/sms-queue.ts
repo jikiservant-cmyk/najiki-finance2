@@ -61,6 +61,10 @@ export const smsQueue = {
         const result = await sendSmsViaProvider(sms.recipient, sms.message)
         console.log(`[smsQueue] Send result:`, result);
         
+        if (!result.success) {
+          throw new Error(result.error || 'Provider rejected SMS delivery')
+        }
+
         // Update status to delivered
         await smsStore.updateStatus(smsId, 'delivered')
         

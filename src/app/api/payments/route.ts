@@ -175,26 +175,28 @@ export async function POST(request: Request) {
     const appBaseUrl = process.env.NEXTAUTH_URL || `${protocol}://${host}`
     const webhookUrl = `${appBaseUrl}/api/webhooks/${provider.code.toLowerCase()}`
 
-    // Process payment in background using Next.js after()
-    after(() => {
-      processPayment({
-        paymentIntentId: paymentIntent.id,
-        amount: Number(validatedBody.amount),
-        currency: validatedBody.currency,
-        phoneNumber: validatedBody.phoneNumber,
-        reference,
-        providerCode: provider.code,
-        description: rawBody.description || `Payment for ${validatedBody.paymentTypeCode ?? 'payment'}`,
-        metadata: { ...(validatedBody.metadata ?? {}), paymentIntentId: paymentIntent.id },
-        webhookUrl,
-      }).catch(err => console.error('Background payment processing error:', err))
+    // Process payment synchronously to avoid Vercel killing the background task
+    await processPayment({
+      paymentIntentId: paymentIntent.id,
+      amount: Number(validatedBody.amount),
+      currency: validatedBody.currency,
+      phoneNumber: validatedBody.phoneNumber,
+      reference,
+      providerCode: provider.code,
+      description: rawBody.description || `Payment for ${validatedBody.paymentTypeCode ?? "payment"}`,
+      metadata: { ...(validatedBody.metadata ?? {}), paymentIntentId: paymentIntent.id },
+      webhookUrl,
+    }).catch(err => console.error("Payment processing error:", err))
+
+    const updatedIntent = await db.paymentIntent.findUnique({
+      where: { id: paymentIntent.id },
     })
 
     return NextResponse.json({
       paymentId: paymentIntent.id,
       reference: paymentIntent.reference,
-      status: 'pending',
-    }, { status: 202 })
+      status: updatedIntent?.status || "pending",
+    }, { status: 200 })
   } catch (error: any) {
     console.error('Create payment error:', error)
     if (error && (error.name === 'ZodError' || Array.isArray(error.issues))) {
