@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
-import { enqueueWebhookNotification } from '@/lib/payments'
+import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
 
 export async function GET(
   request: Request,
@@ -63,38 +63,33 @@ export async function GET(
 
             // If status changed to success or failed, update the DB
             if (statusResult.status !== 'pending' && statusResult.status !== 'processing') {
-              const updatedIntent = await db.paymentIntent.update({
-                where: { id: paymentIntent.id },
-                data: {
-                  status: statusResult.status,
-                  failureReason: statusResult.failureReason || null,
-                  completedAt: statusResult.status === 'success' ? new Date() : null,
-                }
-              })
-              
-              await db.paymentTransaction.create({
-                data: {
-                  paymentIntentId: paymentIntent.id,
-                  status: statusResult.status,
-                  rawProviderResponse: JSON.stringify(statusResult),
-                  note: 'STATUS_SYNC_FROM_API',
-                }
-              })
-
-              await enqueueWebhookNotification({
+              const { intent: updatedIntent, wasAlreadyProcessed } = await completePayment({
                 paymentIntentId: paymentIntent.id,
-                reference: paymentIntent.reference,
                 status: statusResult.status,
+                providerPaymentId: statusResult.providerPaymentId,
+                failureReason: statusResult.failureReason,
                 amount: Number(paymentIntent.amount),
                 currency: paymentIntent.currency,
-                providerPaymentId: statusResult.providerPaymentId || paymentIntent.providerPaymentId || '',
-                failureReason: statusResult.failureReason,
-                applicationId: application.id,
-                webhookUrl: `${application.baseUrl}${application.webhookPath}`,
-                apiKey: application.apiKey,
-                externalEntityId: paymentIntent.externalEntityId,
-                metadata: (() => { try { return paymentIntent.metadata ? JSON.parse(paymentIntent.metadata) : {}; } catch(e) { return {}; } })(),
+                rawProviderResponse: JSON.stringify(statusResult),
+                note: 'STATUS_SYNC_FROM_API',
               })
+
+              if (!wasAlreadyProcessed) {
+                await enqueueWebhookNotification({
+                  paymentIntentId: paymentIntent.id,
+                  reference: paymentIntent.reference,
+                  status: statusResult.status,
+                  amount: Number(paymentIntent.amount),
+                  currency: paymentIntent.currency,
+                  providerPaymentId: statusResult.providerPaymentId || paymentIntent.providerPaymentId || '',
+                  failureReason: statusResult.failureReason,
+                  applicationId: application.id,
+                  webhookUrl: `${application.baseUrl}${application.webhookPath}`,
+                  apiKey: application.apiKey,
+                  externalEntityId: paymentIntent.externalEntityId,
+                  metadata: (() => { try { return paymentIntent.metadata ? JSON.parse(paymentIntent.metadata) : {}; } catch(e) { return {}; } })(),
+                })
+              }
 
               currentStatus = updatedIntent.status
               currentFailureReason = updatedIntent.failureReason

@@ -186,7 +186,7 @@ export async function POST(request: Request) {
       description: rawBody.description || `Payment for ${validatedBody.paymentTypeCode ?? "payment"}`,
       metadata: { ...(validatedBody.metadata ?? {}), paymentIntentId: paymentIntent.id },
       webhookUrl,
-    }).catch(err => console.error("Payment processing error:", err))
+    }).catch(err => { throw err; })
 
     const updatedIntent = await db.paymentIntent.findUnique({
       where: { id: paymentIntent.id },

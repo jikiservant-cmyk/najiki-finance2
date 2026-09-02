@@ -11,7 +11,7 @@ import { db } from '@/lib/db'
 import { getPaymentProvider, getAvailableProviders } from '@/lib/providers'
 import { createWebhookLog, getPaymentByReference } from '@/lib/data'
 import { PrismaClient } from '@prisma/client'
-import { enqueueWebhookNotification } from '@/lib/payments'
+import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
 
 export async function POST(
   request: Request,
@@ -112,91 +112,39 @@ export async function POST(
 
     const normalizedStatus = parsedWebhook.status.toLowerCase()
 
-    // FIX 2 & 3: ALL writes — including the webhookLog update AND wallet updates — are inside one transaction.
-    await db.$transaction(async (tx) => {
-      // Update payment intent
-      await tx.paymentIntent.update({
-        where: { id: paymentIntent.id },
-        data: {
-          status: normalizedStatus,
-          ...(parsedWebhook.providerPaymentId && {
-            providerPaymentId: parsedWebhook.providerPaymentId,
-          }),
-          ...(parsedWebhook.failureReason && {
-            failureReason: parsedWebhook.failureReason,
-          }),
-          ...(normalizedStatus === 'success' || normalizedStatus === 'failed'
-            ? { completedAt: new Date() }
-            : {}),
-        },
-      })
-
-      // Append to audit log
-      await tx.paymentTransaction.create({
-        data: {
-          paymentIntentId: paymentIntent.id,
-          status: normalizedStatus,
-          rawProviderResponse: rawBody,
-          note: 'WEBHOOK_UPDATE',
-        },
-      })
-
-      // If payment was successful, update wallet based on application type!
-      if (normalizedStatus === 'success' && fullPaymentIntent.tenant) {
-        // Route wallet update based on application code!
-        const appCode = fullPaymentIntent.application.code.toLowerCase()
-        const amount = Number(parsedWebhook.amount || paymentIntent.amount)
-        const tenantId = fullPaymentIntent.tenant.id
-
-        if (appCode === 'church') {
-          // For churches, tenant.id maps to church.churches.id,
-          // update church.wallets in "church" schema!
-          // First ensure the wallet exists (upsert)!
-          await tx.$executeRaw`
-            INSERT INTO "church"."wallets" ("church_id", "balance", "sms_credits", "created_at", "updated_at")
-            VALUES (${tenantId}, ${amount}, 0, NOW(), NOW())
-            ON CONFLICT ("church_id") DO UPDATE 
-            SET "balance" = "church"."wallets"."balance" + ${amount}, "updated_at" = NOW()
-          `
-        } else if (appCode === 'sacco') {
-          // For SACCOs, tenant.id maps to kuntiy.saccos.id,
-          // update kuntiy.wallets in "kuntiy" schema!
-          await tx.$executeRaw`
-            INSERT INTO "kuntiy"."wallets" ("sacco_id", "balance", "created_at", "updated_at")
-            VALUES (${tenantId}, ${amount}, NOW(), NOW())
-            ON CONFLICT ("sacco_id") DO UPDATE 
-            SET "balance" = "kuntiy"."wallets"."balance" + ${amount}, "updated_at" = NOW()
-          `
-        }
-      }
-
-      // Queue internal notification for terminal statuses via QStash
-      if (normalizedStatus === 'success' || normalizedStatus === 'failed') {
-        await enqueueWebhookNotification({
-          paymentIntentId: paymentIntent.id,
-          reference: paymentIntent.reference,
-          status: normalizedStatus,
-          amount: Number(parsedWebhook.amount || paymentIntent.amount),
-          currency: parsedWebhook.currency || paymentIntent.currency,
-          providerPaymentId: parsedWebhook.providerPaymentId || '',
-          failureReason: parsedWebhook.failureReason,
-          applicationId: fullPaymentIntent.applicationId,
-          webhookUrl: `${fullPaymentIntent.application.baseUrl}${fullPaymentIntent.application.webhookPath}`,
-          apiKey: fullPaymentIntent.application.apiKey,
-          externalEntityId: fullPaymentIntent.externalEntityId,
-          metadata: (() => { try { return fullPaymentIntent.metadata ? JSON.parse(fullPaymentIntent.metadata) : {}; } catch(e) { return {}; } })(),
-        })
-      }
-
-      // FIX 2: mark log processed INSIDE the transaction
-      await tx.webhookLog.update({
+    // FIX: Guard against double-crediting if a retry comes with a different signature
+    if (
+      fullPaymentIntent.status === 'success' || 
+      fullPaymentIntent.status === 'failed'
+    ) {
+      // Mark this webhook log as processed since we already handled this terminal state
+      await db.webhookLog.update({
         where: { id: webhookLog.id },
         data: { paymentIntentId: paymentIntent.id, processed: true },
       })
+      return NextResponse.json({ success: true, duplicate: true })
+    }
+
+    // FIX 2 & 3: Delegate to completePayment for wallet crediting and status sync
+    const { wasAlreadyProcessed } = await completePayment({
+      paymentIntentId: paymentIntent.id,
+      status: normalizedStatus,
+      providerPaymentId: parsedWebhook.providerPaymentId,
+      failureReason: parsedWebhook.failureReason,
+      amount: Number(parsedWebhook.amount || paymentIntent.amount),
+      currency: parsedWebhook.currency || paymentIntent.currency,
+      rawProviderResponse: rawBody,
+      note: 'WEBHOOK_UPDATE',
+    })
+
+    // FIX 2: mark log processed. If this fails, the retry will be caught by the success guard above.
+    await db.webhookLog.update({
+      where: { id: webhookLog.id },
+      data: { paymentIntentId: paymentIntent.id, processed: true },
     })
 
     // Create completion event for webhook delivery
-    if (normalizedStatus === 'success' || normalizedStatus === 'failed') {
+    if (!wasAlreadyProcessed && (normalizedStatus === 'success' || normalizedStatus === 'failed')) {
       await enqueueWebhookNotification({
         paymentIntentId: paymentIntent.id,
         reference: paymentIntent.reference,

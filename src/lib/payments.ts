@@ -86,7 +86,81 @@ export async function processPayment(data: {
     }
   } catch (err: any) {
     console.error(`processPayment error for ${paymentIntentId}:`, err)
+    await db.paymentIntent.update({ where: { id: paymentIntentId }, data: { status: "failed", failureReason: err.message } }).catch(console.error)
   }
+}
+
+export async function completePayment(data: {
+  paymentIntentId: string
+  status: string
+  providerPaymentId?: string | null
+  failureReason?: string | null
+  amount: number
+  currency: string
+  rawProviderResponse: string
+  note?: string
+}) {
+  const { paymentIntentId, status, providerPaymentId, failureReason, amount, currency, rawProviderResponse, note } = data
+
+  const fullPaymentIntent = await db.paymentIntent.findUnique({
+    where: { id: paymentIntentId },
+    include: { application: true, tenant: true },
+  })
+
+  if (!fullPaymentIntent) throw new Error('Payment not found')
+  
+  if (fullPaymentIntent.status === 'success' || fullPaymentIntent.status === 'failed') {
+    return { intent: fullPaymentIntent, wasAlreadyProcessed: true }
+  }
+
+  const updatedIntent = await db.$transaction(async (tx) => {
+    // Update payment intent
+    const updated = await tx.paymentIntent.update({
+      where: { id: paymentIntentId },
+      data: {
+        status,
+        ...(providerPaymentId && { providerPaymentId }),
+        ...(failureReason && { failureReason }),
+        ...(status === 'success' || status === 'failed' ? { completedAt: new Date() } : {}),
+      },
+    })
+
+    // Append to audit log
+    await tx.paymentTransaction.create({
+      data: {
+        paymentIntentId,
+        status,
+        rawProviderResponse,
+        note: note || 'STATUS_UPDATE',
+      },
+    })
+
+    // If payment was successful, update wallet based on application type!
+    if (status === 'success' && fullPaymentIntent.tenant) {
+      const appCode = fullPaymentIntent.application.code.toLowerCase()
+      const tenantId = fullPaymentIntent.tenant.id
+
+      if (appCode === 'church') {
+        await tx.$executeRaw`
+          INSERT INTO "church"."wallets" ("church_id", "balance", "sms_credits", "created_at", "updated_at")
+          VALUES (${tenantId}, ${amount}, 0, NOW(), NOW())
+          ON CONFLICT ("church_id") DO UPDATE 
+          SET "balance" = "church"."wallets"."balance" + ${amount}, "updated_at" = NOW()
+        `
+      } else if (appCode === 'sacco') {
+        await tx.$executeRaw`
+          INSERT INTO "kuntiy"."wallets" ("sacco_id", "balance", "created_at", "updated_at")
+          VALUES (${tenantId}, ${amount}, NOW(), NOW())
+          ON CONFLICT ("sacco_id") DO UPDATE 
+          SET "balance" = "kuntiy"."wallets"."balance" + ${amount}, "updated_at" = NOW()
+        `
+      }
+    }
+    
+    return updated
+  })
+
+  return { intent: updatedIntent, wasAlreadyProcessed: false }
 }
 
 import { Client } from '@upstash/qstash'
