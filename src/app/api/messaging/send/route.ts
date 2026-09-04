@@ -24,40 +24,30 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Recipient (to) and message content are required' }, { status: 400 })
     }
 
-    // Resolve application:
-    // 1. External API clients: authenticate via Authorization: Bearer <apiKey>
-    // 2. Dashboard UI / internal calls: resolve via applicationCode or active application fallback
+    // External API clients MUST authenticate via Authorization: Bearer <apiKey>
     const authHeader = request.headers.get('Authorization')
-    let application: any = null
-
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      const apiKey = authHeader.slice(7).trim()
-      application = await db.application.findFirst({
-        where: { apiKey, isActive: true },
-      })
-
-      if (!application) {
-        return NextResponse.json({ error: 'Invalid or inactive application API key' }, { status: 401 })
-      }
-    } else if (applicationCode) {
-      application = await db.application.findFirst({
-        where: { code: applicationCode, isActive: true },
-      })
-      if (!application) {
-        // Fallback to first active application if specified code doesn't exist
-        application = await db.application.findFirst({
-          where: { isActive: true },
-        })
-      }
-    } else {
-      // Default to the first active registered application for dashboard quick-sends
-      application = await db.application.findFirst({
-        where: { isActive: true },
-      })
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return NextResponse.json(
+        { error: 'Missing or invalid Authorization header. Provide a valid Bearer API key.' },
+        { status: 401 }
+      )
     }
 
-    const appCode = application?.code || applicationCode || 'church'
-    const appId = application?.id || undefined
+    const apiKey = authHeader.slice(7).trim()
+    if (!apiKey) {
+      return NextResponse.json({ error: 'API key is required' }, { status: 401 })
+    }
+
+    const application = await db.application.findFirst({
+      where: { apiKey, isActive: true },
+    })
+
+    if (!application) {
+      return NextResponse.json({ error: 'Invalid or inactive application API key' }, { status: 401 })
+    }
+
+    const appCode = application.code
+    const appId = application.id
 
     // 1. Create the SMS request in our Redis store (no schema change!)
     const smsRequest = await smsStore.create({

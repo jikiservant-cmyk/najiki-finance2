@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import crypto from 'crypto'
 import { requireSuperAdmin } from '@/lib/auth'
+import { validateSafeUrl } from '@/lib/safe-fetch'
 
 function generateApiKey(): string {
   return `nk_${crypto.randomBytes(24).toString('hex')}`
@@ -12,6 +13,19 @@ export async function POST(request: Request) {
     await requireSuperAdmin()
 
     const { type, data } = await request.json()
+
+    if (type === 'application' || type === 'updateApplication') {
+      if (data?.baseUrl) {
+        try {
+          await validateSafeUrl(data.baseUrl)
+        } catch (urlErr: any) {
+          return NextResponse.json(
+            { error: `Invalid application base URL: ${urlErr.message}` },
+            { status: 400 }
+          )
+        }
+      }
+    }
 
     let result
     switch (type) {

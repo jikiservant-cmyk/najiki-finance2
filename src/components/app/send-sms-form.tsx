@@ -23,7 +23,7 @@ export function SendSmsForm() {
     setLastSent(null)
 
     try {
-      const response = await fetch('/api/messaging/send', {
+      const response = await fetch('/api/messaging/quick-send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ to, message, applicationCode })

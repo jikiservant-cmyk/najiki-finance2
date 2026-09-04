@@ -6,7 +6,7 @@
 -- =============================================
 CREATE TABLE IF NOT EXISTS public.admin_profiles (
   id UUID REFERENCES auth.users(id) ON DELETE CASCADE PRIMARY KEY,
-  role TEXT NOT NULL DEFAULT 'super_admin' CHECK (role IN ('super_admin')),
+  role TEXT NOT NULL DEFAULT 'viewer' CHECK (role IN ('super_admin', 'admin', 'viewer')),
   created_at TIMESTAMPTZ DEFAULT now(),
   updated_at TIMESTAMPTZ DEFAULT now()
 );
@@ -28,10 +28,10 @@ CREATE POLICY "Service role can manage admin profiles" ON public.admin_profiles
 CREATE OR REPLACE FUNCTION public.handle_new_user()
 RETURNS TRIGGER AS $$
 BEGIN
-  -- Only create profile if the email is pre-approved or manually created
-  -- For now, we'll create a profile for every new user with super_admin role
+  -- Default to 'viewer' with no elevated administrative privileges.
+  -- Elevation to 'super_admin' requires manual promotion by an existing super admin.
   INSERT INTO public.admin_profiles (id, role)
-  VALUES (NEW.id, 'super_admin');
+  VALUES (NEW.id, 'viewer');
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
