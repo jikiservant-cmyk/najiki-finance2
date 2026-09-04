@@ -5,9 +5,16 @@ import africastalking from 'africastalking'
  */
 function normalizePhoneNumber(phone: string): string {
   let cleaned = phone.replace(/[\s\-\(\)]/g, '')
-  if (cleaned.startsWith('0')) {
+  if (cleaned.startsWith('00256')) {
+    cleaned = '+256' + cleaned.slice(5)
+  } else if (cleaned.startsWith('0')) {
     // Standard Uganda local format: 07XXXXXXXX -> +2567XXXXXXXX
     cleaned = '+256' + cleaned.slice(1)
+  } else if (cleaned.startsWith('256')) {
+    cleaned = '+' + cleaned
+  } else if (cleaned.length === 9 && cleaned.startsWith('7')) {
+    // 9-digit local mobile number without leading 0: 7XXXXXXXX -> +2567XXXXXXXX
+    cleaned = '+256' + cleaned
   } else if (!cleaned.startsWith('+')) {
     cleaned = `+${cleaned}`
   }

@@ -3,7 +3,7 @@ import { smsStore, SmsRequest } from './sms-store'
 import { sendSmsViaProvider } from './sms'
 import { db } from './db'
 import { createHmac } from 'crypto'
-import { safeFetch } from './safe-fetch'
+import { safeFetch, isPlaceholderUrl } from './safe-fetch'
 
 const SMS_QUEUE_KEY = 'sms:queue'
 
@@ -51,10 +51,15 @@ export const smsQueue = {
         // Update status to pending
         await smsStore.updateStatus(smsId, 'pending')
 
-        if (sms.applicationId) {
-          application = await db.application.findUnique({ where: { id: sms.applicationId } })
-        } else if (sms.applicationCode) {
-          application = await db.application.findFirst({ where: { code: sms.applicationCode } })
+        // Safely resolve application for post-delivery webhook without blocking provider delivery
+        try {
+          if (sms.applicationId) {
+            application = await db.application.findUnique({ where: { id: sms.applicationId } })
+          } else if (sms.applicationCode) {
+            application = await db.application.findFirst({ where: { code: sms.applicationCode } })
+          }
+        } catch (dbErr) {
+          console.warn(`[smsQueue] Could not resolve application for SMS ${smsId} (webhook may be skipped):`, dbErr)
         }
 
         // Send SMS via Provider
@@ -73,36 +78,43 @@ export const smsQueue = {
 
         // Fire webhook to connected app
         if (application && application.webhookPath) {
-          const webhookUrl = `${application.baseUrl}${application.webhookPath}`
-          const payload = JSON.stringify({
-            eventType: 'SMS_DELIVERY_UPDATE',
-            smsId: smsId,
-            reference: sms.reference,
-            status: 'delivered',
-            providerId: result.providerId,
-            recipient: sms.recipient,
-            applicationCode: application.code
-          })
-          
-          const headers: Record<string, string> = {
-            'Content-Type': 'application/json',
-            'X-Najiki-Notification': 'true'
-          }
+          const rawBaseUrl = (application.baseUrl || '').trim()
+          const rawPath = (application.webhookPath || '').trim()
+          const webhookUrl = `${rawBaseUrl}${rawPath.startsWith('/') ? '' : '/'}${rawPath}`
 
-          if (application.apiKey) {
-            headers['X-Najiki-Signature'] = createHmac('sha256', application.apiKey).update(payload).digest('hex')
-            headers['Authorization'] = `Bearer ${application.apiKey}`
-          }
-
-          try {
-            await safeFetch(webhookUrl, {
-              method: 'POST',
-              headers,
-              body: payload
+          if (isPlaceholderUrl(webhookUrl)) {
+            console.log(`[smsQueue] Skipped partner webhook for ${application.code}: endpoint is a placeholder domain (${webhookUrl}). SMS delivery was completed successfully.`)
+          } else {
+            const payload = JSON.stringify({
+              eventType: 'SMS_DELIVERY_UPDATE',
+              smsId: smsId,
+              reference: sms.reference,
+              status: 'delivered',
+              providerId: result.providerId,
+              recipient: sms.recipient,
+              applicationCode: application.code
             })
-            console.log(`[smsQueue] Successfully dispatched webhook to ${webhookUrl}`)
-          } catch (webhookErr) {
-            console.error(`[smsQueue] Failed to dispatch webhook to ${webhookUrl}:`, webhookErr)
+            
+            const headers: Record<string, string> = {
+              'Content-Type': 'application/json',
+              'X-Najiki-Notification': 'true'
+            }
+
+            if (application.apiKey) {
+              headers['X-Najiki-Signature'] = createHmac('sha256', application.apiKey).update(payload).digest('hex')
+              headers['Authorization'] = `Bearer ${application.apiKey}`
+            }
+
+            try {
+              await safeFetch(webhookUrl, {
+                method: 'POST',
+                headers,
+                body: payload
+              })
+              console.log(`[smsQueue] Successfully dispatched webhook to ${webhookUrl}`)
+            } catch (webhookErr: any) {
+              console.warn(`[smsQueue] Webhook delivery note for ${webhookUrl}: ${webhookErr?.message || 'Network error'}. Note: SMS was delivered successfully.`)
+            }
           }
         }
       } catch (error: any) {
@@ -142,31 +154,38 @@ export const smsQueue = {
 
         // Fire webhook for failure
         if (sms && application && application.webhookPath) {
-          const webhookUrl = `${application.baseUrl}${application.webhookPath}`
-          const payload = JSON.stringify({
-            eventType: 'SMS_DELIVERY_UPDATE',
-            smsId: smsId,
-            reference: sms.reference,
-            status: 'failed',
-            error: error.message,
-            recipient: sms.recipient,
-            applicationCode: application.code
-          })
-          
-          const headers: Record<string, string> = {
-            'Content-Type': 'application/json',
-            'X-Najiki-Notification': 'true'
-          }
+          const rawBaseUrl = (application.baseUrl || '').trim()
+          const rawPath = (application.webhookPath || '').trim()
+          const webhookUrl = `${rawBaseUrl}${rawPath.startsWith('/') ? '' : '/'}${rawPath}`
 
-          if (application.apiKey) {
-            headers['X-Najiki-Signature'] = createHmac('sha256', application.apiKey).update(payload).digest('hex')
-            headers['Authorization'] = `Bearer ${application.apiKey}`
-          }
+          if (isPlaceholderUrl(webhookUrl)) {
+            console.log(`[smsQueue] Skipped failure webhook dispatch for ${application.code}: target is a placeholder domain (${webhookUrl}).`)
+          } else {
+            const payload = JSON.stringify({
+              eventType: 'SMS_DELIVERY_UPDATE',
+              smsId: smsId,
+              reference: sms.reference,
+              status: 'failed',
+              error: error.message,
+              recipient: sms.recipient,
+              applicationCode: application.code
+            })
+            
+            const headers: Record<string, string> = {
+              'Content-Type': 'application/json',
+              'X-Najiki-Notification': 'true'
+            }
 
-          try {
-            await safeFetch(webhookUrl, { method: 'POST', headers, body: payload })
-          } catch (webhookErr) {
-            console.error(`[smsQueue] Failed to dispatch failure webhook to ${webhookUrl}:`, webhookErr)
+            if (application.apiKey) {
+              headers['X-Najiki-Signature'] = createHmac('sha256', application.apiKey).update(payload).digest('hex')
+              headers['Authorization'] = `Bearer ${application.apiKey}`
+            }
+
+            try {
+              await safeFetch(webhookUrl, { method: 'POST', headers, body: payload })
+            } catch (webhookErr: any) {
+              console.warn(`[smsQueue] Failure webhook notice for ${webhookUrl}: ${webhookErr?.message || 'Network error'}.`)
+            }
           }
         }
       }

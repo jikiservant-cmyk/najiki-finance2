@@ -29,6 +29,19 @@ export async function POST(request: Request) {
         })
         break
 
+      case 'updateApplication':
+        result = await db.application.update({
+          where: { id: data.id },
+          data: {
+            name: data.name,
+            baseUrl: data.baseUrl,
+            webhookPath: data.webhookPath,
+            internalSecretRef: data.internalSecretRef,
+            isActive: data.isActive,
+          },
+        })
+        break
+
       case 'provider':
         result = await db.provider.create({
           data: {

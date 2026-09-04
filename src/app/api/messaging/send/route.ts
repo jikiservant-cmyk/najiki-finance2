@@ -24,23 +24,40 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Recipient (to) and message content are required' }, { status: 400 })
     }
 
-    // Resolve application
+    // Resolve application:
+    // 1. External API clients: authenticate via Authorization: Bearer <apiKey>
+    // 2. Dashboard UI / internal calls: resolve via applicationCode or active application fallback
     const authHeader = request.headers.get('Authorization')
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return NextResponse.json({ error: 'Missing or invalid authorization header' }, { status: 401 })
-    }
-    
-    const apiKey = authHeader.slice(7)
-    const application = await db.application.findFirst({
-      where: { apiKey, isActive: true },
-    })
-    
-    if (!application) {
-      return NextResponse.json({ error: 'Invalid or inactive application API key' }, { status: 401 })
+    let application: any = null
+
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const apiKey = authHeader.slice(7).trim()
+      application = await db.application.findFirst({
+        where: { apiKey, isActive: true },
+      })
+
+      if (!application) {
+        return NextResponse.json({ error: 'Invalid or inactive application API key' }, { status: 401 })
+      }
+    } else if (applicationCode) {
+      application = await db.application.findFirst({
+        where: { code: applicationCode, isActive: true },
+      })
+      if (!application) {
+        // Fallback to first active application if specified code doesn't exist
+        application = await db.application.findFirst({
+          where: { isActive: true },
+        })
+      }
+    } else {
+      // Default to the first active registered application for dashboard quick-sends
+      application = await db.application.findFirst({
+        where: { isActive: true },
+      })
     }
 
-    const appCode = application.code
-    const appId = application.id
+    const appCode = application?.code || applicationCode || 'church'
+    const appId = application?.id || undefined
 
     // 1. Create the SMS request in our Redis store (no schema change!)
     const smsRequest = await smsStore.create({
