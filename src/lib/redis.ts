@@ -43,9 +43,18 @@ class MockRedis {
   }
 }
 
-export const redis = process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
-  ? new Redis({
+export const redis = (() => {
+  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+    return new Redis({
       url: process.env.UPSTASH_REDIS_REST_URL,
       token: process.env.UPSTASH_REDIS_REST_TOKEN,
-    })
-  : (new MockRedis() as any as Redis)
+    });
+  }
+
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('CRITICAL: UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN are missing in production. Rate limiting and SMS queue will silently fail.');
+  }
+
+  console.warn('WARN: Using in-memory MockRedis. This should only be used in local development.');
+  return new MockRedis() as any as Redis;
+})();

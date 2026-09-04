@@ -113,10 +113,13 @@ export async function completePayment(data: {
     return { intent: fullPaymentIntent, wasAlreadyProcessed: true }
   }
 
-  const updatedIntent = await db.$transaction(async (tx) => {
-    // Update payment intent
-    const updated = await tx.paymentIntent.update({
-      where: { id: paymentIntentId },
+  const result = await db.$transaction(async (tx) => {
+    // ATOMIC UPDATE: only update if the current status is not success or failed
+    const updateResult = await tx.paymentIntent.updateMany({
+      where: { 
+        id: paymentIntentId,
+        status: { notIn: ['success', 'failed'] }
+      },
       data: {
         status,
         ...(providerPaymentId && { providerPaymentId }),
@@ -124,6 +127,11 @@ export async function completePayment(data: {
         ...(status === 'success' || status === 'failed' ? { completedAt: new Date() } : {}),
       },
     })
+
+    if (updateResult.count === 0) {
+      // Another process already updated it while we were waiting for the transaction
+      return { updated: false }
+    }
 
     // Append to audit log
     await tx.paymentTransaction.create({
@@ -157,10 +165,22 @@ export async function completePayment(data: {
       }
     }
     
-    return updated
+    return { updated: true }
   })
 
-  return { intent: updatedIntent, wasAlreadyProcessed: false }
+  if (!result.updated) {
+    // It was processed by another request concurrently
+    return { intent: fullPaymentIntent, wasAlreadyProcessed: true }
+  }
+  
+  const finalIntent = await db.paymentIntent.findUnique({
+    where: { id: paymentIntentId },
+    include: { application: true, tenant: true },
+  })
+  
+  if (!finalIntent) throw new Error('Payment not found after update')
+  
+  return { intent: finalIntent, wasAlreadyProcessed: false }
 }
 
 import { Client } from '@upstash/qstash'
@@ -182,6 +202,10 @@ export async function enqueueWebhookNotification(data: {
   externalEntityId?: string | null
   metadata: any
 }) {
+  if (process.env.NODE_ENV === 'production' && !process.env.QSTASH_TOKEN) {
+    throw new Error('CRITICAL: QSTASH_TOKEN is missing in production. Webhooks cannot be delivered silently failing.')
+  }
+
   const payloadObject = {
     paymentIntentId: data.paymentIntentId,
     reference: data.reference,

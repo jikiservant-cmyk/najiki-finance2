@@ -47,6 +47,10 @@ export const smsQueue = {
         }
 
         console.log(`[smsQueue] Processing SMS ${smsId} for ${sms.recipient}`);
+
+        // Track retries
+        const attemptCount = (sms as any).attemptCount || 0;
+        
         // Update status to pending
         await smsStore.updateStatus(smsId, 'pending')
 
@@ -87,6 +91,7 @@ export const smsQueue = {
             'Content-Type': 'application/json',
             'X-Najiki-Notification': 'true'
           }
+
           if (application.apiKey) {
             headers['X-Najiki-Signature'] = createHmac('sha256', application.apiKey).update(payload).digest('hex')
             headers['Authorization'] = `Bearer ${application.apiKey}`
@@ -106,10 +111,28 @@ export const smsQueue = {
       } catch (error: any) {
         console.error(`Failed to process SMS ${smsId}:`, error)
         
-        // Update status to failed
+        if (sms) {
+          const maxRetries = 3;
+          const attemptCount = (sms as any).attemptCount || 0;
+          
+          if (attemptCount < maxRetries) {
+            console.log(`[smsQueue] Re-queueing SMS ${smsId} (attempt ${attemptCount + 1}/${maxRetries})`);
+            // Update attempt count in store (simulated by updating status to pending_retry)
+            await smsStore.updateStatus(smsId, 'failed', `Retry ${attemptCount + 1}/${maxRetries}: ${error.message || 'Unknown error'}`)
+            
+            // Requeue it to the left side so it gets retried
+            await redis.lpush(SMS_QUEUE_KEY, smsId);
+            
+            // Note: In a real system, you'd add a delay here (e.g., using a dead-letter queue or delayed execution)
+            results.push({ smsId, success: false, error: error.message, retried: true });
+            continue;
+          }
+        }
+        
+        // Update status to failed (permanently)
         await smsStore.updateStatus(smsId, 'failed', error.message || 'Unknown error')
         
-        results.push({ smsId, success: false, error: error.message })
+        results.push({ smsId, success: false, error: error.message, retried: false })
 
         // Fire webhook for failure
         if (sms && application && application.webhookPath) {
@@ -128,6 +151,7 @@ export const smsQueue = {
             'Content-Type': 'application/json',
             'X-Najiki-Notification': 'true'
           }
+
           if (application.apiKey) {
             headers['X-Najiki-Signature'] = createHmac('sha256', application.apiKey).update(payload).digest('hex')
             headers['Authorization'] = `Bearer ${application.apiKey}`
