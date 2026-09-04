@@ -46,10 +46,7 @@ export const smsQueue = {
           continue
         }
 
-        console.log(`[smsQueue] Processing SMS ${smsId} for ${sms.recipient}`);
-
-        // Track retries
-        const attemptCount = (sms as any).attemptCount || 0;
+        console.log(`[smsQueue] Processing SMS ${smsId} for ${sms.recipient} (attempt ${(sms.attemptCount || 0) + 1})`);
         
         // Update status to pending
         await smsStore.updateStatus(smsId, 'pending')
@@ -111,26 +108,35 @@ export const smsQueue = {
       } catch (error: any) {
         console.error(`Failed to process SMS ${smsId}:`, error)
         
-        if (sms) {
-          const maxRetries = 3;
-          const attemptCount = (sms as any).attemptCount || 0;
+        const maxRetries = 3;
+        const currentAttempts = sms?.attemptCount ?? 0;
+        const nextAttempt = currentAttempts + 1;
+
+        if (sms && nextAttempt < maxRetries) {
+          console.log(`[smsQueue] Re-queueing SMS ${smsId} (attempt ${nextAttempt}/${maxRetries})`);
+          // Update attempt count and failure note in store
+          await smsStore.updateStatus(
+            smsId,
+            'failed',
+            `Retry ${nextAttempt}/${maxRetries}: ${error.message || 'Unknown error'}`,
+            nextAttempt
+          )
           
-          if (attemptCount < maxRetries) {
-            console.log(`[smsQueue] Re-queueing SMS ${smsId} (attempt ${attemptCount + 1}/${maxRetries})`);
-            // Update attempt count in store (simulated by updating status to pending_retry)
-            await smsStore.updateStatus(smsId, 'failed', `Retry ${attemptCount + 1}/${maxRetries}: ${error.message || 'Unknown error'}`)
-            
-            // Requeue it to the left side so it gets retried
-            await redis.lpush(SMS_QUEUE_KEY, smsId);
-            
-            // Note: In a real system, you'd add a delay here (e.g., using a dead-letter queue or delayed execution)
-            results.push({ smsId, success: false, error: error.message, retried: true });
-            continue;
-          }
+          // Requeue it to the left side so it gets retried
+          await redis.lpush(SMS_QUEUE_KEY, smsId);
+          
+          results.push({ smsId, success: false, error: error.message, retried: true });
+          continue;
         }
         
-        // Update status to failed (permanently)
-        await smsStore.updateStatus(smsId, 'failed', error.message || 'Unknown error')
+        // Terminal failure: reached max retries or unrecoverable
+        console.log(`[smsQueue] Terminal failure for SMS ${smsId} after ${nextAttempt} attempts`);
+        await smsStore.updateStatus(
+          smsId,
+          'failed',
+          `Permanent failure after ${nextAttempt} attempts: ${error.message || 'Unknown error'}`,
+          nextAttempt
+        )
         
         results.push({ smsId, success: false, error: error.message, retried: false })
 
