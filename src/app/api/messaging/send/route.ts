@@ -26,16 +26,15 @@ export async function POST(request: Request) {
 
     // Resolve application
     const authHeader = request.headers.get('Authorization')
-    
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return NextResponse.json({ error: 'Missing or invalid Authorization header' }, { status: 401 })
+      return NextResponse.json({ error: 'Missing or invalid authorization header' }, { status: 401 })
     }
-
+    
     const apiKey = authHeader.slice(7)
     const application = await db.application.findFirst({
       where: { apiKey, isActive: true },
     })
-
+    
     if (!application) {
       return NextResponse.json({ error: 'Invalid or inactive application API key' }, { status: 401 })
     }
