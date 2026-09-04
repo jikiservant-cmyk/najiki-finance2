@@ -2,6 +2,23 @@ import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
 import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
+import { Ratelimit } from '@upstash/ratelimit'
+import { Redis } from '@upstash/redis'
+
+// Use Upstash Redis for distributed rate limiting if configured
+let ratelimit: Ratelimit | null = null;
+try {
+  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+    const redis = Redis.fromEnv()
+    ratelimit = new Ratelimit({
+      redis,
+      limiter: Ratelimit.slidingWindow(60, '1 m'),
+      analytics: true,
+    })
+  }
+} catch (e) {
+  console.warn('Failed to initialize rate limiter:', e)
+}
 
 export async function GET(
   request: Request,
@@ -13,6 +30,26 @@ export async function GET(
       return NextResponse.json({ error: 'Missing or invalid authorization header' }, { status: 401 })
     }
     const apiKey = authHeader.slice(7) // Remove 'Bearer ' prefix
+
+    if (ratelimit) {
+      try {
+        // Enforce a strict 1-second timeout on the Redis rate limit check
+        const ratelimitPromise = ratelimit.limit(`get_payment_${apiKey}`)
+        const timeoutPromise = new Promise<{success: boolean}>((_, reject) => 
+           setTimeout(() => reject(new Error('Rate limit timeout')), 1000)
+        )
+        
+        const { success } = await Promise.race([ratelimitPromise, timeoutPromise])
+        if (!success) {
+          return NextResponse.json(
+            { error: 'Too many requests' },
+            { status: 429, headers: { 'Retry-After': '60' } }
+          )
+        }
+      } catch (ratelimitError) {
+        console.warn('Rate limiter failed or timed out, bypassing:', ratelimitError)
+      }
+    }
 
     const application = await db.application.findFirst({
       where: { apiKey, isActive: true }

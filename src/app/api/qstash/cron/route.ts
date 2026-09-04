@@ -3,12 +3,15 @@ import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
 import { createHmac } from 'crypto'
 import { safeFetch } from '@/lib/safe-fetch'
-import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
+import { enqueueWebhookNotification } from '@/lib/payments'
+import { verifyCronRequest } from '@/lib/qstash-verify'
 
 export async function POST(request: Request) {
   try {
-    // Optional QStash signature / secret check if present in env
-    const qstashSignature = request.headers.get('upstash-signature')
+    const isAuthorized = await verifyCronRequest(request)
+    if (!isAuthorized) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
     
     // Parse query params for optional app-specific cron execution
     const url = new URL(request.url)
@@ -57,34 +60,40 @@ export async function POST(request: Request) {
           )
 
           if (result && (result.status === 'success' || result.status === 'failed')) {
-            const { intent: updatedIntent, wasAlreadyProcessed } = await completePayment({
-              paymentIntentId: payment.id,
-              status: result.status,
-              providerPaymentId: result.providerPaymentId,
-              failureReason: result.failureReason,
-              amount: Number(payment.amount),
-              currency: payment.currency,
-              rawProviderResponse: JSON.stringify(result),
-              note: `QSTASH_CRON_POLL | Status: ${result.status}`,
-            })
+            await db.$transaction([
+              db.paymentIntent.update({
+                where: { id: payment.id },
+                data: {
+                  status: result.status,
+                  failureReason: result.failureReason,
+                  completedAt: result.status === 'success' ? new Date() : null,
+                },
+              }),
+              db.paymentTransaction.create({
+                data: {
+                  paymentIntentId: payment.id,
+                  status: result.status,
+                  rawProviderResponse: JSON.stringify(result),
+                  note: `QSTASH_CRON_POLL | Status: ${result.status}`,
+                },
+              }),
+            ])
 
             // Create completion event for webhook delivery
-            if (!wasAlreadyProcessed) {
-              await enqueueWebhookNotification({
-                paymentIntentId: payment.id,
-                reference: payment.reference,
-                status: result.status,
-                amount: Number(payment.amount),
-                currency: payment.currency,
-                providerPaymentId: result.providerPaymentId || payment.providerPaymentId || '',
-                failureReason: result.failureReason,
-                applicationId: payment.applicationId,
-                webhookUrl: `${payment.application.baseUrl}${payment.application.webhookPath}`,
-                apiKey: payment.application.apiKey,
-                externalEntityId: payment.externalEntityId,
-                metadata: payment.metadata ? JSON.parse(payment.metadata) : {},
-              })
-            }
+            await enqueueWebhookNotification({
+              paymentIntentId: payment.id,
+              reference: payment.reference,
+              status: result.status,
+              amount: Number(payment.amount),
+              currency: payment.currency,
+              providerPaymentId: result.providerPaymentId || payment.providerPaymentId || '',
+              failureReason: result.failureReason,
+              applicationId: payment.applicationId,
+              webhookUrl: `${payment.application.baseUrl}${payment.application.webhookPath}`,
+              apiKey: payment.application.apiKey,
+              externalEntityId: payment.externalEntityId,
+              metadata: payment.metadata ? JSON.parse(payment.metadata) : {},
+            })
 
             pollResults.push({ id: payment.id, reference: payment.reference, status: 'resolved', polledStatus: result.status })
           } else {

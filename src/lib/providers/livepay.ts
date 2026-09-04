@@ -162,11 +162,12 @@ export class LivePayProvider implements PaymentProvider {
 
       const webhookPayload = JSON.parse(payload)
       const params = {
-        status: webhookPayload.status || '',
+        amount: String(webhookPayload.amount || ''),
+        currency: webhookPayload.currency || '',
         customer_reference: webhookPayload.customer_reference || '',
         internal_reference: webhookPayload.internal_reference || '',
+        status: webhookPayload.status || '',
       }
-
       const sortedKeys = Object.keys(params).sort() as Array<keyof typeof params>
       
       // Determine possible webhook URLs to support dynamic local, preview, and production environments
@@ -205,7 +206,10 @@ export class LivePayProvider implements PaymentProvider {
           .update(stringToSign)
           .digest('hex')
 
-        if (receivedSignature === expectedSignature) {
+        const receivedBuffer = Buffer.from(receivedSignature)
+        const expectedBuffer = Buffer.from(expectedSignature)
+        
+        if (receivedBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(receivedBuffer, expectedBuffer)) {
           return true
         }
       }

@@ -1,11 +1,17 @@
 import { NextResponse } from 'next/server'
 import { smsQueue } from '@/lib/sms-queue'
+import { verifyCronRequest } from '@/lib/qstash-verify'
 
 // Optional: allow function to run longer on Vercel
 export const maxDuration = 60
 
 export async function POST(request: Request) {
   try {
+    const isAuthorized = await verifyCronRequest(request)
+    if (!isAuthorized) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
     // Process up to 20 SMS messages in one batch
     const results = await smsQueue.processBatch(20)
     
