@@ -21,31 +21,36 @@ export async function POST(request: Request) {
 
     // 2. Resolve target application
     const appCode = applicationCode || 'church'
-    const application = await db.application.findFirst({
-      where: { code: appCode, isActive: true },
-    })
-
-    if (!application) {
-      return NextResponse.json({ error: `Application '${appCode}' not found or inactive` }, { status: 400 })
+    let application: any = null
+    try {
+      application = await db.application.findFirst({
+        where: { code: appCode, isActive: true },
+      })
+    } catch (dbErr) {
+      console.warn('[Quick Send API] Application lookup failed, falling back:', dbErr)
     }
 
     // 3. Create SMS record in store
     const smsRequest = await smsStore.create({
       recipient: to,
       message,
-      applicationCode: application.code,
+      applicationCode: application?.code || appCode,
       providerCode: 'africastalking',
       cost: 50,
-      applicationId: application.id,
+      applicationId: application?.id,
     })
 
     // 4. Enqueue for background execution
     await smsQueue.enqueue(smsRequest.id)
 
-    // Trigger worker asynchronously using Next.js 15 'after' API
-    after(() => {
-      smsQueue.processBatch(5).catch(err => console.error('Background worker error:', err))
-    })
+    // Trigger worker asynchronously using Next.js 15 'after' API if available in request context
+    try {
+      after(() => {
+        smsQueue.processBatch(5).catch(err => console.error('Background worker error:', err))
+      })
+    } catch {
+      // Fallback: smsQueue.enqueue already triggered detached background batch processing
+    }
 
     return NextResponse.json({
       success: true,

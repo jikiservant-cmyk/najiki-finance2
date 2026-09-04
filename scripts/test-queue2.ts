@@ -1,2 +1,2 @@
 import { smsStore } from "../src/lib/sms-store";
-console.log(smsStore.getAll());
+smsStore.getAll().then(console.log).catch(console.error);

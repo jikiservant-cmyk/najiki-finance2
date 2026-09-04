@@ -14,6 +14,15 @@ export const smsQueue = {
   enqueue: async (smsId: string) => {
     // We only push the ID to the queue
     await redis.lpush(SMS_QUEUE_KEY, smsId)
+    // Guarantee background execution so messages are processed immediately without depending solely on external cron
+    const timer = setTimeout(() => {
+      smsQueue.processBatch(5).catch(err => {
+        console.error('[smsQueue] Background processBatch error:', err)
+      })
+    }, 10)
+    if (timer && typeof timer.unref === 'function') {
+      timer.unref()
+    }
   },
 
   /**
@@ -64,17 +73,17 @@ export const smsQueue = {
 
         // Send SMS via Provider
         console.log(`[smsQueue] Sending via provider...`);
-        const result = await sendSmsViaProvider(sms.recipient, sms.message)
+        const result = await sendSmsViaProvider(sms.recipient, sms.message, sms.senderId)
         console.log(`[smsQueue] Send result:`, result);
         
         if (!result.success) {
           throw new Error(result.error || 'Provider rejected SMS delivery')
         }
 
-        // Update status to delivered
-        await smsStore.updateStatus(smsId, 'delivered')
+        // Update status to delivered and attach provider tracking message ID
+        await smsStore.updateStatus(smsId, 'delivered', undefined, undefined, result.providerId)
         
-        results.push({ smsId, success: true })
+        results.push({ smsId, success: true, providerId: result.providerId })
 
         // Fire webhook to connected app
         if (application && application.webhookPath) {

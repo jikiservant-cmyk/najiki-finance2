@@ -49,11 +49,25 @@ export async function sendSmsViaProvider(to: string, message: string, fromSender
       sendOptions.from = senderId.trim()
     }
 
-    const result = await atClient.SMS.send(sendOptions)
+    let result = await atClient.SMS.send(sendOptions)
     console.log("[Africa's Talking] Send result:", JSON.stringify(result, null, 2))
     
-    const recipientData = result.SMSMessageData?.Recipients?.[0]
-    const status = recipientData?.status || ''
+    let recipientData = result.SMSMessageData?.Recipients?.[0]
+    let status = recipientData?.status || ''
+
+    // If an explicitly configured senderId failed due to InvalidSenderId, retry without 'from' so delivery succeeds
+    if (
+      sendOptions.from &&
+      (!recipientData || result.SMSMessageData?.Message === 'InvalidSenderId' || status.toLowerCase() === 'invalidsenderid')
+    ) {
+      console.warn(`[Africa's Talking] Sender ID "${sendOptions.from}" rejected as InvalidSenderId by telco. Retrying via default route...`)
+      delete sendOptions.from
+      result = await atClient.SMS.send(sendOptions)
+      console.log("[Africa's Talking] Retry send result:", JSON.stringify(result, null, 2))
+      recipientData = result.SMSMessageData?.Recipients?.[0]
+      status = recipientData?.status || ''
+    }
+
     const isSuccess = status.toLowerCase() === 'success' || status.toLowerCase() === 'submitted' || status.toLowerCase() === 'buffered'
 
     if (!isSuccess) {
@@ -68,7 +82,9 @@ export async function sendSmsViaProvider(to: string, message: string, fromSender
 
     return { 
       success: true, 
-      providerId: recipientData?.messageId || 'at_msg' 
+      providerId: recipientData?.messageId || 'at_msg',
+      cost: recipientData?.cost,
+      status: status,
     }
   } catch (error: any) {
     console.error("[Africa's Talking] Exception sending SMS:", error)

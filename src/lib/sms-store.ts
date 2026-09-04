@@ -11,6 +11,8 @@ export interface SmsRequest {
   applicationCode: string
   providerCode: string
   cost: number
+  senderId?: string
+  providerMessageId?: string
   failureReason?: string
   createdAt: string
   updatedAt: string
@@ -26,6 +28,7 @@ export const smsStore = {
     providerCode: string
     cost: number
     applicationId?: string
+    senderId?: string
   }) => {
     const item: SmsRequest = {
       id: 'sms_' + Math.random().toString(36).substring(2, 11),
@@ -38,6 +41,7 @@ export const smsStore = {
       applicationCode: params.applicationCode,
       providerCode: params.providerCode,
       cost: params.cost,
+      senderId: params.senderId,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     }
@@ -74,7 +78,8 @@ export const smsStore = {
     id: string,
     status: SmsRequest['status'],
     failureReason?: string,
-    attemptCount?: number
+    attemptCount?: number,
+    providerMessageId?: string
   ) => {
     const item = await smsStore.get(id)
     if (item) {
@@ -85,6 +90,9 @@ export const smsStore = {
       }
       if (typeof attemptCount === 'number') {
         item.attemptCount = attemptCount
+      }
+      if (providerMessageId) {
+        item.providerMessageId = providerMessageId
       }
       await redis.hset(SMS_HASH_KEY, { [id]: JSON.stringify(item) })
       return item
