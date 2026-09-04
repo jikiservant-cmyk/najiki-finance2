@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import crypto from 'crypto'
+import { requireSuperAdmin } from '@/lib/auth'
 
 function generateApiKey(): string {
   return `nk_${crypto.randomBytes(24).toString('hex')}`
@@ -8,6 +9,8 @@ function generateApiKey(): string {
 
 export async function POST(request: Request) {
   try {
+    await requireSuperAdmin()
+
     const { type, data } = await request.json()
 
     let result
@@ -64,8 +67,10 @@ export async function POST(request: Request) {
     }
 
     return NextResponse.json(result)
-  } catch (error) {
+  } catch (error: any) {
     console.error('Setup error:', error)
+    if (error.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    if (error.message === 'Forbidden: Super Admin required') return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
     return NextResponse.json(
       { error: error instanceof Error ? error.message : 'Internal server error' },
       { status: 500 }

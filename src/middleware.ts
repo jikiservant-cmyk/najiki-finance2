@@ -86,6 +86,9 @@ export async function middleware(request: NextRequest) {
     }
 
     if (!user) {
+      if (request.nextUrl.pathname.startsWith('/api/')) {
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+      }
       return NextResponse.redirect(new URL('/login', request.url))
     }
 

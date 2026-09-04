@@ -25,33 +25,23 @@ export async function POST(request: Request) {
     }
 
     // Resolve application
-    let application: any = null
     const authHeader = request.headers.get('Authorization')
     
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      const apiKey = authHeader.slice(7)
-      application = await db.application.findFirst({
-        where: { apiKey, isActive: true },
-      })
-      if (!application) {
-        return NextResponse.json({ error: 'Invalid or inactive application API key' }, { status: 401 })
-      }
-    } else {
-      // Find application matching applicationCode, or fallback to first active
-      if (applicationCode) {
-        application = await db.application.findFirst({
-          where: { code: applicationCode, isActive: true },
-        })
-      }
-      if (!application) {
-        application = await db.application.findFirst({
-          where: { isActive: true },
-        })
-      }
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return NextResponse.json({ error: 'Missing or invalid Authorization header' }, { status: 401 })
     }
 
-    const appCode = application?.code || 'najiki'
-    const appId = application?.id || undefined
+    const apiKey = authHeader.slice(7)
+    const application = await db.application.findFirst({
+      where: { apiKey, isActive: true },
+    })
+
+    if (!application) {
+      return NextResponse.json({ error: 'Invalid or inactive application API key' }, { status: 401 })
+    }
+
+    const appCode = application.code
+    const appId = application.id
 
     // 1. Create the SMS request in our Redis store (no schema change!)
     const smsRequest = await smsStore.create({

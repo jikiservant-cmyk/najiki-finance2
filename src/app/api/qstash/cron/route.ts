@@ -3,7 +3,7 @@ import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
 import { createHmac } from 'crypto'
 import { safeFetch } from '@/lib/safe-fetch'
-import { enqueueWebhookNotification } from '@/lib/payments'
+import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
 
 export async function POST(request: Request) {
   try {
@@ -57,40 +57,34 @@ export async function POST(request: Request) {
           )
 
           if (result && (result.status === 'success' || result.status === 'failed')) {
-            await db.$transaction([
-              db.paymentIntent.update({
-                where: { id: payment.id },
-                data: {
-                  status: result.status,
-                  failureReason: result.failureReason,
-                  completedAt: result.status === 'success' ? new Date() : null,
-                },
-              }),
-              db.paymentTransaction.create({
-                data: {
-                  paymentIntentId: payment.id,
-                  status: result.status,
-                  rawProviderResponse: JSON.stringify(result),
-                  note: `QSTASH_CRON_POLL | Status: ${result.status}`,
-                },
-              }),
-            ])
-
-            // Create completion event for webhook delivery
-            await enqueueWebhookNotification({
+            const { intent: updatedIntent, wasAlreadyProcessed } = await completePayment({
               paymentIntentId: payment.id,
-              reference: payment.reference,
               status: result.status,
+              providerPaymentId: result.providerPaymentId,
+              failureReason: result.failureReason,
               amount: Number(payment.amount),
               currency: payment.currency,
-              providerPaymentId: result.providerPaymentId || payment.providerPaymentId || '',
-              failureReason: result.failureReason,
-              applicationId: payment.applicationId,
-              webhookUrl: `${payment.application.baseUrl}${payment.application.webhookPath}`,
-              apiKey: payment.application.apiKey,
-              externalEntityId: payment.externalEntityId,
-              metadata: payment.metadata ? JSON.parse(payment.metadata) : {},
+              rawProviderResponse: JSON.stringify(result),
+              note: `QSTASH_CRON_POLL | Status: ${result.status}`,
             })
+
+            // Create completion event for webhook delivery
+            if (!wasAlreadyProcessed) {
+              await enqueueWebhookNotification({
+                paymentIntentId: payment.id,
+                reference: payment.reference,
+                status: result.status,
+                amount: Number(payment.amount),
+                currency: payment.currency,
+                providerPaymentId: result.providerPaymentId || payment.providerPaymentId || '',
+                failureReason: result.failureReason,
+                applicationId: payment.applicationId,
+                webhookUrl: `${payment.application.baseUrl}${payment.application.webhookPath}`,
+                apiKey: payment.application.apiKey,
+                externalEntityId: payment.externalEntityId,
+                metadata: payment.metadata ? JSON.parse(payment.metadata) : {},
+              })
+            }
 
             pollResults.push({ id: payment.id, reference: payment.reference, status: 'resolved', polledStatus: result.status })
           } else {
