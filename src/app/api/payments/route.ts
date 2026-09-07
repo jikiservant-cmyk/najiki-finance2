@@ -175,7 +175,8 @@ export async function POST(request: Request) {
 
     const host = request.headers.get('x-forwarded-host') || request.headers.get('host') || 'localhost:3000'
     const protocol = request.headers.get('x-forwarded-proto') || 'https'
-    const appBaseUrl = process.env.NEXTAUTH_URL || `${protocol}://${host}`
+    const rawAppBaseUrl = process.env.NEXTAUTH_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : `${protocol}://${host}`)
+    const appBaseUrl = rawAppBaseUrl.replace(/\/+$/, '')
     const webhookUrl = `${appBaseUrl}/api/webhooks/${provider.code.toLowerCase()}`
 
     // Process payment synchronously to avoid Vercel killing the background task

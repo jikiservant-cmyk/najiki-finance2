@@ -196,8 +196,17 @@ export async function completePayment(data: {
 
 import { Client } from '@upstash/qstash'
 import { createHmac } from 'crypto'
+import { safeFetch } from './safe-fetch'
 
-const qstash = new Client({ token: process.env.QSTASH_TOKEN || 'fake-token' })
+let qstashClient: Client | null = null
+function getQStashClient(): Client | null {
+  const token = process.env.QSTASH_TOKEN
+  if (!token) return null
+  if (!qstashClient) {
+    qstashClient = new Client({ token })
+  }
+  return qstashClient
+}
 
 export async function enqueueWebhookNotification(data: {
   paymentIntentId: string
@@ -213,10 +222,6 @@ export async function enqueueWebhookNotification(data: {
   externalEntityId?: string | null
   metadata: any
 }) {
-  if (process.env.NODE_ENV === 'production' && !process.env.QSTASH_TOKEN) {
-    throw new Error('CRITICAL: QSTASH_TOKEN is missing in production. Webhooks cannot be delivered silently failing.')
-  }
-
   const payloadObject = {
     paymentIntentId: data.paymentIntentId,
     reference: data.reference,
@@ -242,14 +247,35 @@ export async function enqueueWebhookNotification(data: {
     headers['Authorization'] = `Bearer ${data.apiKey}`
   }
 
+  // 1. Primary path: Use Upstash QStash with 5 automatic retries and exponential backoff
   try {
-    await qstash.publishJSON({
-      url: data.webhookUrl,
-      body: payloadObject,
-      headers,
-      retries: 5, // QStash native retries with exponential backoff
-    })
+    const client = getQStashClient()
+    if (client) {
+      await client.publishJSON({
+        url: data.webhookUrl,
+        body: payloadObject,
+        headers,
+        retries: 5, // QStash native retries with exponential backoff
+      })
+      console.log(`[QStash] Webhook successfully enqueued for ${data.webhookUrl}`)
+      return
+    } else {
+      console.warn('[QStash] QSTASH_TOKEN not configured, using direct safeFetch fallback.')
+    }
   } catch (err: any) {
-    console.error('Failed to enqueue webhook via QStash:', err)
+    console.error('[QStash] Failed to enqueue webhook via QStash, falling back to direct dispatch:', err)
+  }
+
+  // 2. Resilient fallback: Direct delivery via safeFetch (with SSRF protection & placeholder prevention)
+  try {
+    console.log(`[Webhook] Delivering directly via safeFetch to ${data.webhookUrl}...`)
+    const res = await safeFetch(data.webhookUrl, {
+      method: 'POST',
+      headers,
+      body: payloadString,
+    })
+    console.log(`[Webhook] Direct delivery response status: ${res.status}`)
+  } catch (directErr: any) {
+    console.error('[Webhook] Direct safeFetch delivery error:', directErr)
   }
 }

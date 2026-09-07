@@ -1,9 +1,7 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
-import { createHmac } from 'crypto'
-import { safeFetch } from '@/lib/safe-fetch'
-import { enqueueWebhookNotification } from '@/lib/payments'
+import { completePayment, enqueueWebhookNotification } from '@/lib/payments'
 import { verifyCronRequest } from '@/lib/qstash-verify'
 
 export async function POST(request: Request) {
@@ -29,6 +27,7 @@ export async function POST(request: Request) {
         provider: true,
         application: true,
         tenant: true,
+        paymentType: true,
       },
       take: 50,
     })
@@ -37,8 +36,11 @@ export async function POST(request: Request) {
 
     for (const payment of pendingPayments) {
       try {
+        const platformFeeTypes = ['SMS', 'BUY_SMS', 'SMS_TOPUP', 'ACTIVATION', 'ACCOUNT_ACTIVATION', 'SUBSCRIPTION', 'MONTHLY_SUBSCRIPTION', 'PLATFORM_FEE']
+        const isPlatformPayment = payment.paymentType && platformFeeTypes.includes(payment.paymentType.code.toUpperCase())
+
         let customCredentials: any = undefined
-        if (payment.tenantId) {
+        if (payment.tenantId && !isPlatformPayment) {
           const tenantConfig = await db.tenantProviderConfig.findFirst({
             where: {
               tenantId: payment.tenantId,
@@ -60,40 +62,34 @@ export async function POST(request: Request) {
           )
 
           if (result && (result.status === 'success' || result.status === 'failed')) {
-            await db.$transaction([
-              db.paymentIntent.update({
-                where: { id: payment.id },
-                data: {
-                  status: result.status,
-                  failureReason: result.failureReason,
-                  completedAt: result.status === 'success' ? new Date() : null,
-                },
-              }),
-              db.paymentTransaction.create({
-                data: {
-                  paymentIntentId: payment.id,
-                  status: result.status,
-                  rawProviderResponse: JSON.stringify(result),
-                  note: `QSTASH_CRON_POLL | Status: ${result.status}`,
-                },
-              }),
-            ])
-
-            // Create completion event for webhook delivery
-            await enqueueWebhookNotification({
+            const completion = await completePayment({
               paymentIntentId: payment.id,
-              reference: payment.reference,
               status: result.status,
-              amount: Number(payment.amount),
-              currency: payment.currency,
               providerPaymentId: result.providerPaymentId || payment.providerPaymentId || '',
               failureReason: result.failureReason,
-              applicationId: payment.applicationId,
-              webhookUrl: `${payment.application.baseUrl}${payment.application.webhookPath}`,
-              apiKey: payment.application.apiKey,
-              externalEntityId: payment.externalEntityId,
-              metadata: payment.metadata ? JSON.parse(payment.metadata) : {},
+              amount: Number(payment.amount),
+              currency: payment.currency,
+              rawProviderResponse: JSON.stringify(result),
+              note: `QSTASH_CRON_POLL | Status: ${result.status}`,
             })
+
+            // Only enqueue webhook if it wasn't already processed
+            if (!completion.wasAlreadyProcessed) {
+              await enqueueWebhookNotification({
+                paymentIntentId: payment.id,
+                reference: payment.reference,
+                status: result.status,
+                amount: Number(payment.amount),
+                currency: payment.currency,
+                providerPaymentId: result.providerPaymentId || payment.providerPaymentId || '',
+                failureReason: result.failureReason,
+                applicationId: payment.applicationId,
+                webhookUrl: `${payment.application.baseUrl}${payment.application.webhookPath}`,
+                apiKey: payment.application.apiKey,
+                externalEntityId: payment.externalEntityId,
+                metadata: payment.metadata ? JSON.parse(payment.metadata) : {},
+              })
+            }
 
             pollResults.push({ id: payment.id, reference: payment.reference, status: 'resolved', polledStatus: result.status })
           } else {

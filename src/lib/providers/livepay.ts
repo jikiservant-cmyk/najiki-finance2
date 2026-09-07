@@ -26,6 +26,8 @@ export class LivePayProvider implements PaymentProvider {
 
   async initiatePayment(params: InitiatePaymentParams): Promise<InitiatePaymentResponse> {
     try {
+      const rawAuthUrl = process.env.NEXTAUTH_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:3000')
+      const normalizedBase = rawAuthUrl.replace(/\/+$/, '')
       const payload = {
         accountNumber: this.accountNo,
         phoneNumber: params.phoneNumber.replace(/[\s\-\(\)\+]/g, "").startsWith("0") ? "256" + params.phoneNumber.replace(/[\s\-\(\)\+]/g, "").slice(1) : params.phoneNumber.replace(/[\s\-\(\)\+]/g, ""),
@@ -33,7 +35,7 @@ export class LivePayProvider implements PaymentProvider {
         currency: params.currency || 'UGX',
         reference: params.reference,
         description: params.description || 'Payment',
-        webhookUrl: params.webhookUrl || `${process.env.NEXTAUTH_URL || 'http://localhost:3000'}/api/webhooks/livepay`,
+        webhookUrl: params.webhookUrl || `${normalizedBase}/api/webhooks/livepay`,
       }
 
       const response = await fetch(`${this.baseUrl}/api/collect-money`, {
@@ -187,6 +189,13 @@ export class LivePayProvider implements PaymentProvider {
         const fallbackUrl = `${nextAuthUrl.replace(/\/$/, '')}/api/webhooks/livepay`
         possibleWebhookUrls.push(fallbackUrl)
         possibleWebhookUrls.push(`${fallbackUrl}/`)
+      }
+
+      const vercelUrl = process.env.VERCEL_URL
+      if (vercelUrl) {
+        const fallbackVercel = `https://${vercelUrl.replace(/\/$/, '')}/api/webhooks/livepay`
+        possibleWebhookUrls.push(fallbackVercel)
+        possibleWebhookUrls.push(`${fallbackVercel}/`)
       }
       
       possibleWebhookUrls.push('https://ais-dev-euerua7hv3ffzjninpghye-159837012533.europe-west3.run.app/api/webhooks/livepay')
