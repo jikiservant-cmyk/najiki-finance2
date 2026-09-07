@@ -136,9 +136,12 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Invalid or inactive tenant' }, { status: 404 })
     }
 
-    // Prefer tenant's default provider
+    // Prefer tenant's default provider, UNLESS it's a platform payment
+    const platformFeeTypes = ['SMS', 'BUY_SMS', 'SMS_TOPUP', 'ACTIVATION', 'ACCOUNT_ACTIVATION', 'SUBSCRIPTION', 'MONTHLY_SUBSCRIPTION', 'PLATFORM_FEE']
+    const isPlatformPayment = paymentType && platformFeeTypes.includes(paymentType.code.toUpperCase())
+
     let provider = activeProvider
-    if (tenant?.defaultProviderId) {
+    if (tenant?.defaultProviderId && !isPlatformPayment) {
       const tenantProvider = await db.provider.findFirst({
         where: { id: tenant.defaultProviderId, isActive: true },
       })

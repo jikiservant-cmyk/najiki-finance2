@@ -19,10 +19,16 @@ export async function processPayment(data: {
     let customCredentials: any = undefined
     const payment = await db.paymentIntent.findUnique({
       where: { id: paymentIntentId },
-      include: { application: true },
+      include: { application: true, paymentType: true },
     })
 
-    if (payment?.tenantId && payment?.providerId) {
+    // Define payment types that go to the platform (owner's main account)
+    const platformFeeTypes = ['SMS', 'BUY_SMS', 'SMS_TOPUP', 'ACTIVATION', 'ACCOUNT_ACTIVATION', 'SUBSCRIPTION', 'MONTHLY_SUBSCRIPTION', 'PLATFORM_FEE']
+    const isPlatformPayment = payment?.paymentType && platformFeeTypes.includes(payment.paymentType.code.toUpperCase())
+
+    // Only load tenant credentials if it's NOT a platform payment. 
+    // Platform payments use the default global credentials.
+    if (payment?.tenantId && payment?.providerId && !isPlatformPayment) {
       const tenantConfig = await db.tenantProviderConfig.findFirst({
         where: {
           tenantId: payment.tenantId,
@@ -104,7 +110,7 @@ export async function completePayment(data: {
 
   const fullPaymentIntent = await db.paymentIntent.findUnique({
     where: { id: paymentIntentId },
-    include: { application: true, tenant: true },
+    include: { application: true, tenant: true, paymentType: true },
   })
 
   if (!fullPaymentIntent) throw new Error('Payment not found')
@@ -143,8 +149,13 @@ export async function completePayment(data: {
       },
     })
 
+    // Define payment types that go to the platform (owner's main account)
+    const platformFeeTypes = ['SMS', 'BUY_SMS', 'SMS_TOPUP', 'ACTIVATION', 'ACCOUNT_ACTIVATION', 'SUBSCRIPTION', 'MONTHLY_SUBSCRIPTION', 'PLATFORM_FEE']
+    const isPlatformPayment = fullPaymentIntent.paymentType && platformFeeTypes.includes(fullPaymentIntent.paymentType.code.toUpperCase())
+
     // If payment was successful, update wallet based on application type!
-    if (status === 'success' && fullPaymentIntent.tenant) {
+    // We ONLY credit the tenant's actual wallet balance if it's NOT a platform payment (e.g. SAVINGS).
+    if (status === 'success' && fullPaymentIntent.tenant && !isPlatformPayment) {
       const appCode = fullPaymentIntent.application.code.toLowerCase()
       const tenantId = fullPaymentIntent.tenant.id
 
