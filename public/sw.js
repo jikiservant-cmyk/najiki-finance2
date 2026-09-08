@@ -1,5 +1,5 @@
 // Service Worker for Na'jiki PWA
-const CACHE_NAME = 'najiki-cache-v1';
+const CACHE_NAME = 'najiki-cache-v2';
 const OFFLINE_URL = '/offline';
 
 const PRECACHE_ASSETS = [
@@ -56,9 +56,26 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Handle Static Assets (_next/static, icons, images, fonts) -> Cache First with Network Fallback
+  // Handle Next.js Static Chunks -> Always Network First to avoid stale Webpack module references
+  if (url.pathname.startsWith('/_next/')) {
+    event.respondWith(
+      fetch(request)
+        .then((networkResponse) => {
+          if (networkResponse && networkResponse.status === 200) {
+            const responseToCache = networkResponse.clone();
+            caches.open(CACHE_NAME).then((cache) => {
+              cache.put(request, responseToCache);
+            });
+          }
+          return networkResponse;
+        })
+        .catch(() => caches.match(request))
+    );
+    return;
+  }
+
+  // Handle Static Media Assets (icons, images, fonts) -> Cache First with Network Fallback
   if (
-    url.pathname.startsWith('/_next/static/') ||
     url.pathname.startsWith('/icons/') ||
     url.pathname.endsWith('.svg') ||
     url.pathname.endsWith('.png') ||

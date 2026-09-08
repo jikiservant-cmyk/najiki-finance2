@@ -34,11 +34,22 @@ export function PwaRegistrar() {
         setIsIOS(true)
       }
 
-      // 2. Register Service Worker
+      // 2. Register Service Worker and purge legacy caches
+      if ('caches' in window) {
+        caches.keys().then((keys) => {
+          keys.forEach((key) => {
+            if (key !== 'najiki-cache-v2') {
+              caches.delete(key)
+            }
+          })
+        })
+      }
+
       if ('serviceWorker' in navigator) {
         navigator.serviceWorker
           .register('/sw.js')
           .then((registration) => {
+            registration.update().catch(() => {})
             console.log('[PWA] Service Worker registered with scope:', registration.scope)
           })
           .catch((err) => {
@@ -69,7 +80,30 @@ export function PwaRegistrar() {
       window.addEventListener('online', handleOnline)
       window.addEventListener('offline', handleOffline)
 
+      // 5. Optional early tap-to-dismiss for the brand splash screen
+      const splashEl = document.getElementById('najiki-splash-screen')
+      const handleSplashDismiss = () => {
+        if (splashEl) {
+          splashEl.style.transition = 'opacity 0.35s ease, transform 0.35s ease'
+          splashEl.style.opacity = '0'
+          splashEl.style.pointerEvents = 'none'
+          splashEl.style.transform = 'scale(1.04)'
+          setTimeout(() => {
+            if (splashEl) {
+              splashEl.style.display = 'none'
+            }
+          }, 360)
+        }
+      }
+
+      if (splashEl) {
+        splashEl.addEventListener('click', handleSplashDismiss)
+      }
+
       return () => {
+        if (splashEl) {
+          splashEl.removeEventListener('click', handleSplashDismiss)
+        }
         window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt)
         window.removeEventListener('appinstalled', handleAppInstalled)
         window.removeEventListener('online', handleOnline)

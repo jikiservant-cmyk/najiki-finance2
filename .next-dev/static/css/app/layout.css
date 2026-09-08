@@ -583,6 +583,9 @@
   .z-\[100\] {
     z-index: 100;
   }
+  .z-\[99999\] {
+    z-index: 99999;
+  }
   .col-start-2 {
     grid-column-start: 2;
   }
@@ -1655,6 +1658,12 @@
       border-color: color-mix(in oklab, var(--primary-foreground) 30%, transparent);
     }
   }
+  .border-primary\/30 {
+    border-color: var(--primary);
+    @supports (color: color-mix(in lab, red, red)) {
+      border-color: color-mix(in oklab, var(--primary) 30%, transparent);
+    }
+  }
   .border-red-500\/20 {
     border-color: color-mix(in srgb, oklch(63.7% 0.237 25.331) 20%, transparent);
     @supports (color: color-mix(in lab, red, red)) {
@@ -1889,6 +1898,12 @@
       background-color: color-mix(in oklab, var(--primary) 10%, transparent);
     }
   }
+  .bg-primary\/15 {
+    background-color: var(--primary);
+    @supports (color: color-mix(in lab, red, red)) {
+      background-color: color-mix(in oklab, var(--primary) 15%, transparent);
+    }
+  }
   .bg-primary\/20 {
     background-color: var(--primary);
     @supports (color: color-mix(in lab, red, red)) {
@@ -2016,6 +2031,9 @@
   }
   .p-1 {
     padding: calc(var(--spacing) * 1);
+  }
+  .p-1\.5 {
+    padding: calc(var(--spacing) * 1.5);
   }
   .p-2 {
     padding: calc(var(--spacing) * 2);
@@ -6089,6 +6107,67 @@
 .stack-3d > *:nth-child(3) {
   transform: translateZ(-20px) scale(0.96);
 }
+@keyframes splash-float {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-6px);
+  }
+}
+@keyframes splash-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+.splash-icon {
+  width: 70px;
+  height: 70px;
+  margin-bottom: 12px;
+  animation: splash-float 2.5s ease-in-out infinite;
+}
+.splash-icon path {
+  stroke-dasharray: 200;
+  stroke-dashoffset: 200;
+  animation: splash-draw 1.4s ease forwards;
+}
+.splash-title {
+  margin: 0;
+  font-size: 26px;
+  color: oklch(0.95 0.01 140);
+  font-family: Georgia, "Times New Roman", serif;
+  font-weight: bold;
+  letter-spacing: -0.02em;
+}
+.splash-tagline {
+  margin-top: 6px;
+  color: oklch(0.58 0.03 150);
+  font-size: 14px;
+}
+.splash-bg {
+  background: radial-gradient(circle at 20% 30%, oklch(0.72 0.19 155 / 0.18), transparent 40%),
+    radial-gradient(circle at 80% 70%, oklch(0.72 0.19 155 / 0.12), transparent 50%),
+    linear-gradient(135deg, oklch(0.18 0.025 155), oklch(0.14 0.02 155), oklch(0.10 0.02 155));
+}
+#najiki-splash-screen {
+  animation: splashFadeOut 0.6s cubic-bezier(0.16, 1, 0.3, 1) 2.1s forwards;
+}
+@keyframes splashFadeOut {
+  0% {
+    opacity: 1;
+    visibility: visible;
+  }
+  99% {
+    opacity: 0;
+    visibility: visible;
+  }
+  100% {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    display: none;
+  }
+}
 @property --tw-translate-x {
   syntax: "*";
   inherits: false;
@@ -6569,4 +6648,6 @@
     }
   }
 }
+
+
 

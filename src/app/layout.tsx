@@ -63,8 +63,29 @@ export default function RootLayout({
         <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
       </head>
       <body
+        suppressHydrationWarning
         className={`${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground`}
       >
+        {/* Instant Brand Splash Screen (0ms initial paint, pure CSS fade-out) */}
+        <div
+          id="najiki-splash-screen"
+          suppressHydrationWarning
+          className="splash-bg fixed inset-0 z-[99999] flex flex-col items-center justify-center cursor-pointer select-none"
+        >
+          <div className="splash-icon">
+            <svg viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg" className="w-full h-full">
+              <path
+                d="M40 80 V25 C40 15, 60 15, 60 30 C60 45, 40 45, 40 45"
+                stroke="oklch(0.72 0.19 155)"
+                strokeWidth="4"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+          </div>
+          <h1 className="splash-title">Najiki</h1>
+          <p className="splash-tagline">Because every name matters.</p>
+        </div>
         {children}
         <Toaster />
         <PwaRegistrar />

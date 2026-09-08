@@ -42,9 +42,17 @@ export function Navigation() {
               initial={{ scale: 0, rotate: -180 }}
               animate={{ scale: 1, rotate: 0 }}
               transition={{ delay: 0.4, duration: 0.5, type: 'spring', stiffness: 200 }}
-              className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center"
+              className="w-8 h-8 rounded-lg bg-primary/15 border border-primary/30 flex items-center justify-center p-1.5"
             >
-              <span className="text-primary-foreground text-xs font-black">N</span>
+              <svg viewBox="0 0 100 100" fill="none" className="w-full h-full" xmlns="http://www.w3.org/2000/svg">
+                <path
+                  d="M40 80 V25 C40 15, 60 15, 60 30 C60 45, 40 45, 40 45"
+                  stroke="oklch(0.72 0.19 155)"
+                  strokeWidth="8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
             </motion.div>
             <motion.span
               initial={{ opacity: 0, x: -10 }}
