@@ -12,6 +12,7 @@ import { getPaymentProvider, getAvailableProviders } from '@/lib/providers'
 import { createWebhookLog, getPaymentByReference } from '@/lib/data'
 import { PrismaClient } from '@prisma/client'
 import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
+import { decrypt } from '@/lib/encryption'
 
 export async function POST(
   request: Request,
@@ -69,6 +70,9 @@ export async function POST(
         })
         if (tenantConfig?.configJson && typeof tenantConfig.configJson === 'object') {
           customCredentials = tenantConfig.configJson
+          if (customCredentials?._encrypted) {
+            customCredentials = JSON.parse(decrypt(customCredentials._encrypted))
+          }
         }
       }
     }

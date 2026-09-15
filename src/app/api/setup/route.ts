@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import crypto from 'crypto'
 import { requireSuperAdmin } from '@/lib/auth'
 import { validateSafeUrl } from '@/lib/safe-fetch'
+import { encrypt } from '@/lib/encryption'
 
 function generateApiKey(): string {
   return `nk_${crypto.randomBytes(24).toString('hex')}`
@@ -137,11 +138,15 @@ export async function POST(request: Request) {
         break
 
       case 'tenantProviderConfig': {
-        const configJson = {
+        const rawCreds = {
           apiKey: data.apiKey?.trim() || '',
           accountNo: data.accountNo?.trim() || '',
           webhookSecret: data.webhookSecret?.trim() || '',
           baseUrl: data.baseUrl?.trim() || 'https://livepay.me',
+        }
+        
+        const configJson = {
+          _encrypted: encrypt(JSON.stringify(rawCreds))
         }
 
         if (data.id) {

@@ -71,8 +71,10 @@ export async function POST(request: Request) {
         )
       }
     } catch (ratelimitError) {
-      console.warn('Rate limiter failed or timed out, bypassing:', ratelimitError)
-      // Bypass rate limiting if Redis is down/fails to prevent breaking payments
+      console.warn('Rate limiter failed or timed out:', ratelimitError)
+      if (process.env.NODE_ENV === 'production') {
+        return NextResponse.json({ error: 'Service temporarily unavailable' }, { status: 503 })
+      }
     }
   }
 

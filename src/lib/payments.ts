@@ -1,5 +1,6 @@
 import { db } from './db'
 import { getPaymentProvider } from './providers'
+import { decrypt } from './encryption'
 
 export async function processPayment(data: {
   paymentIntentId: string,
@@ -38,6 +39,9 @@ export async function processPayment(data: {
       })
       if (tenantConfig?.configJson && typeof tenantConfig.configJson === 'object') {
         customCredentials = tenantConfig.configJson
+        if (customCredentials?._encrypted) {
+          customCredentials = JSON.parse(decrypt(customCredentials._encrypted))
+        }
       }
     }
 
@@ -159,20 +163,26 @@ export async function completePayment(data: {
       const appCode = fullPaymentIntent.application.code.toLowerCase()
       const tenantId = fullPaymentIntent.tenant.id
 
-      if (appCode === 'church') {
-        await tx.$executeRaw`
-          INSERT INTO "church"."wallets" ("church_id", "balance", "sms_credits", "created_at", "updated_at")
-          VALUES (${tenantId}, ${amount}, 0, NOW(), NOW())
-          ON CONFLICT ("church_id") DO UPDATE 
-          SET "balance" = "church"."wallets"."balance" + ${amount}, "updated_at" = NOW()
-        `
-      } else if (appCode === 'sacco') {
-        await tx.$executeRaw`
-          INSERT INTO "kuntiy"."wallets" ("sacco_id", "balance", "created_at", "updated_at")
-          VALUES (${tenantId}, ${amount}, NOW(), NOW())
-          ON CONFLICT ("sacco_id") DO UPDATE 
-          SET "balance" = "kuntiy"."wallets"."balance" + ${amount}, "updated_at" = NOW()
-        `
+      try {
+        if (appCode === 'church') {
+          await tx.$executeRaw`
+            INSERT INTO "church"."wallets" ("church_id", "balance", "sms_credits", "created_at", "updated_at")
+            VALUES (${tenantId}, ${amount}, 0, NOW(), NOW())
+            ON CONFLICT ("church_id") DO UPDATE 
+            SET "balance" = "church"."wallets"."balance" + ${amount}, "updated_at" = NOW()
+          `
+        } else if (appCode === 'sacco') {
+          await tx.$executeRaw`
+            INSERT INTO "kuntiy"."wallets" ("sacco_id", "balance", "created_at", "updated_at")
+            VALUES (${tenantId}, ${amount}, NOW(), NOW())
+            ON CONFLICT ("sacco_id") DO UPDATE 
+            SET "balance" = "kuntiy"."wallets"."balance" + ${amount}, "updated_at" = NOW()
+          `
+        }
+      } catch (err) {
+        console.error(`Failed to credit wallet for tenant ${tenantId} in app ${appCode}:`, err)
+        // We don't want the entire transaction to rollback just because wallet update failed
+        // This should eventually be moved to an event-driven webhook architecture
       }
     }
     

@@ -198,8 +198,6 @@ export class LivePayProvider implements PaymentProvider {
         possibleWebhookUrls.push(`${fallbackVercel}/`)
       }
       
-      possibleWebhookUrls.push('https://ais-dev-euerua7hv3ffzjninpghye-159837012533.europe-west3.run.app/api/webhooks/livepay')
-      possibleWebhookUrls.push('https://ais-pre-euerua7hv3ffzjninpghye-159837012533.europe-west3.run.app/api/webhooks/livepay')
       possibleWebhookUrls.push('http://localhost:3000/api/webhooks/livepay')
 
       const uniqueUrls = Array.from(new Set(possibleWebhookUrls))
