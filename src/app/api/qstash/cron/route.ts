@@ -3,6 +3,8 @@ import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
 import { completePayment, enqueueWebhookNotification } from '@/lib/payments'
 import { verifyCronRequest } from '@/lib/qstash-verify'
+import { decrypt } from '@/lib/encryption'
+import { PLATFORM_FEE_TYPES } from '@/lib/constants'
 
 export async function POST(request: Request) {
   try {
@@ -36,8 +38,7 @@ export async function POST(request: Request) {
 
     for (const payment of pendingPayments) {
       try {
-        const platformFeeTypes = ['SMS', 'BUY_SMS', 'SMS_TOPUP', 'ACTIVATION', 'ACCOUNT_ACTIVATION', 'SUBSCRIPTION', 'MONTHLY_SUBSCRIPTION', 'PLATFORM_FEE']
-        const isPlatformPayment = payment.paymentType && platformFeeTypes.includes(payment.paymentType.code.toUpperCase())
+        const isPlatformPayment = payment.paymentType && PLATFORM_FEE_TYPES.includes(payment.paymentType.code.toUpperCase())
 
         let customCredentials: any = undefined
         if (payment.tenantId && !isPlatformPayment) {
@@ -50,6 +51,9 @@ export async function POST(request: Request) {
           })
           if (tenantConfig?.configJson && typeof tenantConfig.configJson === 'object') {
             customCredentials = tenantConfig.configJson
+            if (customCredentials?._encrypted) {
+              customCredentials = JSON.parse(decrypt(customCredentials._encrypted))
+            }
           }
         }
 

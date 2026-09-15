@@ -34,6 +34,6 @@ export function decrypt(payload: string): string {
     return dec.toString('utf8')
   } catch (err) {
     console.error('Decryption failed', err)
-    return '{}'
+    throw new Error('Decryption failed')
   }
 }

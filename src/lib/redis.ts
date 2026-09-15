@@ -52,7 +52,7 @@ export const redis = (() => {
   }
 
   if (process.env.NODE_ENV === 'production') {
-    console.error('CRITICAL WARNING: UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN are missing in production. Falling back to in-memory MockRedis.');
+    throw new Error('CRITICAL: UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN must be configured in production.');
   } else {
     console.warn('WARN: Using in-memory MockRedis. This should only be used in local development.');
   }

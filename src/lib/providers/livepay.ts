@@ -7,6 +7,7 @@ import {
   ParsedWebhook,
 } from './types'
 import crypto from 'crypto'
+import { normalizePhone } from '@/lib/phone'
 
 export class LivePayProvider implements PaymentProvider {
   code = 'livepay'
@@ -30,7 +31,7 @@ export class LivePayProvider implements PaymentProvider {
       const normalizedBase = rawAuthUrl.replace(/\/+$/, '')
       const payload = {
         accountNumber: this.accountNo,
-        phoneNumber: params.phoneNumber.replace(/[\s\-\(\)\+]/g, "").startsWith("0") ? "256" + params.phoneNumber.replace(/[\s\-\(\)\+]/g, "").slice(1) : params.phoneNumber.replace(/[\s\-\(\)\+]/g, ""),
+        phoneNumber: normalizePhone(params.phoneNumber),
         amount: params.amount,
         currency: params.currency || 'UGX',
         reference: params.reference,

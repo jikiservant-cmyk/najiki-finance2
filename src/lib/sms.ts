@@ -1,25 +1,5 @@
 import africastalking from 'africastalking'
-
-/**
- * Normalizes phone numbers to standard E.164 (+2567XXXXXXXX)
- */
-function normalizePhoneNumber(phone: string): string {
-  let cleaned = phone.replace(/[\s\-\(\)]/g, '')
-  if (cleaned.startsWith('00256')) {
-    cleaned = '+256' + cleaned.slice(5)
-  } else if (cleaned.startsWith('0')) {
-    // Standard Uganda local format: 07XXXXXXXX -> +2567XXXXXXXX
-    cleaned = '+256' + cleaned.slice(1)
-  } else if (cleaned.startsWith('256')) {
-    cleaned = '+' + cleaned
-  } else if (cleaned.length === 9 && cleaned.startsWith('7')) {
-    // 9-digit local mobile number without leading 0: 7XXXXXXXX -> +2567XXXXXXXX
-    cleaned = '+256' + cleaned
-  } else if (!cleaned.startsWith('+')) {
-    cleaned = `+${cleaned}`
-  }
-  return cleaned
-}
+import { normalizeToE164 } from '@/lib/phone'
 
 export async function sendSmsViaProvider(to: string, message: string, fromSenderId?: string) {
   const apiKey = process.env.AFRICASTALKING_API_KEY
@@ -35,7 +15,7 @@ export async function sendSmsViaProvider(to: string, message: string, fromSender
 
   try {
     const atClient = africastalking({ apiKey, username })
-    const formattedTo = normalizePhoneNumber(to)
+    const formattedTo = normalizeToE164(to)
     
     console.log(`[Africa's Talking] Dispatching to ${formattedTo} with username: "${username}"...`)
     

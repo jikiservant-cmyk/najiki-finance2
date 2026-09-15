@@ -1,6 +1,7 @@
 import { db } from './db'
 import { getPaymentProvider } from './providers'
 import { decrypt } from './encryption'
+import { PLATFORM_FEE_TYPES } from './constants'
 
 export async function processPayment(data: {
   paymentIntentId: string,
@@ -24,8 +25,7 @@ export async function processPayment(data: {
     })
 
     // Define payment types that go to the platform (owner's main account)
-    const platformFeeTypes = ['SMS', 'BUY_SMS', 'SMS_TOPUP', 'ACTIVATION', 'ACCOUNT_ACTIVATION', 'SUBSCRIPTION', 'MONTHLY_SUBSCRIPTION', 'PLATFORM_FEE']
-    const isPlatformPayment = payment?.paymentType && platformFeeTypes.includes(payment.paymentType.code.toUpperCase())
+    const isPlatformPayment = payment?.paymentType && PLATFORM_FEE_TYPES.includes(payment.paymentType.code.toUpperCase())
 
     // Only load tenant credentials if it's NOT a platform payment. 
     // Platform payments use the default global credentials.
@@ -154,8 +154,7 @@ export async function completePayment(data: {
     })
 
     // Define payment types that go to the platform (owner's main account)
-    const platformFeeTypes = ['SMS', 'BUY_SMS', 'SMS_TOPUP', 'ACTIVATION', 'ACCOUNT_ACTIVATION', 'SUBSCRIPTION', 'MONTHLY_SUBSCRIPTION', 'PLATFORM_FEE']
-    const isPlatformPayment = fullPaymentIntent.paymentType && platformFeeTypes.includes(fullPaymentIntent.paymentType.code.toUpperCase())
+    const isPlatformPayment = fullPaymentIntent.paymentType && PLATFORM_FEE_TYPES.includes(fullPaymentIntent.paymentType.code.toUpperCase())
 
     // If payment was successful, update wallet based on application type!
     // We ONLY credit the tenant's actual wallet balance if it's NOT a platform payment (e.g. SAVINGS).

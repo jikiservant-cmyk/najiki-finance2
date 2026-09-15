@@ -11,6 +11,7 @@ import { getPaymentProvider } from '@/lib/providers'
 import { createPaymentTransaction } from '@/lib/data'
 import { CreatePaymentRequestSchema } from '@/lib/schemas'
 import { processPayment } from '@/lib/payments'
+import { PLATFORM_FEE_TYPES } from '@/lib/constants'
 import { Ratelimit } from '@upstash/ratelimit'
 import { Redis } from '@upstash/redis'
 
@@ -139,8 +140,7 @@ export async function POST(request: Request) {
     }
 
     // Prefer tenant's default provider, UNLESS it's a platform payment
-    const platformFeeTypes = ['SMS', 'BUY_SMS', 'SMS_TOPUP', 'ACTIVATION', 'ACCOUNT_ACTIVATION', 'SUBSCRIPTION', 'MONTHLY_SUBSCRIPTION', 'PLATFORM_FEE']
-    const isPlatformPayment = paymentType && platformFeeTypes.includes(paymentType.code.toUpperCase())
+    const isPlatformPayment = paymentType && PLATFORM_FEE_TYPES.includes(paymentType.code.toUpperCase())
 
     let provider = activeProvider
     if (tenant?.defaultProviderId && !isPlatformPayment) {
