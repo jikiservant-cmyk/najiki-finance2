@@ -121,7 +121,3 @@ async function handleSync(request: Request) {
 export async function POST(request: Request) {
   return handleSync(request)
 }
-
-export async function GET(request: Request) {
-  return handleSync(request)
-}

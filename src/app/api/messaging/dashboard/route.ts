@@ -1,9 +1,11 @@
 import { NextResponse } from 'next/server'
 import { smsStore } from '@/lib/sms-store'
 import { db } from '@/lib/db'
+import { requireSuperAdmin } from '@/lib/auth'
 
 export async function GET(request: Request) {
   try {
+    await requireSuperAdmin()
     const messages = await smsStore.getAll()
     const apps = await db.application.findMany()
     const appMap = new Map(apps.map(a => [a.code.toLowerCase(), a.name]))

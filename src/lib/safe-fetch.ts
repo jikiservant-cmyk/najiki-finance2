@@ -162,6 +162,7 @@ export async function safeFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   return fetch(input, {
     ...init,
+    redirect: init?.redirect ?? 'manual',
     signal,
   })
 }

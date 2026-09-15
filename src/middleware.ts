@@ -12,7 +12,10 @@ export async function middleware(request: NextRequest) {
   const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
 
   if (!supabaseUrl || !supabaseKey || !supabaseUrl.startsWith('http')) {
-    // If Supabase is not configured yet, allow the request to proceed
+    // If Supabase is not configured yet, allow the request to proceed in dev
+    if (process.env.NODE_ENV === 'production') {
+      return NextResponse.json({ error: 'Auth not configured' }, { status: 500 })
+    }
     return response
   }
 

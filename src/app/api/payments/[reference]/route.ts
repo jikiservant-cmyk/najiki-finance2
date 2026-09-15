@@ -80,6 +80,13 @@ export async function GET(
       return NextResponse.json({ error: 'Payment not found' }, { status: 404 })
     }
 
+    const { searchParams } = new URL(request.url)
+    const requestTenantCode = searchParams.get('tenantCode')
+
+    if (paymentIntent.tenant && paymentIntent.tenant.code !== requestTenantCode) {
+      return NextResponse.json({ error: 'Payment not found (tenant mismatch)' }, { status: 404 })
+    }
+
     let currentStatus = paymentIntent.status
     let currentFailureReason = paymentIntent.failureReason
     let completedAt = paymentIntent.completedAt
@@ -166,7 +173,7 @@ export async function GET(
   } catch (error) {
     console.error('Get payment error:', error)
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
+      { error: 'Internal server error' },
       { status: 500 }
     )
   }

@@ -3,14 +3,35 @@ import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { smsStore } from '@/lib/sms-store'
 import { smsQueue } from '@/lib/sms-queue'
+import { Ratelimit } from '@upstash/ratelimit'
+import { Redis } from '@upstash/redis'
 
-export function OPTIONS() {
+// Use Upstash Redis for distributed rate limiting if configured
+let ratelimit: Ratelimit | null = null;
+try {
+  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+    const redis = Redis.fromEnv()
+    ratelimit = new Ratelimit({
+      redis,
+      limiter: Ratelimit.slidingWindow(60, '1 m'), // 60 SMS requests per minute per application
+      analytics: true,
+    })
+  }
+} catch (e) {
+  console.warn('Failed to initialize rate limiter:', e)
+}
+
+export function OPTIONS(request: Request) {
+  const origin = request.headers.get('origin') || '*'
+  const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').filter(Boolean)
+  const allowedOrigin = allowedOrigins.length > 0 && allowedOrigins.includes(origin) ? origin : (allowedOrigins.length > 0 ? allowedOrigins[0] : '*')
+
   return new NextResponse(null, {
     status: 204,
     headers: {
-      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Origin': allowedOrigin,
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key',
     },
   })
 }
@@ -41,32 +62,46 @@ export async function POST(request: Request) {
 
     let application: any = null
 
-    // 2. If an API key is provided, authenticate against the registered applications
+    // 2. Authenticate against the registered applications
     if (apiKey) {
       try {
         application = await db.application.findFirst({
           where: { apiKey, isActive: true },
         })
       } catch (dbErr) {
-        console.warn('[Messaging API] DB lookup by apiKey failed (transient DB error):', dbErr)
+        console.warn('[Messaging API] DB lookup by apiKey failed:', dbErr)
       }
     }
 
-    // 3. If no application resolved yet, try finding by applicationCode
-    if (!application && applicationCode) {
-      try {
-        application = await db.application.findFirst({
-          where: { code: applicationCode, isActive: true },
-        })
-      } catch (dbErr) {
-        console.warn('[Messaging API] DB lookup by applicationCode failed:', dbErr)
-      }
-    }
-
-    // 4. Default fallback: allow legitimate system/school messages to flow even if app lookup is recovering
     if (!application) {
       return NextResponse.json({ error: 'Invalid or missing API key' }, { status: 401 })
     }
+    
+    if (applicationCode && application.code !== applicationCode) {
+      return NextResponse.json({ error: 'Application code mismatch' }, { status: 403 })
+    }
+
+    if (ratelimit) {
+      try {
+        const ratelimitPromise = ratelimit.limit(`sms_${apiKey}`)
+        const timeoutPromise = new Promise<{success: boolean}>((_, reject) => 
+          setTimeout(() => reject(new Error('Rate limit timeout')), 1000)
+        )
+        const { success } = await Promise.race([ratelimitPromise, timeoutPromise])
+        if (!success) {
+          return NextResponse.json(
+            { error: 'Too many requests' },
+            { status: 429, headers: { 'Retry-After': '60' } }
+          )
+        }
+      } catch (ratelimitError) {
+        console.warn('Rate limiter failed or timed out:', ratelimitError)
+        if (process.env.NODE_ENV === 'production') {
+          return NextResponse.json({ error: 'Service temporarily unavailable' }, { status: 503 })
+        }
+      }
+    }
+
     const appCode = application.code
     const appId = application.id
     const customSender = from || senderId || undefined
@@ -105,7 +140,7 @@ export async function POST(request: Request) {
 
   } catch (error) {
     console.error('Send SMS API Error:', error)
-    return NextResponse.json({ error: error instanceof Error ? error.message : 'Internal server error' }, { status: 500 })
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
 

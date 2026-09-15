@@ -52,7 +52,11 @@ export async function requireSuperAdmin() {
   })
 
   // Auto-elevate the known admin emails to super_admin
-  const superAdminEmails = ['smartskoolz@gmail.com', 'jikiservant@gmail.com']
+  const superAdminEmails = (process.env.SUPER_ADMIN_EMAILS || 'smartskoolz@gmail.com,jikiservant@gmail.com')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+
   if (user.email && superAdminEmails.includes(user.email)) {
     if (!adminProfile) {
       adminProfile = await db.adminProfile.create({

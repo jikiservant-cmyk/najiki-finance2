@@ -40,13 +40,19 @@ function generateReference(appCode: string, typeCode?: string): string {
 }
 
 
-export function OPTIONS() {
+export function OPTIONS(request: Request) {
+  const origin = request.headers.get('origin') || '*'
+  // Implement an allowlist based on env var (e.g. process.env.ALLOWED_ORIGINS)
+  // For now, if ALLOWED_ORIGINS is provided, we check it; otherwise fallback to * for dev
+  const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').filter(Boolean)
+  const allowedOrigin = allowedOrigins.length > 0 && allowedOrigins.includes(origin) ? origin : (allowedOrigins.length > 0 ? allowedOrigins[0] : '*')
+
   return new NextResponse(null, {
     status: 204,
     headers: {
-      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Origin': allowedOrigin,
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key',
     },
   })
 }
@@ -227,7 +233,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Validation failed', details }, { status: 400 })
     }
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
+      { error: 'Internal server error' },
       { status: 500 }
     )
   }

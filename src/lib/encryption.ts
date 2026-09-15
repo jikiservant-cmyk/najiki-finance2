@@ -8,9 +8,9 @@ const getEncryptionKey = () => {
   if (envKey && envKey.length === 64) {
     return Buffer.from(envKey, 'hex')
   }
-  // Fallback for dev ONLY, ideally throw in prod
+  // Fallback for dev ONLY, throw in prod
   if (process.env.NODE_ENV === 'production') {
-    console.warn('CRITICAL: APP_ENCRYPTION_KEY is missing or invalid in production!')
+    throw new Error('CRITICAL: APP_ENCRYPTION_KEY must be a 64-character hex string in production!')
   }
   return crypto.scryptSync(process.env.NEXTAUTH_SECRET || 'fallback-secret-1234', 'salt', 32)
 }
