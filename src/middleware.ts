@@ -31,7 +31,7 @@ export async function middleware(request: NextRequest) {
           set(name: string, value: string, options: CookieOptions) {
             const cookieOptions = {
               ...options,
-              sameSite: 'none' as const,
+              sameSite: 'lax' as const,
               secure: true,
             }
             request.cookies.set({
@@ -53,7 +53,7 @@ export async function middleware(request: NextRequest) {
           remove(name: string, options: CookieOptions) {
             const cookieOptions = {
               ...options,
-              sameSite: 'none' as const,
+              sameSite: 'lax' as const,
               secure: true,
             }
             request.cookies.set({

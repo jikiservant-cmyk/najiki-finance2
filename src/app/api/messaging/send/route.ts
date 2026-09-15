@@ -24,6 +24,9 @@ try {
 export function OPTIONS(request: Request) {
   const origin = request.headers.get('origin') || '*'
   const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').filter(Boolean)
+  if (process.env.NODE_ENV === 'production' && allowedOrigins.length === 0) {
+    return new NextResponse(null, { status: 403, headers: { 'Access-Control-Allow-Origin': 'null' } })
+  }
   const allowedOrigin = allowedOrigins.length > 0 && allowedOrigins.includes(origin) ? origin : (allowedOrigins.length > 0 ? allowedOrigins[0] : '*')
 
   return new NextResponse(null, {

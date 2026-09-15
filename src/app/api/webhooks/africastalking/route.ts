@@ -3,6 +3,11 @@ import { smsStore } from '@/lib/sms-store'
 
 export async function POST(request: Request) {
   try {
+    const secret = process.env.AFRICASTALKING_CALLBACK_SECRET
+    if (secret && request.headers.get('x-callback-secret') !== secret) {
+      return new NextResponse('Unauthorized', { status: 401 })
+    }
+
     let payload: Record<string, any> = {}
     const contentType = request.headers.get('content-type') || ''
 

@@ -13,6 +13,11 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Unauthorized: Log in to use dashboard quick send' }, { status: 401 })
     }
 
+    const contentType = request.headers.get('content-type') || ''
+    if (!contentType.includes('application/json')) {
+      return NextResponse.json({ error: 'Unsupported media type' }, { status: 415 })
+    }
+
     const { to, message, applicationCode } = await request.json()
 
     if (!to || !message) {
@@ -61,6 +66,6 @@ export async function POST(request: Request) {
     }, { status: 202 })
   } catch (error) {
     console.error('Quick send API Error:', error)
-    return NextResponse.json({ error: error instanceof Error ? error.message : 'Internal server error' }, { status: 500 })
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

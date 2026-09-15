@@ -42,9 +42,10 @@ function generateReference(appCode: string, typeCode?: string): string {
 
 export function OPTIONS(request: Request) {
   const origin = request.headers.get('origin') || '*'
-  // Implement an allowlist based on env var (e.g. process.env.ALLOWED_ORIGINS)
-  // For now, if ALLOWED_ORIGINS is provided, we check it; otherwise fallback to * for dev
   const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').filter(Boolean)
+  if (process.env.NODE_ENV === 'production' && allowedOrigins.length === 0) {
+    return new NextResponse(null, { status: 403, headers: { 'Access-Control-Allow-Origin': 'null' } })
+  }
   const allowedOrigin = allowedOrigins.length > 0 && allowedOrigins.includes(origin) ? origin : (allowedOrigins.length > 0 ? allowedOrigins[0] : '*')
 
   return new NextResponse(null, {
@@ -58,39 +59,36 @@ export function OPTIONS(request: Request) {
 }
 
 export async function POST(request: Request) {
-  const ip =
-    request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? 'unknown'
-
-  if (ratelimit) {
-    try {
-      // Enforce a strict 1-second timeout on the Redis rate limit check
-      // so it never stalls the payment API if Redis is slow or unresponsive.
-      const ratelimitPromise = ratelimit.limit(ip)
-      const timeoutPromise = new Promise<{success: boolean}>((_, reject) => 
-        setTimeout(() => reject(new Error('Rate limit timeout')), 1000)
-      )
-      
-      const { success } = await Promise.race([ratelimitPromise, timeoutPromise])
-      if (!success) {
-        return NextResponse.json(
-          { error: 'Too many requests' },
-          { status: 429, headers: { 'Retry-After': '60' } }
-        )
-      }
-    } catch (ratelimitError) {
-      console.warn('Rate limiter failed or timed out:', ratelimitError)
-      if (process.env.NODE_ENV === 'production') {
-        return NextResponse.json({ error: 'Service temporarily unavailable' }, { status: 503 })
-      }
-    }
-  }
-
   try {
     const authHeader = request.headers.get('Authorization')
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return NextResponse.json({ error: 'Missing or invalid authorization header' }, { status: 401 })
     }
     const apiKey = authHeader.slice(7) // Remove 'Bearer ' prefix
+
+    if (ratelimit) {
+      try {
+        // Enforce a strict 1-second timeout on the Redis rate limit check
+        // so it never stalls the payment API if Redis is slow or unresponsive.
+        const ratelimitPromise = ratelimit.limit(`payment_${apiKey}`)
+        const timeoutPromise = new Promise<{success: boolean}>((_, reject) => 
+          setTimeout(() => reject(new Error('Rate limit timeout')), 1000)
+        )
+        
+        const { success } = await Promise.race([ratelimitPromise, timeoutPromise])
+        if (!success) {
+          return NextResponse.json(
+            { error: 'Too many requests' },
+            { status: 429, headers: { 'Retry-After': '60' } }
+          )
+        }
+      } catch (ratelimitError) {
+        console.warn('Rate limiter failed or timed out:', ratelimitError)
+        if (process.env.NODE_ENV === 'production') {
+          return NextResponse.json({ error: 'Service temporarily unavailable' }, { status: 503 })
+        }
+      }
+    }
 
     const rawBody = await request.json()
     const validatedBody = CreatePaymentRequestSchema.parse(rawBody)
