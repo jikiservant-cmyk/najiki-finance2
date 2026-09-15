@@ -64,8 +64,11 @@ export async function POST(request: Request) {
     }
 
     // 4. Default fallback: allow legitimate system/school messages to flow even if app lookup is recovering
-    const appCode = application?.code || applicationCode || 'school'
-    const appId = application?.id || undefined
+    if (!application) {
+      return NextResponse.json({ error: 'Invalid or missing API key' }, { status: 401 })
+    }
+    const appCode = application.code
+    const appId = application.id
     const customSender = from || senderId || undefined
 
     // 5. Create the SMS request in our Redis store (no schema change!)

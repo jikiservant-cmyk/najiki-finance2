@@ -156,22 +156,39 @@ export async function POST(request: Request) {
       validatedBody.paymentTypeCode
     )
 
-    const paymentIntent = await db.paymentIntent.create({
-      data: {
-        applicationId: application.id,
-        tenantId: tenant?.id ?? null,
-        paymentTypeId: paymentType?.id ?? null,
-        externalEntityId: validatedBody.externalEntityId,
-        reference,
-        idempotencyKey: validatedBody.idempotencyKey,
-        amount: validatedBody.amount,
-        currency: validatedBody.currency,
-        phoneNumber: validatedBody.phoneNumber,
-        providerId: provider.id,
-        status: 'pending',
-        metadata: JSON.stringify(validatedBody.metadata ?? {}),
-      },
-    })
+    let paymentIntent;
+    try {
+      paymentIntent = await db.paymentIntent.create({
+        data: {
+          applicationId: application.id,
+          tenantId: tenant?.id ?? null,
+          paymentTypeId: paymentType?.id ?? null,
+          externalEntityId: validatedBody.externalEntityId,
+          reference,
+          idempotencyKey: validatedBody.idempotencyKey,
+          amount: validatedBody.amount,
+          currency: validatedBody.currency,
+          phoneNumber: validatedBody.phoneNumber,
+          providerId: provider.id,
+          status: 'pending',
+          metadata: JSON.stringify(validatedBody.metadata ?? {}),
+        },
+      })
+    } catch (e: any) {
+      if (e.code === 'P2002') { // Prisma Unique constraint failed
+        const existing = await db.paymentIntent.findUnique({
+          where: { idempotencyKey: validatedBody.idempotencyKey },
+        })
+        if (existing) {
+          return NextResponse.json({
+            paymentId: existing.id,
+            reference: existing.reference,
+            status: existing.status,
+          })
+        }
+      }
+      throw e
+    }
 
     const host = request.headers.get('x-forwarded-host') || request.headers.get('host') || 'localhost:3000'
     const protocol = request.headers.get('x-forwarded-proto') || 'https'

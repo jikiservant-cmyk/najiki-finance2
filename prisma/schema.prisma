@@ -231,7 +231,8 @@ model TenantProviderConfig {
   createdAt      DateTime  @default(now()) @map("created_at")
   updatedAt      DateTime  @updatedAt @map("updated_at")
 
-  @@unique([tenantId, providerId, isActive])
+  @@unique([tenantId, providerId])
+  @@index([tenantId, isActive])
   @@index([tenantId, providerId])
   @@map("tenant_provider_configs")
   @@schema("public")

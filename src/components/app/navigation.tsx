@@ -12,6 +12,7 @@ const navItems = [
   { href: '/', label: 'Dashboard' },
   { href: '/messaging', label: 'Messaging' },
   { href: '/transactions', label: 'Transactions' },
+  { href: '/planner', label: 'Planner' },
   { href: '/webhooks', label: 'Webhooks' },
   { href: '/setup', label: 'Setup' },
 ]

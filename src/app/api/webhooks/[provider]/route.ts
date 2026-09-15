@@ -42,14 +42,38 @@ export async function POST(
       return NextResponse.json({ success: true, duplicate: true })
     }
 
-    const providerClient = getPaymentProvider(providerCode)
+    // Need to find tentative reference to load tenant credentials before validating signature
+    let tentativeReference: string | null = null
+    try {
+      const parsedBody = JSON.parse(rawBody)
+      tentativeReference = parsedBody.customer_reference || parsedBody.reference
+    } catch {}
 
     const provider = await db.provider.findFirst({
       where: { code: providerCode.toLowerCase(), isActive: true },
     })
+    
     if (!provider) {
       return NextResponse.json({ error: 'Provider not active' }, { status: 404 })
     }
+
+    let customCredentials: any = undefined
+    if (tentativeReference) {
+      const intent = await db.paymentIntent.findUnique({
+        where: { reference: tentativeReference },
+        select: { tenantId: true, providerId: true },
+      })
+      if (intent?.tenantId) {
+        const tenantConfig = await db.tenantProviderConfig.findFirst({
+          where: { tenantId: intent.tenantId, providerId: intent.providerId, isActive: true },
+        })
+        if (tenantConfig?.configJson && typeof tenantConfig.configJson === 'object') {
+          customCredentials = tenantConfig.configJson
+        }
+      }
+    }
+
+    const providerClient = getPaymentProvider(providerCode, customCredentials)
 
     const host = request.headers.get('x-forwarded-host') || request.headers.get('host') || 'localhost:3000'
     const protocol = request.headers.get('x-forwarded-proto') || 'https'
