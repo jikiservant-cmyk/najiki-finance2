@@ -47,11 +47,27 @@ export async function requireSuperAdmin() {
     throw new Error('Unauthorized')
   }
 
-  const adminProfile = await db.adminProfile.findUnique({
+  let adminProfile = await db.adminProfile.findUnique({
     where: { id: user.id }
   })
 
+  // Auto-elevate the known admin emails to super_admin
+  const superAdminEmails = ['smartskoolz@gmail.com', 'jikiservant@gmail.com']
+  if (user.email && superAdminEmails.includes(user.email)) {
+    if (!adminProfile) {
+      adminProfile = await db.adminProfile.create({
+        data: { id: user.id, role: 'super_admin' }
+      })
+    } else if (adminProfile.role !== 'super_admin') {
+      adminProfile = await db.adminProfile.update({
+        where: { id: user.id },
+        data: { role: 'super_admin' }
+      })
+    }
+  }
+
   if (!adminProfile || adminProfile.role !== 'super_admin') {
+    console.error('[AUTH ERROR] User ID:', user.id, 'Email:', user.email, 'Profile:', adminProfile)
     throw new Error('Forbidden: Super Admin required')
   }
 

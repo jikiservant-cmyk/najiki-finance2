@@ -194,11 +194,26 @@ model InternalNotification {
   @@schema("public")
 }
 
+enum AdminRoleEnum {
+  doctor
+  nurse
+  pharmacist
+  admin
+  member
+  pastor
+  sacco_admin
+  super_admin
+  school_admin
+
+  @@map("admin_role_enum")
+  @@schema("public")
+}
+
 model AdminProfile {
-  id               String   @id
-  role             String   @default("super_admin")
-  createdAt        DateTime @map("created_at") @default(now())
-  updatedAt        DateTime @map("updated_at") @updatedAt
+  id               String         @id
+  role             AdminRoleEnum  @default(super_admin)
+  createdAt        DateTime       @map("created_at") @default(now())
+  updatedAt        DateTime       @map("updated_at") @updatedAt
 
   @@map("admin_profiles")
   @@schema("public")

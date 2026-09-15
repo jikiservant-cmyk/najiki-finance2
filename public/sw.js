@@ -1,9 +1,8 @@
 // Service Worker for Na'jiki PWA
-const CACHE_NAME = 'najiki-cache-v2';
+const CACHE_NAME = 'najiki-cache-v5';
 const OFFLINE_URL = '/offline';
 
 const PRECACHE_ASSETS = [
-  '/',
   '/offline',
   '/manifest.json',
   '/logo.svg',
@@ -14,7 +13,7 @@ const PRECACHE_ASSETS = [
   '/favicon.ico',
 ];
 
-// Install Event - Precache core shell
+// Install Event - Precache only true static assets (NEVER HTML pages)
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
@@ -25,7 +24,7 @@ self.addEventListener('install', (event) => {
   );
 });
 
-// Activate Event - Clean up stale caches
+// Activate Event - Purge ALL old caches
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys().then((cacheNames) => {
@@ -45,31 +44,34 @@ self.addEventListener('fetch', (event) => {
   const { request } = event;
   const url = new URL(request.url);
 
-  // Skip non-GET requests and API/OAuth/Auth calls
+  // NEVER intercept non-GET, API routes, Auth, Webpack chunks, Next.js internal files, HMR
   if (request.method !== 'GET') return;
   if (
+    url.pathname.startsWith('/_next/') ||
     url.pathname.startsWith('/api/') ||
     url.pathname.startsWith('/auth/') ||
+    url.pathname.includes('webpack') ||
+    url.pathname.includes('hot-update') ||
     url.pathname.includes('supabase') ||
     url.pathname.includes('upstash')
   ) {
     return;
   }
 
-  // Handle Next.js Static Chunks -> Always Network First to avoid stale Webpack module references
-  if (url.pathname.startsWith('/_next/')) {
+  // Handle Navigation / HTML pages -> Always Network Only. If offline, serve /offline page.
+  // NEVER cache HTML pages, as they contain references to ephemeral Webpack chunk hashes!
+  if (request.mode === 'navigate') {
     event.respondWith(
-      fetch(request)
-        .then((networkResponse) => {
-          if (networkResponse && networkResponse.status === 200) {
-            const responseToCache = networkResponse.clone();
-            caches.open(CACHE_NAME).then((cache) => {
-              cache.put(request, responseToCache);
-            });
-          }
-          return networkResponse;
-        })
-        .catch(() => caches.match(request))
+      fetch(request).catch(async () => {
+        const offlinePage = await caches.match(OFFLINE_URL);
+        if (offlinePage) {
+          return offlinePage;
+        }
+        return new Response('Offline - No connection available', {
+          status: 503,
+          headers: { 'Content-Type': 'text/plain' },
+        });
+      })
     );
     return;
   }
@@ -101,56 +103,6 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Handle Navigation / HTML pages -> Network First with Offline Page Fallback
-  if (request.mode === 'navigate') {
-    event.respondWith(
-      fetch(request)
-        .then((networkResponse) => {
-          // Cache successful navigation responses
-          if (networkResponse && networkResponse.status === 200) {
-            const responseToCache = networkResponse.clone();
-            caches.open(CACHE_NAME).then((cache) => {
-              cache.put(request, responseToCache);
-            });
-          }
-          return networkResponse;
-        })
-        .catch(async () => {
-          // Check if requested page is in cache
-          const cachedResponse = await caches.match(request);
-          if (cachedResponse) {
-            return cachedResponse;
-          }
-          // Otherwise return offline page
-          const offlinePage = await caches.match(OFFLINE_URL);
-          if (offlinePage) {
-            return offlinePage;
-          }
-          return new Response('Offline - No connection available', {
-            status: 503,
-            headers: { 'Content-Type': 'text/plain' },
-          });
-        })
-    );
-    return;
-  }
-
-  // Default Stale-While-Revalidate for other GET resources
-  event.respondWith(
-    caches.match(request).then((cachedResponse) => {
-      const fetchPromise = fetch(request)
-        .then((networkResponse) => {
-          if (networkResponse && networkResponse.status === 200) {
-            const responseToCache = networkResponse.clone();
-            caches.open(CACHE_NAME).then((cache) => {
-              cache.put(request, responseToCache);
-            });
-          }
-          return networkResponse;
-        })
-        .catch(() => cachedResponse);
-
-      return cachedResponse || fetchPromise;
-    })
-  );
+  // Default: Network fetch directly
+  event.respondWith(fetch(request));
 });

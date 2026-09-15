@@ -34,28 +34,66 @@ export function PwaRegistrar() {
         setIsIOS(true)
       }
 
-      // 2. Register Service Worker and purge legacy caches
-      if ('caches' in window) {
-        caches.keys().then((keys) => {
-          keys.forEach((key) => {
-            if (key !== 'najiki-cache-v2') {
-              caches.delete(key)
-            }
-          })
-        })
+      // 2. Service Worker Lifecycle
+      if ('serviceWorker' in navigator) {
+        if (process.env.NODE_ENV === 'development') {
+          // In development mode, purge all service workers and caches to prevent chunk conflicts
+          navigator.serviceWorker.getRegistrations().then((registrations) => {
+            registrations.forEach((r) => r.unregister().catch(() => {}))
+          }).catch(() => {})
+          if ('caches' in window) {
+            caches.keys().then((keys) => {
+              keys.forEach((key) => caches.delete(key).catch(() => {}))
+            }).catch(() => {})
+          }
+        } else {
+          // In production, register the lightweight asset service worker and purge old caches
+          if ('caches' in window) {
+            caches.keys().then((keys) => {
+              keys.forEach((key) => {
+                if (key !== 'najiki-cache-v5') {
+                  caches.delete(key).catch((err) => console.warn('[PWA] Cache delete error:', err))
+                }
+              })
+            }).catch((err) => console.warn('[PWA] Caches keys error:', err))
+          }
+
+          navigator.serviceWorker
+            .register('/sw.js')
+            .then((registration) => {
+              registration.update().catch(() => {})
+              console.log('[PWA] Service Worker registered with scope:', registration.scope)
+            })
+            .catch((err) => {
+              console.warn('[PWA] Service Worker registration failed:', err)
+            })
+        }
       }
 
-      if ('serviceWorker' in navigator) {
-        navigator.serviceWorker
-          .register('/sw.js')
-          .then((registration) => {
-            registration.update().catch(() => {})
-            console.log('[PWA] Service Worker registered with scope:', registration.scope)
-          })
-          .catch((err) => {
-            console.warn('[PWA] Service Worker registration failed:', err)
-          })
+      // Automatically recover from dynamic chunk loading errors (e.g. after server rebuilds)
+      const handleChunkError = (e: ErrorEvent) => {
+        if (e?.message && /Loading chunk .* failed/i.test(e.message)) {
+          const storageKey = 'last_chunk_reload'
+          const lastReload = sessionStorage.getItem(storageKey)
+          const now = Date.now()
+          if (!lastReload || now - Number(lastReload) > 10000) {
+            sessionStorage.getItem(storageKey)
+            sessionStorage.setItem(storageKey, String(now))
+            console.warn('[PWA] Recovering from chunk load error by unregistering SW and reloading...')
+            if ('serviceWorker' in navigator) {
+              navigator.serviceWorker.getRegistrations().then((registrations) => {
+                registrations.forEach((r) => {
+                  r.unregister().catch(console.error)
+                })
+              }).catch(console.error)
+            }
+            setTimeout(() => {
+              window.location.reload()
+            }, 500)
+          }
+        }
       }
+      window.addEventListener('error', handleChunkError)
 
       // 3. Listen for Install Prompt (Chrome/Edge/Android)
       const handleBeforeInstallPrompt = (e: Event) => {

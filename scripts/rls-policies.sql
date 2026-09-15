@@ -13,6 +13,7 @@ ALTER TABLE public.payment_intents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.payment_transactions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.webhook_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.internal_notifications ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.tenant_provider_configs ENABLE ROW LEVEL SECURITY;
 
 -- =============================================
 -- RLS POLICIES: Service Role Only Writes (for NaJiki backend)
@@ -49,3 +50,8 @@ CREATE POLICY "Service role full access on webhook_logs" ON public.webhook_logs
 -- Internal Notifications
 CREATE POLICY "Service role full access on internal_notifications" ON public.internal_notifications
   FOR ALL USING (auth.role() = 'service_role');
+
+-- Tenant Provider Configs (API Keys & Merchant Secrets)
+CREATE POLICY "Service role full access on tenant_provider_configs" ON public.tenant_provider_configs
+  FOR ALL USING (auth.role() = 'service_role');
+
