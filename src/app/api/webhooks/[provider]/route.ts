@@ -30,11 +30,20 @@ export async function POST(
       return NextResponse.json({ error: 'Invalid provider' }, { status: 400 })
     }
 
-    // FIX 1: Build idempotency hash BEFORE touching the DB
-    // SHA-256(provider + signature + raw body) is deterministic for a given delivery
-    const signatureHash = createHash('sha256')
-      .update(`${providerCode}:${signature}:${rawBody}`)
-      .digest('hex')
+    // P0-6: Build idempotency hash based on event identity (not ephemeral timestamped signature)
+    let providerEventId: string | null = null
+    let tentativeStatus: string | null = null
+    let tentativeReference: string | null = null
+    try {
+      const parsedBody = JSON.parse(rawBody)
+      providerEventId = parsedBody.internal_reference || parsedBody.transactionId || null
+      tentativeStatus = parsedBody.status || null
+      tentativeReference = parsedBody.customer_reference || parsedBody.reference || null
+    } catch {}
+
+    const signatureHash = providerEventId
+      ? createHash('sha256').update(`ev:${providerCode}:${providerEventId}:${tentativeStatus}`).digest('hex')
+      : createHash('sha256').update(`bd:${providerCode}:${rawBody}`).digest('hex')
 
     // FIX 1: Check for duplicate delivery
     const existingLog = await db.webhookLog.findUnique({ where: { signatureHash } })
@@ -42,13 +51,6 @@ export async function POST(
       // Already handled — tell LivePay we got it so it stops retrying
       return NextResponse.json({ success: true, duplicate: true })
     }
-
-    // Need to find tentative reference to load tenant credentials before validating signature
-    let tentativeReference: string | null = null
-    try {
-      const parsedBody = JSON.parse(rawBody)
-      tentativeReference = parsedBody.customer_reference || parsedBody.reference
-    } catch {}
 
     const provider = await db.provider.findFirst({
       where: { code: providerCode.toLowerCase(), isActive: true },
@@ -91,11 +93,17 @@ export async function POST(
       publicUrl
     )
 
+    // P1-7: Mask customer phone numbers in stored payload for Uganda Data Protection Act compliance
+    const sanitizedPayload = rawBody.replace(
+      /(\+?[0-9]{3})[0-9]{3,6}([0-9]{3})/g,
+      '$1****$2'
+    )
+
     // Log receipt even for invalid signatures (audit trail)
     const webhookLog = await createWebhookLog({
       provider: providerCode,
       eventType: 'WEBHOOK_RECEIVED',
-      payload: rawBody,
+      payload: sanitizedPayload,
       signature,
       signatureHash,
       verified: isValidSignature,
@@ -140,6 +148,54 @@ export async function POST(
 
     const normalizedStatus = parsedWebhook.status.toLowerCase()
 
+    // P0-2: HARD GATE — Verify reported amount and currency against stored intent
+    const expectedAmount = Number(paymentIntent.amount)
+    const reportedAmount = parsedWebhook.amount !== undefined && parsedWebhook.amount !== null
+      ? Number(parsedWebhook.amount)
+      : expectedAmount
+
+    if (Math.abs(expectedAmount - reportedAmount) > 0.001) {
+      await db.webhookLog.update({
+        where: { id: webhookLog.id },
+        data: {
+          paymentIntentId: paymentIntent.id,
+          processed: true,
+          processingError: `AMOUNT_MISMATCH expected=${expectedAmount} reported=${reportedAmount}`,
+        },
+      })
+      await db.paymentTransaction.create({
+        data: {
+          paymentIntentId: paymentIntent.id,
+          status: 'disputed',
+          rawProviderResponse: rawBody,
+          note: `AMOUNT_MISMATCH | expected ${expectedAmount} ${paymentIntent.currency}, got ${reportedAmount} ${parsedWebhook.currency || ''}`,
+        },
+      })
+      console.error(`[Webhook] Amount mismatch on ${paymentIntent.reference}: expected ${expectedAmount}, reported ${reportedAmount}`)
+      return NextResponse.json({ error: 'Amount mismatch' }, { status: 422 })
+    }
+
+    if (parsedWebhook.currency && parsedWebhook.currency.toUpperCase() !== paymentIntent.currency.toUpperCase()) {
+      await db.webhookLog.update({
+        where: { id: webhookLog.id },
+        data: {
+          paymentIntentId: paymentIntent.id,
+          processed: true,
+          processingError: `CURRENCY_MISMATCH expected=${paymentIntent.currency} reported=${parsedWebhook.currency}`,
+        },
+      })
+      await db.paymentTransaction.create({
+        data: {
+          paymentIntentId: paymentIntent.id,
+          status: 'disputed',
+          rawProviderResponse: rawBody,
+          note: `CURRENCY_MISMATCH | expected ${paymentIntent.currency}, got ${parsedWebhook.currency}`,
+        },
+      })
+      console.error(`[Webhook] Currency mismatch on ${paymentIntent.reference}: expected ${paymentIntent.currency}, got ${parsedWebhook.currency}`)
+      return NextResponse.json({ error: 'Currency mismatch' }, { status: 422 })
+    }
+
     // FIX: Guard against double-crediting if a retry comes with a different signature
     if (
       fullPaymentIntent.status === 'success' || 
@@ -154,13 +210,14 @@ export async function POST(
     }
 
     // FIX 2 & 3: Delegate to completePayment for wallet crediting and status sync
+    // Always use the AUTHORITATIVE stored amount and currency, never the provider's unverified value
     const { wasAlreadyProcessed } = await completePayment({
       paymentIntentId: paymentIntent.id,
       status: normalizedStatus,
       providerPaymentId: parsedWebhook.providerPaymentId,
       failureReason: parsedWebhook.failureReason,
-      amount: Number(parsedWebhook.amount || paymentIntent.amount),
-      currency: parsedWebhook.currency || paymentIntent.currency,
+      amount: expectedAmount,
+      currency: paymentIntent.currency,
       rawProviderResponse: rawBody,
       note: 'WEBHOOK_UPDATE',
     })
@@ -177,8 +234,8 @@ export async function POST(
         paymentIntentId: paymentIntent.id,
         reference: paymentIntent.reference,
         status: normalizedStatus,
-        amount: Number(parsedWebhook.amount || paymentIntent.amount),
-        currency: parsedWebhook.currency || paymentIntent.currency,
+        amount: expectedAmount,
+        currency: paymentIntent.currency,
         providerPaymentId: parsedWebhook.providerPaymentId || '',
         failureReason: parsedWebhook.failureReason,
         applicationId: fullPaymentIntent.applicationId,

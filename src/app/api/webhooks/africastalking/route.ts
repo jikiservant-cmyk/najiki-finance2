@@ -1,11 +1,22 @@
 import { NextResponse } from 'next/server'
 import { smsStore } from '@/lib/sms-store'
+import crypto from 'crypto'
 
 export async function POST(request: Request) {
   try {
     const secret = process.env.AFRICASTALKING_CALLBACK_SECRET
-    if (secret && request.headers.get('x-callback-secret') !== secret) {
+    if (process.env.NODE_ENV === 'production' && !secret) {
+      console.error("[Africa's Talking DLR] AFRICASTALKING_CALLBACK_SECRET must be configured in production (fail-closed)")
       return new NextResponse('Unauthorized', { status: 401 })
+    }
+
+    if (secret) {
+      const received = request.headers.get('x-callback-secret') || ''
+      const secretBuf = Buffer.from(secret)
+      const receivedBuf = Buffer.from(received)
+      if (secretBuf.length !== receivedBuf.length || !crypto.timingSafeEqual(secretBuf, receivedBuf)) {
+        return new NextResponse('Unauthorized', { status: 401 })
+      }
     }
 
     let payload: Record<string, any> = {}

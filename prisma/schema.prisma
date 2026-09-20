@@ -62,6 +62,7 @@ model Tenant {
 
   paymentIntents        PaymentIntent[]
   tenantProviderConfigs TenantProviderConfig[]
+  wallets               WalletAccount[]
 
   @@unique([applicationId, code])
   @@map("tenants")
@@ -115,6 +116,7 @@ model PaymentIntent {
   transactions          PaymentTransaction[]
   webhookLogs           WebhookLog[]
   internalNotifications InternalNotification[]
+  ledgerEntries         LedgerEntry[]
 
   @@index([applicationId])
   @@index([tenantId])
@@ -237,3 +239,42 @@ model TenantProviderConfig {
   @@map("tenant_provider_configs")
   @@schema("public")
 }
+
+model WalletAccount {
+  id           String        @id @default(cuid())
+  tenantId     String        @map("tenant_id")
+  tenant       Tenant        @relation(fields: [tenantId], references: [id])
+  appCode      String        @map("app_code")
+  currency     String        @default("UGX")
+  balanceMinor BigInt        @default(0) @map("balance_minor")
+  version      Int           @default(0)
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
+
+  ledgerEntries LedgerEntry[]
+
+  @@unique([tenantId, appCode, currency])
+  @@index([tenantId])
+  @@map("wallet_accounts")
+  @@schema("public")
+}
+
+model LedgerEntry {
+  id                String         @id @default(cuid())
+  walletId          String         @map("wallet_id")
+  wallet            WalletAccount  @relation(fields: [walletId], references: [id])
+  paymentIntentId   String?        @map("payment_intent_id")
+  paymentIntent     PaymentIntent? @relation(fields: [paymentIntentId], references: [id])
+  direction         String         // 'credit' | 'debit'
+  amountMinor       BigInt         @map("amount_minor")
+  currency          String         @default("UGX")
+  entryType         String         @map("entry_type") // payment_in | payout | fee | reversal | adjustment
+  idempotencyKey    String         @unique @map("idempotency_key")
+  balanceAfterMinor BigInt         @map("balance_after_minor")
+  createdAt         DateTime       @default(now()) @map("created_at")
+
+  @@index([walletId, createdAt])
+  @@map("ledger_entries")
+  @@schema("public")
+}
+

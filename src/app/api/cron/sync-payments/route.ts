@@ -16,12 +16,13 @@ async function handleSync(request: Request) {
     const url = new URL(request.url)
     const appCode = url.searchParams.get('app')
 
-    // Find all pending payments older than 30 seconds
+    // Find all pending or processing payments older than 30 seconds
     const thirtySecondsAgo = new Date(Date.now() - 30_000)
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000)
     const pendingPayments = await db.paymentIntent.findMany({
       where: {
-        status: 'pending',
-        createdAt: { lte: thirtySecondsAgo },
+        status: { in: ['pending', 'processing'] },
+        createdAt: { lte: thirtySecondsAgo, gte: twentyFourHoursAgo },
         ...(appCode ? { application: { code: appCode } } : {}),
       },
       include: {

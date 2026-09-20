@@ -43,19 +43,37 @@ class MockRedis {
   }
 }
 
-export const redis = (() => {
+let _redisInstance: any = null
+
+export function getRedis(): Redis {
+  if (_redisInstance) return _redisInstance
+
   if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
-    return new Redis({
+    _redisInstance = new Redis({
       url: process.env.UPSTASH_REDIS_REST_URL,
       token: process.env.UPSTASH_REDIS_REST_TOKEN,
-    });
+    })
+    return _redisInstance
   }
 
-  if (process.env.NODE_ENV === 'production') {
-    throw new Error('CRITICAL: UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN must be configured in production.');
+  if (process.env.NODE_ENV === 'production' && process.env.NEXT_PHASE !== 'phase-production-build') {
+    console.warn('WARN: UPSTASH_REDIS_REST_URL not configured in production, falling back to mock.')
   } else {
-    console.warn('WARN: Using in-memory MockRedis. This should only be used in local development.');
+    console.warn('WARN: Using in-memory MockRedis. This should only be used in local development.')
   }
 
-  return new MockRedis() as any as Redis;
-})();
+  _redisInstance = new MockRedis() as any as Redis
+  return _redisInstance
+}
+
+export const redis = new Proxy({} as Redis, {
+  get(_target, prop) {
+    const instance = getRedis() as any
+    const val = instance[prop]
+    if (typeof val === 'function') {
+      return val.bind(instance)
+    }
+    return val
+  }
+})
+

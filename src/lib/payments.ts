@@ -96,7 +96,27 @@ export async function processPayment(data: {
     }
   } catch (err: any) {
     console.error(`processPayment error for ${paymentIntentId}:`, err)
-    await db.paymentIntent.update({ where: { id: paymentIntentId }, data: { status: "failed", failureReason: err.message } }).catch(console.error)
+    const isNetworkAmbiguous = err?.name === 'AbortError' || err?.code === 'ECONNRESET'
+      || err?.code === 'ETIMEDOUT' || err?.name === 'TimeoutError' || err?.message?.includes('fetch failed')
+
+    await db.$transaction([
+      db.paymentIntent.update({
+        where: { id: paymentIntentId },
+        data: {
+          // Ambiguous: leave it reconcilable (processing), do NOT mark failed!
+          status: isNetworkAmbiguous ? 'processing' : 'failed',
+          failureReason: isNetworkAmbiguous ? `INITIATE_AMBIGUOUS: ${err.message}` : err.message,
+        },
+      }),
+      db.paymentTransaction.create({
+        data: {
+          paymentIntentId,
+          status: isNetworkAmbiguous ? 'initiate_ambiguous' : 'initiate_failed',
+          rawProviderResponse: JSON.stringify({ error: err.message, name: err?.name, code: err?.code }),
+          note: 'PAYMENT_INITIATE_ERROR',
+        },
+      }),
+    ]).catch(console.error)
   }
 }
 
@@ -156,33 +176,94 @@ export async function completePayment(data: {
     // Define payment types that go to the platform (owner's main account)
     const isPlatformPayment = fullPaymentIntent.paymentType && PLATFORM_FEE_TYPES.includes(fullPaymentIntent.paymentType.code.toUpperCase())
 
-    // If payment was successful, update wallet based on application type!
-    // We ONLY credit the tenant's actual wallet balance if it's NOT a platform payment (e.g. SAVINGS).
+    // P0-4 & Phase 1a: Atomic wallet balance credit and immutable ledger entry using Prisma public models
     if (status === 'success' && fullPaymentIntent.tenant && !isPlatformPayment) {
       const appCode = fullPaymentIntent.application.code.toLowerCase()
       const tenantId = fullPaymentIntent.tenant.id
+      const amountMinor = BigInt(Math.round(amount * 100))
 
-      try {
-        if (appCode === 'church') {
-          await tx.$executeRaw`
-            INSERT INTO "church"."wallets" ("church_id", "balance", "sms_credits", "created_at", "updated_at")
-            VALUES (${tenantId}, ${amount}, 0, NOW(), NOW())
-            ON CONFLICT ("church_id") DO UPDATE 
-            SET "balance" = "church"."wallets"."balance" + ${amount}, "updated_at" = NOW()
-          `
-        } else if (appCode === 'sacco') {
-          await tx.$executeRaw`
-            INSERT INTO "kuntiy"."wallets" ("sacco_id", "balance", "created_at", "updated_at")
-            VALUES (${tenantId}, ${amount}, NOW(), NOW())
-            ON CONFLICT ("sacco_id") DO UPDATE 
-            SET "balance" = "kuntiy"."wallets"."balance" + ${amount}, "updated_at" = NOW()
-          `
-        }
-      } catch (err) {
-        console.error(`Failed to credit wallet for tenant ${tenantId} in app ${appCode}:`, err)
-        // We don't want the entire transaction to rollback just because wallet update failed
-        // This should eventually be moved to an event-driven webhook architecture
+      const existingWallet = await tx.walletAccount.findUnique({
+        where: {
+          tenantId_appCode_currency: {
+            tenantId,
+            appCode,
+            currency,
+          },
+        },
+      })
+
+      let walletId: string
+      let balanceAfterMinor: bigint
+
+      if (!existingWallet) {
+        const created = await tx.walletAccount.create({
+          data: {
+            tenantId,
+            appCode,
+            currency,
+            balanceMinor: amountMinor,
+            version: 1,
+          },
+        })
+        walletId = created.id
+        balanceAfterMinor = created.balanceMinor
+      } else {
+        const updated = await tx.walletAccount.update({
+          where: { id: existingWallet.id, version: existingWallet.version },
+          data: {
+            balanceMinor: { increment: amountMinor },
+            version: { increment: 1 },
+          },
+        })
+        walletId = updated.id
+        balanceAfterMinor = updated.balanceMinor
       }
+
+      // Record immutable ledger entry with idempotency key
+      const idempotencyKey = `${paymentIntentId}:payment_in`
+      await tx.ledgerEntry.upsert({
+        where: { idempotencyKey },
+        create: {
+          walletId,
+          paymentIntentId,
+          direction: 'credit',
+          amountMinor,
+          currency,
+          entryType: 'payment_in',
+          idempotencyKey,
+          balanceAfterMinor,
+        },
+        update: {},
+      })
+    }
+
+    // P0-7: Write outbound notification ledger record in the transaction
+    if (status === 'success' || status === 'failed') {
+      const webhookUrl = `${fullPaymentIntent.application.baseUrl}${fullPaymentIntent.application.webhookPath}`
+      const notificationPayload = {
+        paymentIntentId,
+        reference: fullPaymentIntent.reference,
+        status,
+        amount: Number(amount),
+        currency,
+        providerPaymentId: providerPaymentId || '',
+        failureReason: failureReason || null,
+        externalEntityId: fullPaymentIntent.externalEntityId,
+        metadata: (() => { try { return fullPaymentIntent.metadata ? JSON.parse(fullPaymentIntent.metadata) : {}; } catch { return {}; } })(),
+      }
+
+      await tx.internalNotification.create({
+        data: {
+          paymentIntentId,
+          applicationId: fullPaymentIntent.applicationId,
+          url: webhookUrl,
+          payload: JSON.stringify(notificationPayload),
+          status: 'pending',
+          attemptCount: 0,
+          maxAttempts: 5,
+          nextRetryAt: new Date(),
+        },
+      })
     }
     
     return { updated: true }
@@ -205,7 +286,7 @@ export async function completePayment(data: {
 
 import { Client } from '@upstash/qstash'
 import { createHmac } from 'crypto'
-import { safeFetch } from './safe-fetch'
+import { safeFetch, validateSafeUrl } from './safe-fetch'
 
 let qstashClient: Client | null = null
 function getQStashClient(): Client | null {
@@ -231,6 +312,22 @@ export async function enqueueWebhookNotification(data: {
   externalEntityId?: string | null
   metadata: any
 }) {
+  // P1-4: Reject SSRF / private targets before enqueuing or delivering
+  try {
+    await validateSafeUrl(data.webhookUrl)
+  } catch (urlErr: any) {
+    console.error(`[Webhook] Refusing to send webhook to unsafe/internal URL: ${data.webhookUrl} (${urlErr?.message})`)
+    await db.internalNotification.updateMany({
+      where: { paymentIntentId: data.paymentIntentId, status: 'pending' },
+      data: {
+        status: 'failed',
+        lastAttemptAt: new Date(),
+        lastResponseBody: `Unsafe webhook URL: ${urlErr?.message}`,
+      },
+    })
+    return
+  }
+
   const payloadObject = {
     paymentIntentId: data.paymentIntentId,
     reference: data.reference,
@@ -250,10 +347,14 @@ export async function enqueueWebhookNotification(data: {
     'X-Najiki-Notification': 'true',
   }
 
+  // P1-5: Replay protection with timestamped signature
   if (data.apiKey) {
-    const signature = createHmac('sha256', data.apiKey).update(payloadString).digest('hex')
-    headers['X-Najiki-Signature'] = signature
-    headers['Authorization'] = `Bearer ${data.apiKey}`
+    const timestamp = Date.now()
+    const signature = createHmac('sha256', data.apiKey)
+      .update(`${timestamp}.${payloadString}`)
+      .digest('hex')
+    headers['X-Najiki-Timestamp'] = String(timestamp)
+    headers['X-Najiki-Signature'] = `t=${timestamp},v=${signature}`
   }
 
   // 1. Primary path: Use Upstash QStash with 5 automatic retries and exponential backoff
@@ -267,6 +368,14 @@ export async function enqueueWebhookNotification(data: {
         retries: 5, // QStash native retries with exponential backoff
       })
       console.log(`[QStash] Webhook successfully enqueued for ${data.webhookUrl}`)
+      await db.internalNotification.updateMany({
+        where: { paymentIntentId: data.paymentIntentId, status: 'pending' },
+        data: {
+          status: 'delivered',
+          lastAttemptAt: new Date(),
+          lastResponseStatus: 200,
+        },
+      })
       return
     } else {
       console.warn('[QStash] QSTASH_TOKEN not configured, using direct safeFetch fallback.')
@@ -282,9 +391,38 @@ export async function enqueueWebhookNotification(data: {
       method: 'POST',
       headers,
       body: payloadString,
+      signal: AbortSignal.timeout(10_000),
     })
     console.log(`[Webhook] Direct delivery response status: ${res.status}`)
+    if (res.ok) {
+      await db.internalNotification.updateMany({
+        where: { paymentIntentId: data.paymentIntentId, status: 'pending' },
+        data: {
+          status: 'delivered',
+          lastAttemptAt: new Date(),
+          lastResponseStatus: res.status,
+        },
+      })
+    } else {
+      await db.internalNotification.updateMany({
+        where: { paymentIntentId: data.paymentIntentId, status: 'pending' },
+        data: {
+          status: 'failed',
+          lastAttemptAt: new Date(),
+          lastResponseStatus: res.status,
+          lastResponseBody: `HTTP ${res.status}`,
+        },
+      })
+    }
   } catch (directErr: any) {
     console.error('[Webhook] Direct safeFetch delivery error:', directErr)
+    await db.internalNotification.updateMany({
+      where: { paymentIntentId: data.paymentIntentId, status: 'pending' },
+      data: {
+        status: 'failed',
+        lastAttemptAt: new Date(),
+        lastResponseBody: directErr instanceof Error ? directErr.message : 'Unknown direct delivery error',
+      },
+    })
   }
 }

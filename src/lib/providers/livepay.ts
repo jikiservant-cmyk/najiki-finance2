@@ -46,6 +46,7 @@ export class LivePayProvider implements PaymentProvider {
           'Authorization': `Bearer ${this.apiKey}`,
         },
         body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(10_000),
       })
 
       const data = await response.json()
@@ -86,6 +87,7 @@ export class LivePayProvider implements PaymentProvider {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${this.apiKey}`,
         },
+        signal: AbortSignal.timeout(10_000),
       })
 
       const data = await response.json()
@@ -131,6 +133,13 @@ export class LivePayProvider implements PaymentProvider {
     requestUrl?: string
   ): Promise<boolean> {
     try {
+      // P0-1: FAIL CLOSED. If secret is missing or too short, reject immediately.
+      // An empty secret must NEVER compute an empty-key HMAC.
+      if (!this.webhookSecret || this.webhookSecret.trim().length < 16) {
+        console.error('[LivePay] REJECTING webhook: webhookSecret is not configured or too short (fail-closed)')
+        return false
+      }
+
       let sigValue = signatureHeader
       if (!sigValue && headers) {
         // Fallback to checking headers case-insensitively
@@ -160,6 +169,20 @@ export class LivePayProvider implements PaymentProvider {
 
       if (!timestamp || !receivedSignature) {
         console.warn('[LivePay] Webhook signature verification failed: missing timestamp or signature value')
+        return false
+      }
+
+      // P1-6: Replay window check - ensure timestamp is within 5 minutes (300,000 ms)
+      const timestampNum = Number(timestamp)
+      if (isNaN(timestampNum) || timestampNum <= 0) {
+        console.warn('[LivePay] Webhook signature verification failed: invalid timestamp value', timestamp)
+        return false
+      }
+      const timestampMs = timestampNum < 1e11 ? timestampNum * 1000 : timestampNum
+      const now = Date.now()
+      const maxReplayDriftMs = 5 * 60 * 1000
+      if (Math.abs(now - timestampMs) > maxReplayDriftMs) {
+        console.error(`[LivePay] Webhook REJECTED: timestamp outside 5-minute replay window (received: ${timestampMs}, now: ${now})`)
         return false
       }
 
