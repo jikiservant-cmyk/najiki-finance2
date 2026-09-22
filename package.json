@@ -9,12 +9,17 @@
     "start:standalone": "node .next/standalone/server.js",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "test:watch": "node --experimental-strip-types --test --watch tests/*.test.ts",
+    "verify": "npm run typecheck && npm run lint && npm test",
     "db:push": "prisma db push",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
     "db:reset": "prisma migrate reset",
-    "db:seed": "npx tsx scripts/seed.ts"
+    "db:seed": "npx tsx scripts/seed.ts",
+    "db:harden": "npx tsx scripts/harden-database.ts",
+    "cron:setup": "npx tsx scripts/setup-cron-schedules.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.1.1",
