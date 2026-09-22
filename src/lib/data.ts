@@ -232,10 +232,13 @@ export async function getDashboardData(period: string = '14d') {
   }))
 
   // Notification stats
-  const notifStats = { total: 0, delivered: 0, pending: 0, retrying: 0, exhausted: 0 }
+  const notifStats = { total: 0, delivered: 0, dispatched: 0, pending: 0, retrying: 0, exhausted: 0 }
   for (const item of notificationsData) {
     notifStats.total += item._count
     if (item.status === 'delivered') notifStats.delivered = item._count
+    // Handed to QStash, which owns delivery + retries from that point on. Kept
+    // separate from "delivered" because we have no delivery receipt for it.
+    if (item.status === 'dispatched') notifStats.dispatched = item._count
     if (item.status === 'pending') notifStats.pending = item._count
     if (item.status === 'failed_retrying') notifStats.retrying = item._count
     if (item.status === 'failed_exhausted') notifStats.exhausted = item._count

@@ -19,11 +19,17 @@ async function handleCron(request: Request) {
     
     // 1. Find all pending or processing payments older than 30 seconds
     const thirtySecondsAgo = new Date(Date.now() - 30_000)
-    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000)
+    // 24h was too narrow: a payment the provider never resolved silently fell
+    // out of the poller and was never reconciled again. It is now polled for a
+    // week and anything older surfaces through /api/cron/alerts.
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+    const pollCutoff = new Date(Date.now() - 30_000)
     const pendingPayments = await db.paymentIntent.findMany({
       where: {
         status: { in: ['pending', 'processing'] },
-        createdAt: { lte: thirtySecondsAgo, gte: twentyFourHoursAgo },
+        createdAt: { lte: thirtySecondsAgo, gte: sevenDaysAgo },
+        // Skip rows another worker polled in the last 30 seconds.
+        OR: [{ lastPolledAt: null }, { lastPolledAt: { lte: pollCutoff } }],
         ...(appCode ? { application: { code: appCode } } : {}),
       },
       include: {
@@ -32,6 +38,9 @@ async function handleCron(request: Request) {
         tenant: true,
         paymentType: true,
       },
+      // Least-recently-polled first (never-polled rows first) so a backlog
+      // cannot monopolise every batch.
+      orderBy: [{ lastPolledAt: { sort: 'asc', nulls: 'first' } }, { createdAt: 'asc' }],
       take: 50,
     })
 
@@ -103,6 +112,8 @@ async function handleCron(request: Request) {
         }
       } catch (err: any) {
         pollResults.push({ id: payment.id, reference: payment.reference, status: 'error', polledStatus: err.message })
+      } finally {
+        await markPolled(db, payment.id)
       }
     }
 
@@ -125,4 +136,19 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   return handleCron(request)
+}
+
+/**
+ * Stamp the poll attempt so the next batch rotates to other payments.
+ * Best effort: a failure here must not fail the whole cron run.
+ */
+async function markPolled(client: typeof db, paymentIntentId: string): Promise<void> {
+  try {
+    await client.paymentIntent.update({
+      where: { id: paymentIntentId },
+      data: { lastPolledAt: new Date() },
+    })
+  } catch (error) {
+    console.error(`[poll] failed to record poll attempt for ${paymentIntentId}:`, error)
+  }
 }

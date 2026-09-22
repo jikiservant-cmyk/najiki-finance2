@@ -8,7 +8,7 @@ import { FloatingGeometry } from '@/components/app/floating-geometry'
 import { TiltCard } from '@/components/app/tilt-card'
 import { PaymentFlow3D } from '@/components/app/payment-flow-3d'
 import Link from 'next/link'
-import { useRealtimeDashboard } from '@/hooks/useRealtimeDashboard'
+import { useLiveDashboard } from '@/hooks/useLiveDashboard'
 
 interface DashboardData {
   totalRevenue: number
@@ -141,7 +141,13 @@ export default function HomePage() {
     refresh() 
   }, [refresh, period])
 
-  const { events, connected } = useRealtimeDashboard(refresh)
+  // Snapshot of the latest payments — a change in this string is what
+  // constitutes "a new payment arrived" for the activity feed.
+  const snapshotKey = data?.recentIntents
+    ?.map((i: { id: string; status: string }) => `${i.id}:${i.status}`)
+    .join('|')
+
+  const { events, connected, lastRefresh } = useLiveDashboard(refresh, snapshotKey)
 
   const safeData = data || {
     totalRevenue: 0,
@@ -214,8 +220,10 @@ export default function HomePage() {
                   <option value="1y">Last 1 Year</option>
                   <option value="all">All Time</option>
                 </select>
-                {/* Realtime Connection Status */}
-                <div className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium ${
+                {/* Polling connection status */}
+                <div
+                  title={lastRefresh ? `Last updated ${lastRefresh.toLocaleTimeString()}` : 'Connecting…'}
+                  className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium ${
                   connected ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/20' : 'bg-red-500/15 text-red-400 border border-red-500/20'
                 }`}>
                   <span className={`w-1.5 h-1.5 rounded-full ${connected ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />

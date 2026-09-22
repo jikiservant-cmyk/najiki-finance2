@@ -287,6 +287,12 @@ export async function completePayment(data: {
 import { Client } from '@upstash/qstash'
 import { createHmac } from 'crypto'
 import { safeFetch, validateSafeUrl } from './safe-fetch'
+import {
+  NOTIFICATION_MAX_ATTEMPTS as MAX_ATTEMPTS,
+  computeNextRetryAt,
+  isExhausted,
+  isPermanentHttpFailure,
+} from './backoff'
 
 let qstashClient: Client | null = null
 function getQStashClient(): Client | null {
@@ -298,20 +304,12 @@ function getQStashClient(): Client | null {
   return qstashClient
 }
 
-/** Default number of delivery attempts before a notification is abandoned. */
-export const NOTIFICATION_MAX_ATTEMPTS = 5
-
-/**
- * Exponential backoff with jitter for webhook retries.
- * attempt 1 → ~30s, 2 → ~2m, 3 → ~8m, 4 → ~32m (capped at 6h).
- */
-export function computeNextRetryAt(attemptCount: number): Date {
-  const baseMs = 30_000
-  const exponential = baseMs * Math.pow(4, Math.max(0, attemptCount - 1))
-  const capped = Math.min(exponential, 6 * 60 * 60 * 1000)
-  const jitter = Math.floor(Math.random() * 5_000)
-  return new Date(Date.now() + capped + jitter)
-}
+// Retry policy lives in ./backoff so it can be unit-tested without a database.
+export {
+  NOTIFICATION_MAX_ATTEMPTS,
+  computeNextRetryAt,
+  isExhausted as isNotificationExhausted,
+} from './backoff'
 
 /**
  * Build the outbound webhook headers, including the timestamped HMAC signature
@@ -357,6 +355,24 @@ export async function recordNotificationDelivered(
 }
 
 /**
+ * Mark in-flight notifications for a payment intent as handed to QStash.
+ *
+ * QStash retries on its own (and has its own failure handling), so our worker
+ * must not double-send. The row is no longer `pending`, so
+ * getPendingNotifications() ignores it.
+ */
+export async function recordNotificationDispatched(paymentIntentId: string): Promise<void> {
+  await db.internalNotification.updateMany({
+    where: { paymentIntentId, status: { in: ['pending', 'failed_retrying'] } },
+    data: {
+      status: 'dispatched',
+      lastAttemptAt: new Date(),
+      nextRetryAt: null,
+    },
+  })
+}
+
+/**
  * Record a failed delivery attempt.
  *
  * BUG FIX: this used to set `status: 'failed'`, but the retry worker only
@@ -377,8 +393,8 @@ export async function recordNotificationFailure(
 
   for (const row of rows) {
     const nextAttempt = (row.attemptCount ?? 0) + 1
-    const maxAttempts = row.maxAttempts ?? NOTIFICATION_MAX_ATTEMPTS
-    const exhausted = opts.permanent === true || nextAttempt >= maxAttempts
+    const maxAttempts = row.maxAttempts ?? MAX_ATTEMPTS
+    const exhausted = isExhausted(nextAttempt, maxAttempts, opts.permanent === true)
 
     await db.internalNotification.update({
       where: { id: row.id },
@@ -431,7 +447,7 @@ export async function deliverQueuedNotification(row: {
 
     const body = await res.text().catch(() => '')
     // 4xx responses (except 408/429) are permanent — retrying won't help.
-    const permanent = res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429
+    const permanent = isPermanentHttpFailure(res.status)
     return {
       success: false,
       statusCode: res.status,
@@ -511,9 +527,12 @@ export async function enqueueWebhookNotification(data: {
         retries: 5, // QStash native retries with exponential backoff
       })
       console.log(`[QStash] Webhook successfully enqueued for ${data.webhookUrl}`)
-      // QStash now owns delivery + retries, so the local row is considered
-      // delivered. (QStash retries independently of our cron worker.)
-      await recordNotificationDelivered(data.paymentIntentId, 200)
+      // QStash owns delivery + retries from here. Recorded as 'dispatched',
+      // NOT 'delivered': we have no delivery receipt, and previously marking
+      // these delivered made the dashboard green while a partner could have
+      // received nothing at all. `recordNotificationDispatched` also stops our
+      // own cron from retrying it a second time.
+      await recordNotificationDispatched(data.paymentIntentId)
       return
     } else {
       console.warn('[QStash] QSTASH_TOKEN not configured, using direct safeFetch fallback.')
@@ -536,7 +555,7 @@ export async function enqueueWebhookNotification(data: {
       await recordNotificationDelivered(data.paymentIntentId, res.status)
     } else {
       const body = await res.text().catch(() => '')
-      const permanent = res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429
+      const permanent = isPermanentHttpFailure(res.status)
       await recordNotificationFailure(
         data.paymentIntentId,
         `HTTP ${res.status}${body ? `: ${body.slice(0, 300)}` : ''}`,
