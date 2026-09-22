@@ -4,16 +4,12 @@
   "buildCommand": "npm run build",
   "crons": [
     {
+      "path": "/api/cron/alerts",
+      "schedule": "0 4 * * *"
+    },
+    {
       "path": "/api/cron/notifications",
-      "schedule": "* * * * *"
-    },
-    {
-      "path": "/api/cron/sync-payments",
-      "schedule": "*/2 * * * *"
-    },
-    {
-      "path": "/api/qstash/sms-cron",
-      "schedule": "* * * * *"
+      "schedule": "0 5 * * *"
     }
   ]
 }

@@ -51,7 +51,11 @@ can access the dashboard.
 | `npm run lint` | ESLint |
 | `npm run db:push` | Push the Prisma schema to the database |
 | `npm run db:migrate` | Create/apply a Prisma migration |
-| `npm run db:seed` | Seed demo data |
+| `npm run db:seed` | Seed demo data (`scripts/seed.ts` — never run in production) |
+| `npm run db:harden` | Enable RLS + revoke anon/authenticated grants, then verify |
+| `npm run cron:setup` | Register the QStash schedules for the background workers |
+| `npm test` | Unit tests (Node's built-in runner) |
+| `npm run verify` | `typecheck` + `lint` + `test` — what CI runs |
 
 ---
 
@@ -95,7 +99,14 @@ deployment fails immediately instead of failing later at runtime. In particular:
 | --- | --- |
 | `POST/GET /api/cron/notifications` | Retries undelivered partner webhooks with exponential backoff |
 | `POST/GET /api/cron/sync-payments` | Polls the provider for stuck pending payments |
+| `POST/GET /api/cron/alerts` | Operational alerting (stuck payments, exhausted webhooks, SMS backlog) |
 | `POST/GET /api/qstash/sms-cron` | Drains the SMS queue |
+
+### Unauthenticated endpoints
+
+| Endpoint | Description |
+| --- | --- |
+| `GET /api/health` | Liveness probe — DB + Redis reachability. `?deep=1` also counts stuck payments. Returns 503 when a dependency is down. |
 
 ### Admin APIs (Supabase session + `super_admin`)
 
@@ -104,7 +115,11 @@ deployment fails immediately instead of failing later at runtime. In particular:
 | `GET /api/dashboard` | Revenue/analytics aggregates |
 | `GET /api/setup`, `POST /api/setup` | Applications, providers, tenants, tenant credentials |
 | `GET /api/messaging/dashboard` | SMS stats |
-| `POST /api/messaging/quick-send` | Send an SMS from the dashboard |
+| `POST /api/messaging/quick-send` | Send an SMS from the dashboard (rate limited) |
+
+All admin responses are sent with `Cache-Control: no-store`, and the dashboard
+refreshes by polling `/api/dashboard` rather than subscribing to Supabase
+Realtime from the browser — see the security notes below.
 
 ---
 
@@ -131,12 +146,46 @@ without reprocessing.
 ## Deployment
 
 1. Set every **required in production** variable from `.env.example` in your
-   hosting provider's environment settings.
-2. Apply the schema: `npx prisma migrate deploy`.
-3. Deploy. On Vercel, `vercel.json` registers the cron schedules automatically;
-   on other platforms, schedule the worker endpoints yourself.
-4. Set `NEXTAUTH_URL` to your public HTTPS origin — it must match the URL
+   hosting provider's environment settings. The app refuses to boot if any are
+   missing (`src/lib/env.ts`).
+2. Apply the schema with migrations — never `db push` in production:
+
+   ```bash
+   npx prisma migrate deploy     # see prisma/migrations/README.md for the baseline step
+   ```
+
+3. **Harden database exposure** (this one is not optional — see below):
+
+   ```bash
+   npm run db:harden              # enables RLS, revokes anon/authenticated, then verifies
+   ```
+
+4. Deploy.
+5. Register the background workers. `vercel.json` ships two *daily* crons
+   because Vercel's Hobby plan rejects sub-daily expressions outright (a
+   deployment with `* * * * *` fails to build). Minute-level scheduling is done
+   through QStash, which works on any plan and any host:
+
+   ```bash
+   npm run cron:setup             # creates/replaces all four QStash schedules
+   ```
+
+6. Set `NEXTAUTH_URL` to your public HTTPS origin — it must match the URL
    registered with LivePay or webhook signatures will not verify.
+7. Point Africa's Talking's delivery-report callback at
+   `https://<your-domain>/api/webhooks/africastalking` and set
+   `AFRICASTALKING_CALLBACK_SECRET`.
+8. Optionally set `ALERT_WEBHOOK_URL` (Slack/Discord/generic JSON) so
+   `/api/cron/alerts` can reach a human.
+
+### Why step 3 matters
+
+Prisma creates every table in the `public` schema, which is the schema Supabase
+exposes through its Data API. The anon key that ships to the browser can read
+any table in that schema **unless RLS is enabled and denies by default** — so
+`applications.api_key` (every partner's API key) and all payment rows would be
+world-readable. `npm run db:harden` fixes and then *proves* the fix by querying
+the Data API with the anon key.
 
 ---
 
@@ -146,15 +195,24 @@ without reprocessing.
 src/
   app/                 Next.js App Router (pages + API routes)
   components/          UI (shadcn/ui) and app components
-  hooks/               Realtime dashboard subscription
+  hooks/               Dashboard polling (no browser-side database access)
   lib/
     auth.ts            Session + super-admin guards
     env.ts             Boot-time environment assertions
     encryption.ts      AES-256-GCM for tenant credentials
     payments.ts        Payment lifecycle, webhook signing + delivery
+    backoff.ts         Retry/backoff policy (unit-tested)
+    rate-limit.ts      Shared Upstash limiter
+    redact.ts          Phone-number masking for logs and audit payloads
+    sms-store.ts       SMS records (Postgres)
     safe-fetch.ts      SSRF-guarded outbound HTTP
+    webhook-hash.ts    Inbound webhook idempotency hashing (unit-tested)
     redis.ts           Upstash client (in-memory fallback in dev only)
     providers/         Payment provider adapters (LivePay)
+tests/                 Unit tests (node --test, no framework)
+scripts/harden-database.ts       RLS + grant hardening and verification
+scripts/setup-cron-schedules.ts  QStash schedule registration
+.github/workflows/ci.yml         typecheck · lint · test · build
 prisma/schema.prisma   Data model
 apps/, packages/       Reserved for future modular-monolith extraction (see ARCHITECTURE.md)
 .zscripts/             Sandbox tooling — NOT used for production deploys
@@ -169,4 +227,13 @@ apps/, packages/       Reserved for future modular-monolith extraction (see ARCH
   loopback, link-local and cloud-metadata addresses (SSRF protection).
 - Provider credentials are encrypted at rest; the service-role Supabase client
   is marked `server-only` so it can never be bundled for the browser.
-- Customer phone numbers are masked in stored webhook payloads.
+- Customer phone numbers are masked in stored webhook payloads and in logs.
+- Inbound provider webhooks are rate limited, size capped, and **verified before
+  anything is written** — a rejected delivery cannot create or suppress an audit
+  row.
+- Partner API keys are opaque `Authorization: Bearer` credentials; the
+  idempotency key is scoped per application so one partner can never observe
+  another's payment.
+- The dashboard reads data through session-gated API routes only; no
+  browser-side Supabase table access (which would require either RLS-off or a
+  public Realtime policy).
