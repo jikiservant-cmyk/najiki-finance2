@@ -1,18 +1,22 @@
 import type { Metadata, Viewport } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+// Self-hosted Geist (from the `geist` npm package) instead of `next/font/google`.
+//
+// `next/font/google` downloads the font files from fonts.googleapis.com at
+// BUILD time. That made every production build depend on Google's CDN being
+// reachable: any network hiccup, proxy, or air-gapped CI runner failed the
+// entire build with "Failed to fetch `Geist` from Google Fonts".
+//
+// The npm package ships the identical variable font files and exposes the same
+// CSS variables (--font-geist-sans / --font-geist-mono) that globals.css and
+// tailwind.config.ts already reference, so the typography is unchanged.
+import { GeistSans } from "geist/font/sans";
+import { GeistMono } from "geist/font/mono";
 import "./globals.css";
 import { Toaster } from "@/components/ui/toaster";
 import { PwaRegistrar } from "@/components/pwa-registrar";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
+const geistSans = GeistSans;
+const geistMono = GeistMono;
 
 export const viewport: Viewport = {
   themeColor: "#09090b",
