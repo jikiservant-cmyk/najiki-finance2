@@ -46,8 +46,23 @@ async function handleRetry(request: Request) {
     const due = await getPendingNotifications()
     const results: ProcessedResult[] = []
     let delivered = 0
+    let skippedForTime = 0
+
+    // Each delivery may take up to 10s, so a batch of 100 can outlive the
+    // platform's function limit and get killed mid-run (leaving rows in an
+    // unknown state). Stop early instead and let the next tick continue.
+    const startedAt = Date.now()
+    const budgetMs = Number(process.env.NOTIFICATION_WORKER_BUDGET_MS || 40_000)
 
     for (const row of due) {
+      if (Date.now() - startedAt > budgetMs) {
+        skippedForTime = due.length - results.length
+        console.warn(
+          `[notifications] time budget of ${budgetMs}ms reached after ${results.length} deliveries — ${skippedForTime} left for the next run`
+        )
+        break
+      }
+
       const outcome = await deliverQueuedNotification({
         id: row.id,
         url: row.url,
@@ -92,7 +107,10 @@ async function handleRetry(request: Request) {
       success: true,
       timestamp: new Date().toISOString(),
       dueCount: due.length,
+      processedCount: results.length,
       deliveredCount: delivered,
+      skippedCount: skippedForTime,
+      durationMs: Date.now() - startedAt,
       results,
     })
   } catch (error: any) {

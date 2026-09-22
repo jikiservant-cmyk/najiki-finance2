@@ -4,11 +4,41 @@
 
 ---
 
-## Verdict
+## Status update — what this branch now fixes
 
-**No — not production-ready today.**
+**Branch:** `arena/01a0ca6f-najiki-finance2` (contains PR #1, plus 7 commits on top)
 
-**PR #1 is genuinely good and should be merged** — I read the diff and most of its claims check out (auth fail-open, hard-coded super-admin backdoor, the webhook retry state machine, simulated SMS, prod Redis mock, dead env validation). But it is a *security hardening* PR, not a "ready to take real money" PR. There are still **10 blockers** below, several of which can lose money or leak partner API keys in a way the PR does not touch.
+| Item | Status |
+| --- | --- |
+| **B1** cross-tenant leak in `POST /api/payments` | ✅ Fixed — authenticate → validate → scoped idempotency; key is now unique per application |
+| **B2** Supabase Data API exposure | ⚠️ Tooling shipped (`npm run db:harden`), **must be run against the real database** — it verifies by querying `/rest/v1` with the anon key and exits non-zero if anything is still readable |
+| **B3** browser-side Realtime access | ✅ Fixed — replaced with polling of the session-gated `/api/dashboard` |
+| **B4** broken SMS delivery reports | ✅ Fixed — matcher exempts both callback paths (trailing-slash anchored), `AFRICASTALKING_CALLBACK_SECRET` required again, lookup is indexed |
+| **B5** webhook poisoning / unbounded writes | ✅ Fixed — rate limited, 64 KB cap, **verify before write**, canonical signature URL, P2002-safe dedupe |
+| **B6** Vercel Hobby cron limits | ✅ Fixed — `vercel.json` is Hobby-safe (2 daily jobs); minute-granularity workers registered via QStash (`npm run cron:setup`) |
+| **B7** no Prisma migrations | ⚠️ Procedure + pre-flight queries documented (`prisma/migrations/README.md`); the baseline itself must be generated where the Prisma engines can download |
+| **B8** no tests / no CI | ✅ Fixed — 13 unit tests on the money-path helpers (`npm test`), CI runs typecheck · lint · test · build |
+| **B9** no health endpoint / alerting | ✅ Fixed — `GET /api/health`, `/api/cron/alerts` with Slack/Discord webhook + thresholds |
+| **B10** settlement model, mixed units, BigInt | ❌ **Not addressed** — needs product decisions (payout/settlement flow, whether `amount` stays `Decimal(14,2)` for UGX) |
+| Medium: API keys plaintext + reused as webhook HMAC | ❌ **Not addressed** — hashing at rest needs a key-migration/rotation plan (existing keys are in use) |
+| Medium: `StubProvider` reachable via setup UI | ❌ Not addressed |
+| Medium: PII in logs, notification payloads | 🟡 Partially — phone numbers masked in logs, stored webhook payloads and dashboard responses; `payment_intents.phone_number` is still stored in clear and there is no retention policy |
+
+Also fixed on this branch beyond the list below: retry/poll starvation (a payment
+the provider never resolved fell out of the 24h window and was never
+reconciled), the QStash path claiming `delivered` with no delivery receipt, the
+notification worker being killed mid-batch, and six SQL scripts that cannot run
+against the Prisma schema (one of which creates a conflicting `applications`
+table).
+
+---
+
+## Verdict (as of the audit, before the fixes above)
+
+**No — not production-ready.** The status table above lists what this branch now
+closes; the blockers that remain are the ones marked ❌ or ⚠️.
+
+**PR #1 is genuinely good and should be merged** — I read the diff and most of its claims check out (auth fail-open, hard-coded super-admin backdoor, the webhook retry state machine, simulated SMS, prod Redis mock, dead env validation). But it is a *security hardening* PR, not a "ready to take real money" PR. There were **10 blockers**, several of which could lose money or leak partner API keys in a way the PR did not touch.
 
 | Area | State |
 | --- | --- |
@@ -163,12 +193,11 @@ Caveat: history was rewritten at some point — an earlier commit added `scripts
 
 ## 6. Recommended order
 
-1. **Merge PR #1.** It fixes real bypasses and the largest reliability bug.
-2. Apply the schema change (`role` default) — via a real migration, not `db push` (B7).
-3. Fix the four pre-launch security items: **B1** (auth before idempotency), **B2** (RLS/grants — verify first, it may already be critical), **B4** (DLR path + env regression), **B5** (verify before write + rate limit).
-4. Decide the Realtime question (**B3**).
-5. Resolve deployment mechanics: Vercel plan or external cron (**B6**); add `/api/health` + alerting (**B9**).
-6. Add the test suite + CI gate (**B8**) before onboarding a second partner app.
-7. Add settlement/payout + reconciliation and settle on minor units (**B10**); then work through the medium list.
+1. **Merge PR #1** (already included in this branch).
+2. Apply the schema change (`role` default + the three changes in this branch) — via a real migration, not `db push` (B7).
+3. Run `npm run db:harden` against the production database and keep the output: it is the evidence for **B2**.
+4. Generate the migration baseline (B7) and switch the deploy step to `migrate deploy`.
+5. Register the workers (`npm run cron:setup`) and confirm `/api/health` is green.
+6. Add settlement/payout + reconciliation and settle on minor units (**B10**); then work through the medium list (key hashing/rotation is the next security item).
 
 **Bottom line:** PR #1 takes this from "actively dangerous" to "solid beta". It is not yet a system I would let hold other people's money without B1, B2, B4, B5, B6, B7, B8 and B9 closed.
