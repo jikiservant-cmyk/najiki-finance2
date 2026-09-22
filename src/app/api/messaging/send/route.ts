@@ -135,15 +135,6 @@ export async function POST(request: Request) {
       }
     }
 
-    // Trigger the worker asynchronously using Next.js 15 'after' API if available in request context
-    try {
-      after(() => {
-        smsQueue.processBatch(5).catch(err => console.error('Background worker error:', err))
-      })
-    } catch {
-      // Fallback: smsQueue.enqueue already triggered detached background batch processing
-    }
-
     // 7. Return 202 Accepted fast-path
     return NextResponse.json({
       success: true,
