@@ -1,3 +1,8 @@
+// SECURITY: this module constructs a Supabase client with the SERVICE ROLE key,
+// which bypasses Row Level Security. The `server-only` import makes Next.js
+// fail the build if this file is ever pulled into a client component, so the
+// key can never end up in a browser bundle.
+import 'server-only'
 import { createClient } from '@supabase/supabase-js'
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!

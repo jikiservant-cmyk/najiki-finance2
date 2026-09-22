@@ -46,16 +46,23 @@ export function OPTIONS(request: Request) {
   if (process.env.NODE_ENV === 'production' && allowedOrigins.length === 0) {
     return new NextResponse(null, { status: 403, headers: { 'Access-Control-Allow-Origin': 'null' } })
   }
-  const allowedOrigin = allowedOrigins.length > 0 && allowedOrigins.includes(origin) ? origin : (allowedOrigins.length > 0 ? allowedOrigins[0] : '*')
+  const headers: Record<string, string> = {
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key',
+    'Vary': 'Origin',
+  }
 
-  return new NextResponse(null, {
-    status: 204,
-    headers: {
-      'Access-Control-Allow-Origin': allowedOrigin,
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key',
-    },
-  })
+  // Only echo back an origin we actually allow. Previously a non-matching
+  // origin received `Access-Control-Allow-Origin: <first allowed origin>`,
+  // which is at best confusing and makes ALLOWED_ORIGINS appear enforced by
+  // accident. Omit the header entirely to deny.
+  if (allowedOrigins.length === 0) {
+    headers['Access-Control-Allow-Origin'] = '*'
+  } else if (allowedOrigins.includes(origin)) {
+    headers['Access-Control-Allow-Origin'] = origin
+  }
+
+  return new NextResponse(null, { status: 204, headers })
 }
 
 export async function POST(request: Request) {

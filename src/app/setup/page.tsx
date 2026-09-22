@@ -139,16 +139,10 @@ export default function SetupPage() {
         setProviders(data.providers || [])
         setTenantConfigs(data.tenantProviderConfigs || [])
         setTenantsList(data.tenants || [])
-      } else {
-        // Fallback to debug-apps if needed
-        const fbRes = await fetch('/api/debug-apps')
-        if (fbRes.ok) {
-          const fbData = await fbRes.json()
-          setApplications(fbData.applications || [])
-          setProviders(fbData.providers || [])
-          setTenantConfigs(fbData.tenantProviderConfigs || [])
-          setTenantsList(fbData.tenants || [])
-        }
+      } else if (res.status === 401) {
+        setStatusMessage({ type: 'error', text: 'Your session has expired. Please sign in again.' })
+      } else if (res.status === 403) {
+        setStatusMessage({ type: 'error', text: 'Super admin access is required to view this page.' })
       }
     } catch (error) {
       console.error('Failed to fetch setup data:', error)

@@ -2,14 +2,22 @@ import { NextResponse, after } from 'next/server'
 import { db } from '@/lib/db'
 import { smsStore } from '@/lib/sms-store'
 import { smsQueue } from '@/lib/sms-queue'
-import { requireAuth } from '@/lib/auth'
+import { requireSuperAdmin } from '@/lib/auth'
 
 export async function POST(request: Request) {
   try {
-    // 1. Enforce dashboard session authentication
+    // 1. Enforce dashboard session authentication.
+    //
+    // SECURITY: this previously used requireAuth(), so ANY authenticated
+    // Supabase user (including tenant end-users) could send SMS billed to the
+    // platform. Sending from the dashboard is now super-admin only.
     try {
-      await requireAuth()
-    } catch {
+      await requireSuperAdmin()
+    } catch (authErr) {
+      const message = authErr instanceof Error ? authErr.message : 'Unauthorized'
+      if (message.includes('Forbidden')) {
+        return NextResponse.json({ error: 'Forbidden: Super Admin required' }, { status: 403 })
+      }
       return NextResponse.json({ error: 'Unauthorized: Log in to use dashboard quick send' }, { status: 401 })
     }
 

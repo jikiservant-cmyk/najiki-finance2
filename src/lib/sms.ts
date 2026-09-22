@@ -7,7 +7,19 @@ export async function sendSmsViaProvider(to: string, message: string, fromSender
   const senderId = fromSenderId || process.env.AFRICASTALKING_SENDER_ID || undefined
 
   if (!apiKey) {
-    console.log(`[SMS Simulation] Sending to ${to}: "${message}"`)
+    // FAIL CLOSED in production.
+    //
+    // Previously this branch "simulated" a successful delivery (and returned a
+    // fake providerId) whenever AFRICASTALKING_API_KEY was missing. In
+    // production that meant every SMS was recorded as delivered while nothing
+    // was ever sent — silent data corruption plus wasted billing records.
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'SMS provider is not configured: AFRICASTALKING_API_KEY is missing. Refusing to simulate delivery in production.'
+      )
+    }
+
+    console.log(`[SMS Simulation] (development only) Sending to ${to}: "${message}"`)
     // Mock delivery delay for demonstration
     await new Promise((resolve) => setTimeout(resolve, 500))
     return { success: true, providerId: 'sim_' + Math.random().toString(36).substring(2, 11) }

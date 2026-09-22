@@ -213,7 +213,10 @@ enum AdminRoleEnum {
 
 model AdminProfile {
   id               String         @id
-  role             AdminRoleEnum  @default(super_admin)
+  // SECURITY: this defaulted to `super_admin`, so any row inserted without an
+  // explicit role silently became a full platform administrator.
+  // Default to the least-privileged role; elevate deliberately.
+  role             AdminRoleEnum  @default(member)
   createdAt        DateTime       @map("created_at") @default(now())
   updatedAt        DateTime       @map("updated_at") @updatedAt
 

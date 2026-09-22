@@ -39,12 +39,17 @@ export async function GET() {
       }),
     ])
 
-    return NextResponse.json({
-      applications,
-      providers,
-      tenantProviderConfigs,
-      tenants,
-    })
+    // This payload contains application API keys and provider credential
+    // references — never let it be cached by a browser or intermediary.
+    return NextResponse.json(
+      {
+        applications,
+        providers,
+        tenantProviderConfigs,
+        tenants,
+      },
+      { headers: { 'Cache-Control': 'no-store, max-age=0' } }
+    )
   } catch (error: any) {
     console.error('Setup GET error:', error)
     if (error.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
