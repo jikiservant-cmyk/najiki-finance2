@@ -130,7 +130,8 @@ export class LivePayProvider implements PaymentProvider {
     payload: string,
     signatureHeader: string,
     headers?: Record<string, string>,
-    requestUrl?: string
+    requestUrl?: string,
+    additionalUrls?: string[]
   ): Promise<boolean> {
     try {
       // P0-1: FAIL CLOSED. If secret is missing or too short, reject immediately.
@@ -196,18 +197,21 @@ export class LivePayProvider implements PaymentProvider {
       }
       const sortedKeys = Object.keys(params).sort() as Array<keyof typeof params>
       
-      // Determine possible webhook URLs to support dynamic local, preview, and production environments
+      // Candidate webhook URLs. The URL is part of the signed string, so the
+      // caller passes the canonical origin first and env-configured origins
+      // after it. A caller-supplied host is deliberately NOT trusted here
+      // outside development — see buildSignatureUrlCandidates() in the route.
       const possibleWebhookUrls: string[] = []
-      
-      if (requestUrl) {
-        possibleWebhookUrls.push(requestUrl)
-        if (requestUrl.endsWith('/')) {
-          possibleWebhookUrls.push(requestUrl.slice(0, -1))
-        } else {
-          possibleWebhookUrls.push(requestUrl + '/')
-        }
+
+      const candidates = [requestUrl, ...(additionalUrls ?? [])].filter(
+        (url): url is string => typeof url === 'string' && url.length > 0
+      )
+
+      for (const candidate of candidates) {
+        possibleWebhookUrls.push(candidate)
+        possibleWebhookUrls.push(candidate.endsWith('/') ? candidate.slice(0, -1) : `${candidate}/`)
       }
-      
+
       const nextAuthUrl = process.env.NEXTAUTH_URL
       if (nextAuthUrl) {
         const fallbackUrl = `${nextAuthUrl.replace(/\/$/, '')}/api/webhooks/livepay`
@@ -221,10 +225,16 @@ export class LivePayProvider implements PaymentProvider {
         possibleWebhookUrls.push(fallbackVercel)
         possibleWebhookUrls.push(`${fallbackVercel}/`)
       }
-      
-      possibleWebhookUrls.push('http://localhost:3000/api/webhooks/livepay')
+
+      if (process.env.NODE_ENV !== 'production') {
+        possibleWebhookUrls.push('http://localhost:3000/api/webhooks/livepay')
+      }
 
       const uniqueUrls = Array.from(new Set(possibleWebhookUrls))
+      if (uniqueUrls.length === 0) {
+        console.error('[LivePay] No webhook base URL available for signature verification (fail-closed)')
+        return false
+      }
 
       for (const webhookUrl of uniqueUrls) {
         let stringToSign = `${webhookUrl}${timestamp}`

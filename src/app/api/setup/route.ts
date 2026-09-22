@@ -1,9 +1,69 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import crypto from 'crypto'
+import { z } from 'zod'
 import { requireSuperAdmin } from '@/lib/auth'
 import { validateSafeUrl } from '@/lib/safe-fetch'
 import { encrypt } from '@/lib/encryption'
+
+// Every write path is validated. These payloads previously went straight from
+// `request.json()` into Prisma, so a typo in the dashboard (or a crafted
+// request) could persist an application with an empty code or a non-http base
+// URL that the SSRF guard would only reject much later, at delivery time.
+const Id = z.string().min(1).max(64)
+const Code = z.string().min(2).max(64).regex(/^[a-zA-Z0-9._-]+$/, 'code may only contain letters, numbers, dot, dash or underscore')
+
+const ApplicationSchema = z.object({
+  code: Code,
+  name: z.string().min(1).max(200),
+  baseUrl: z.string().url().max(500),
+  webhookPath: z.string().min(1).max(300).default('/api/internal/payment-completed'),
+  internalSecretRef: z.string().max(200).optional().default(''),
+  isActive: z.boolean().optional().default(true),
+})
+
+const UpdateApplicationSchema = ApplicationSchema.partial({ code: true }).extend({ id: Id })
+
+const ProviderSchema = z.object({
+  code: Code,
+  name: z.string().min(1).max(200),
+  credentialsRef: z.string().max(200).optional().default(''),
+  isActive: z.boolean().optional().default(true),
+})
+
+const TenantSchema = z.object({
+  applicationId: Id,
+  code: Code,
+  name: z.string().min(1).max(200),
+  defaultProviderId: z.string().max(64).optional().nullable(),
+  isActive: z.boolean().optional().default(true),
+})
+
+const PaymentTypeSchema = z.object({
+  applicationId: Id,
+  code: z.string().min(1).max(64),
+  description: z.string().max(300).optional(),
+})
+
+const TenantProviderConfigSchema = z.object({
+  id: Id.optional(),
+  tenantId: Id,
+  providerId: Id,
+  apiKey: z.string().max(500).optional().default(''),
+  accountNo: z.string().max(200).optional().default(''),
+  webhookSecret: z.string().max(500).optional().default(''),
+  baseUrl: z.string().url().max(500).optional().default('https://livepay.me'),
+  credentialsRef: z.string().max(200).optional().nullable(),
+  isActive: z.boolean().optional().default(true),
+})
+
+const DeleteConfigSchema = z.object({ id: Id })
+const ToggleConfigSchema = z.object({ id: Id, isActive: z.boolean() })
+
+function validationError(error: z.ZodError) {
+  const details = error.issues.map((issue) => `${issue.path.join('.') || 'body'}: ${issue.message}`)
+  return NextResponse.json({ error: 'Validation failed', details }, { status: 400 })
+}
 
 function generateApiKey(): string {
   return `nk_${crypto.randomBytes(24).toString('hex')}`
@@ -65,10 +125,12 @@ export async function POST(request: Request) {
   try {
     await requireSuperAdmin()
 
-    const { type, data } = await request.json()
+    const body = await request.json()
+    const type = body?.type
+    const data = body?.data
 
     if (type === 'application' || type === 'updateApplication') {
-      if (data?.baseUrl) {
+      if (typeof data?.baseUrl === 'string' && data.baseUrl) {
         try {
           await validateSafeUrl(data.baseUrl)
         } catch (urlErr: any) {
@@ -82,95 +144,125 @@ export async function POST(request: Request) {
 
     let result
     switch (type) {
-      case 'application':
+      case 'application': {
+        const parsed = ApplicationSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
         result = await db.application.create({
           data: {
-            code: data.code,
-            name: data.name,
-            baseUrl: data.baseUrl,
-            webhookPath: data.webhookPath,
-            internalSecretRef: data.internalSecretRef,
+            code: parsed.data.code,
+            name: parsed.data.name,
+            baseUrl: parsed.data.baseUrl,
+            webhookPath: parsed.data.webhookPath,
+            internalSecretRef: parsed.data.internalSecretRef,
             apiKey: generateApiKey(),
-            isActive: data.isActive,
+            isActive: parsed.data.isActive,
           },
         })
         break
+      }
 
-      case 'updateApplication':
+      case 'updateApplication': {
+        const parsed = UpdateApplicationSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
         result = await db.application.update({
-          where: { id: data.id },
+          where: { id: parsed.data.id },
           data: {
-            name: data.name,
-            baseUrl: data.baseUrl,
-            webhookPath: data.webhookPath,
-            internalSecretRef: data.internalSecretRef,
-            isActive: data.isActive,
+            name: parsed.data.name,
+            baseUrl: parsed.data.baseUrl,
+            webhookPath: parsed.data.webhookPath,
+            internalSecretRef: parsed.data.internalSecretRef,
+            isActive: parsed.data.isActive,
           },
         })
         break
+      }
 
-      case 'provider':
+      case 'provider': {
+        const parsed = ProviderSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
         result = await db.provider.create({
           data: {
-            code: data.code,
-            name: data.name,
-            credentialsRef: data.credentialsRef,
-            isActive: data.isActive,
+            code: parsed.data.code,
+            name: parsed.data.name,
+            credentialsRef: parsed.data.credentialsRef,
+            isActive: parsed.data.isActive,
           },
         })
         break
+      }
 
-      case 'tenant':
+      case 'tenant': {
+        const parsed = TenantSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
         result = await db.tenant.create({
           data: {
-            applicationId: data.applicationId,
-            code: data.code,
-            name: data.name,
-            defaultProviderId: data.defaultProviderId || null,
-            isActive: data.isActive,
+            applicationId: parsed.data.applicationId,
+            code: parsed.data.code,
+            name: parsed.data.name,
+            defaultProviderId: parsed.data.defaultProviderId || null,
+            isActive: parsed.data.isActive,
           },
         })
         break
+      }
 
-      case 'paymentType':
+      case 'paymentType': {
+        const parsed = PaymentTypeSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
         result = await db.paymentType.create({
           data: {
-            applicationId: data.applicationId,
-            code: data.code,
-            description: data.description,
+            applicationId: parsed.data.applicationId,
+            code: parsed.data.code,
+            description: parsed.data.description,
           },
         })
         break
+      }
 
       case 'tenantProviderConfig': {
+        const parsed = TenantProviderConfigSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
+        const config = parsed.data
+
+        // The per-tenant provider endpoint is an outbound target too — run the
+        // same SSRF checks as the application base URL before storing it.
+        try {
+          await validateSafeUrl(config.baseUrl)
+        } catch (urlErr: any) {
+          return NextResponse.json(
+            { error: `Invalid provider base URL: ${urlErr.message}` },
+            { status: 400 }
+          )
+        }
+
         const rawCreds = {
-          apiKey: data.apiKey?.trim() || '',
-          accountNo: data.accountNo?.trim() || '',
-          webhookSecret: data.webhookSecret?.trim() || '',
-          baseUrl: data.baseUrl?.trim() || 'https://livepay.me',
+          apiKey: config.apiKey?.trim() || '',
+          accountNo: config.accountNo?.trim() || '',
+          webhookSecret: config.webhookSecret?.trim() || '',
+          baseUrl: config.baseUrl?.trim() || 'https://livepay.me',
         }
         
         const configJson = {
           _encrypted: encrypt(JSON.stringify(rawCreds))
         }
 
-        if (data.id) {
+        if (config.id) {
           result = await db.tenantProviderConfig.update({
-            where: { id: data.id },
+            where: { id: config.id },
             data: {
-              tenantId: data.tenantId,
-              providerId: data.providerId,
+              tenantId: config.tenantId,
+              providerId: config.providerId,
               configJson,
-              credentialsRef: data.credentialsRef || null,
-              isActive: data.isActive ?? true,
+              credentialsRef: config.credentialsRef || null,
+              isActive: config.isActive ?? true,
             },
           })
         } else {
           // Check if an existing configuration exists for this tenant & provider
           const existing = await db.tenantProviderConfig.findFirst({
             where: {
-              tenantId: data.tenantId,
-              providerId: data.providerId,
+              tenantId: config.tenantId,
+              providerId: config.providerId,
             },
           })
 
@@ -179,18 +271,18 @@ export async function POST(request: Request) {
               where: { id: existing.id },
               data: {
                 configJson,
-                credentialsRef: data.credentialsRef || null,
-                isActive: data.isActive ?? true,
+                credentialsRef: config.credentialsRef || null,
+                isActive: config.isActive ?? true,
               },
             })
           } else {
             result = await db.tenantProviderConfig.create({
               data: {
-                tenantId: data.tenantId,
-                providerId: data.providerId,
+                tenantId: config.tenantId,
+                providerId: config.providerId,
                 configJson,
-                credentialsRef: data.credentialsRef || null,
-                isActive: data.isActive ?? true,
+                credentialsRef: config.credentialsRef || null,
+                isActive: config.isActive ?? true,
               },
             })
           }
@@ -199,16 +291,20 @@ export async function POST(request: Request) {
       }
 
       case 'deleteTenantProviderConfig': {
+        const parsed = DeleteConfigSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
         result = await db.tenantProviderConfig.delete({
-          where: { id: data.id },
+          where: { id: parsed.data.id },
         })
         break
       }
 
       case 'toggleTenantProviderConfig': {
+        const parsed = ToggleConfigSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
         result = await db.tenantProviderConfig.update({
-          where: { id: data.id },
-          data: { isActive: data.isActive },
+          where: { id: parsed.data.id },
+          data: { isActive: parsed.data.isActive },
         })
         break
       }
