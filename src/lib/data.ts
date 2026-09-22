@@ -358,10 +358,12 @@ export async function createWebhookLog(data: {
   verified: boolean
   processed: boolean
 }) {
-  let provider = await db.provider.findFirst({ where: { code: data.provider.toLowerCase() } })
-  if (!provider) {
-    provider = await db.provider.findFirst({ where: { isActive: true } })
-  }
+  // Must match the provider that actually sent the webhook. This used to fall
+  // back to "any active provider", which silently attached webhook audit rows
+  // to an unrelated provider and corrupted the audit trail.
+  const provider = await db.provider.findFirst({
+    where: { code: data.provider.toLowerCase() },
+  })
   if (!provider) {
     throw new Error(`No provider found for webhook: ${data.provider}`)
   }
