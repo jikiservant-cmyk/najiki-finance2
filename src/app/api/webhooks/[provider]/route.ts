@@ -22,7 +22,7 @@ import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
 import { decrypt } from '@/lib/encryption'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
 import { computeWebhookEventHash } from '@/lib/webhook-hash'
-import { maskPhoneNumber, redactPhoneNumbersInText } from '@/lib/redact'
+import { redactPhoneNumbersInText } from '@/lib/redact'
 
 /** Providers retry with at-least-once semantics; 64 KB is far above any real payload. */
 const MAX_WEBHOOK_BYTES = 64 * 1024

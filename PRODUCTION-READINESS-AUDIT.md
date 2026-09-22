@@ -49,6 +49,32 @@ closes; the blockers that remain are the ones marked ❌ or ⚠️.
 | Deployability | 🔴 `vercel.json` schedules will **fail the deployment on Vercel Hobby** (B6); no Prisma migrations exist (B7). |
 | Testing / CI / observability | 🔴 None. Zero tests, no CI, no health endpoint, no alerting, no error tracking (B8, B9). |
 
+### Still open (found or confirmed while implementing the fixes)
+
+1. **`POST /api/messaging/send` has no idempotency key.** A partner that retries
+   an HTTP request creates and sends a *second* SMS — real money, per retry. The
+   fix mirrors payments (optional `idempotencyKey`, unique per application) and
+   needs a schema column plus a partner-facing contract decision, so it is left
+   as an explicit decision rather than a silent behaviour change.
+2. **API keys are plaintext and double as the outbound webhook HMAC secret.**
+   Hashing at rest needs a rotation plan for keys already in use.
+3. **Settlement/payout side does not exist.** The ledger only credits
+   (`payment_in`); no payout, fee or reversal entry, and amounts stay
+   `Decimal(14,2)` for a zero-decimal currency — reconciliation against provider
+   statements will disagree by 100×.
+4. **Inbound SMS delivery-report signature format differs from the payments
+   webhook format** (`t=…,v=…` with replay window vs. a bare HMAC), and the SMS
+   dispatch webhook sends the partner's API key as a bearer token. Changing
+   either breaks existing integrations, so both are documented rather than
+   silently altered.
+5. **Background work kicked off inside a request** (`after()` / a detached
+   `setTimeout` on enqueue) is best-effort on serverless. Correctness now rests
+   on the cron workers; the inline path is just latency.
+6. **Housekeeping:** `apps/`, `packages/`, `mini-services/` are empty
+   scaffolding (`ARCHITECTURE.md` describes a structure that does not exist),
+   `.zscripts/` is sandbox tooling, `reactStrictMode: false`, and there is no
+   Content-Security-Policy.
+
 ---
 
 ## 1. What PR #1 fixes — verified in the diff, not just the description

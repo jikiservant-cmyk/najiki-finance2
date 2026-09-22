@@ -71,10 +71,26 @@ export const smsQueue = {
 
       try {
         sms = await smsStore.get(smsId)
-        
+
         if (!sms) {
           console.error(`SMS not found in store: ${smsId}`)
           continue
+        }
+
+        // Honour the retry schedule: a message that failed a moment ago waits
+        // out its backoff instead of being re-sent on the very next tick.
+        //
+        // The id was popped and un-marked above, so it MUST be put back before
+        // stopping — otherwise the message would be dropped from the queue and
+        // never sent. The batch then ends: everything behind this message is
+        // no more due than it is, and the next tick is a minute away.
+        if (sms.nextAttemptAt && new Date(sms.nextAttemptAt).getTime() > Date.now()) {
+          await redis.lpush(SMS_QUEUE_KEY, smsId)
+          await redis.sadd(SMS_QUEUE_SEEN_KEY, smsId)
+          console.log(
+            `[smsQueue] Deferring ${smsId} until ${new Date(sms.nextAttemptAt).toISOString()} — ending batch`
+          )
+          break
         }
 
         console.log(`[smsQueue] Processing SMS ${smsId} for ${maskPhoneNumber(sms.recipient)} (attempt ${(sms.attemptCount || 0) + 1})`);
