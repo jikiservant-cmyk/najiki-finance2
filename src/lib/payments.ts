@@ -298,6 +298,153 @@ function getQStashClient(): Client | null {
   return qstashClient
 }
 
+/** Default number of delivery attempts before a notification is abandoned. */
+export const NOTIFICATION_MAX_ATTEMPTS = 5
+
+/**
+ * Exponential backoff with jitter for webhook retries.
+ * attempt 1 → ~30s, 2 → ~2m, 3 → ~8m, 4 → ~32m (capped at 6h).
+ */
+export function computeNextRetryAt(attemptCount: number): Date {
+  const baseMs = 30_000
+  const exponential = baseMs * Math.pow(4, Math.max(0, attemptCount - 1))
+  const capped = Math.min(exponential, 6 * 60 * 60 * 1000)
+  const jitter = Math.floor(Math.random() * 5_000)
+  return new Date(Date.now() + capped + jitter)
+}
+
+/**
+ * Build the outbound webhook headers, including the timestamped HMAC signature
+ * used for replay protection on the receiving application.
+ */
+export function buildNotificationHeaders(
+  apiKey: string | null,
+  payloadString: string
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Najiki-Notification': 'true',
+  }
+
+  if (apiKey) {
+    const timestamp = Date.now()
+    const signature = createHmac('sha256', apiKey)
+      .update(`${timestamp}.${payloadString}`)
+      .digest('hex')
+    headers['X-Najiki-Timestamp'] = String(timestamp)
+    headers['X-Najiki-Signature'] = `t=${timestamp},v=${signature}`
+  }
+
+  return headers
+}
+
+/**
+ * Mark all in-flight notifications for a payment intent as delivered.
+ */
+export async function recordNotificationDelivered(
+  paymentIntentId: string,
+  statusCode: number
+): Promise<void> {
+  await db.internalNotification.updateMany({
+    where: { paymentIntentId, status: { in: ['pending', 'failed_retrying'] } },
+    data: {
+      status: 'delivered',
+      lastAttemptAt: new Date(),
+      lastResponseStatus: statusCode,
+      lastResponseBody: null,
+    },
+  })
+}
+
+/**
+ * Record a failed delivery attempt.
+ *
+ * BUG FIX: this used to set `status: 'failed'`, but the retry worker only
+ * selects rows in ('pending', 'failed_retrying') — so every failed webhook was
+ * silently dropped forever and the attemptCount / nextRetryAt / maxAttempts
+ * columns were never used. We now schedule a backoff retry, and only give up
+ * once maxAttempts is reached (or the error is permanent).
+ */
+export async function recordNotificationFailure(
+  paymentIntentId: string,
+  reason: string,
+  opts: { permanent?: boolean; statusCode?: number } = {}
+): Promise<void> {
+  const rows = await db.internalNotification.findMany({
+    where: { paymentIntentId, status: { in: ['pending', 'failed_retrying'] } },
+    select: { id: true, attemptCount: true, maxAttempts: true },
+  })
+
+  for (const row of rows) {
+    const nextAttempt = (row.attemptCount ?? 0) + 1
+    const maxAttempts = row.maxAttempts ?? NOTIFICATION_MAX_ATTEMPTS
+    const exhausted = opts.permanent === true || nextAttempt >= maxAttempts
+
+    await db.internalNotification.update({
+      where: { id: row.id },
+      data: {
+        attemptCount: nextAttempt,
+        status: exhausted ? 'failed_exhausted' : 'failed_retrying',
+        lastAttemptAt: new Date(),
+        lastResponseBody: reason.slice(0, 2000),
+        ...(opts.statusCode !== undefined ? { lastResponseStatus: opts.statusCode } : {}),
+        nextRetryAt: exhausted ? null : computeNextRetryAt(nextAttempt),
+      },
+    })
+  }
+}
+
+/**
+ * Deliver a single queued InternalNotification row (used by the cron retry
+ * worker). Returns whether the delivery succeeded.
+ */
+export async function deliverQueuedNotification(row: {
+  id: string
+  url: string
+  payload: string
+  applicationId: string
+}): Promise<{ success: boolean; error?: string; statusCode?: number }> {
+  const application = await db.application.findUnique({
+    where: { id: row.applicationId },
+    select: { apiKey: true },
+  })
+
+  try {
+    await validateSafeUrl(row.url)
+  } catch (urlErr: any) {
+    return { success: false, error: `Unsafe webhook URL: ${urlErr?.message}`, statusCode: 0 }
+  }
+
+  const headers = buildNotificationHeaders(application?.apiKey ?? null, row.payload)
+
+  try {
+    const res = await safeFetch(row.url, {
+      method: 'POST',
+      headers,
+      body: row.payload,
+      signal: AbortSignal.timeout(10_000),
+    })
+
+    if (res.ok) {
+      return { success: true, statusCode: res.status }
+    }
+
+    const body = await res.text().catch(() => '')
+    // 4xx responses (except 408/429) are permanent — retrying won't help.
+    const permanent = res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429
+    return {
+      success: false,
+      statusCode: res.status,
+      error: `HTTP ${res.status}${body ? `: ${body.slice(0, 300)}` : ''}${permanent ? ' (permanent)' : ''}`,
+    }
+  } catch (err: any) {
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : 'Unknown delivery error',
+    }
+  }
+}
+
 export async function enqueueWebhookNotification(data: {
   paymentIntentId: string
   reference: string
@@ -317,13 +464,9 @@ export async function enqueueWebhookNotification(data: {
     await validateSafeUrl(data.webhookUrl)
   } catch (urlErr: any) {
     console.error(`[Webhook] Refusing to send webhook to unsafe/internal URL: ${data.webhookUrl} (${urlErr?.message})`)
-    await db.internalNotification.updateMany({
-      where: { paymentIntentId: data.paymentIntentId, status: 'pending' },
-      data: {
-        status: 'failed',
-        lastAttemptAt: new Date(),
-        lastResponseBody: `Unsafe webhook URL: ${urlErr?.message}`,
-      },
+    // Permanent failure — a private/placeholder URL will never become valid.
+    await recordNotificationFailure(data.paymentIntentId, `Unsafe webhook URL: ${urlErr?.message}`, {
+      permanent: true,
     })
     return
   }
@@ -368,14 +511,9 @@ export async function enqueueWebhookNotification(data: {
         retries: 5, // QStash native retries with exponential backoff
       })
       console.log(`[QStash] Webhook successfully enqueued for ${data.webhookUrl}`)
-      await db.internalNotification.updateMany({
-        where: { paymentIntentId: data.paymentIntentId, status: 'pending' },
-        data: {
-          status: 'delivered',
-          lastAttemptAt: new Date(),
-          lastResponseStatus: 200,
-        },
-      })
+      // QStash now owns delivery + retries, so the local row is considered
+      // delivered. (QStash retries independently of our cron worker.)
+      await recordNotificationDelivered(data.paymentIntentId, 200)
       return
     } else {
       console.warn('[QStash] QSTASH_TOKEN not configured, using direct safeFetch fallback.')
@@ -395,34 +533,23 @@ export async function enqueueWebhookNotification(data: {
     })
     console.log(`[Webhook] Direct delivery response status: ${res.status}`)
     if (res.ok) {
-      await db.internalNotification.updateMany({
-        where: { paymentIntentId: data.paymentIntentId, status: 'pending' },
-        data: {
-          status: 'delivered',
-          lastAttemptAt: new Date(),
-          lastResponseStatus: res.status,
-        },
-      })
+      await recordNotificationDelivered(data.paymentIntentId, res.status)
     } else {
-      await db.internalNotification.updateMany({
-        where: { paymentIntentId: data.paymentIntentId, status: 'pending' },
-        data: {
-          status: 'failed',
-          lastAttemptAt: new Date(),
-          lastResponseStatus: res.status,
-          lastResponseBody: `HTTP ${res.status}`,
-        },
-      })
+      const body = await res.text().catch(() => '')
+      const permanent = res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429
+      await recordNotificationFailure(
+        data.paymentIntentId,
+        `HTTP ${res.status}${body ? `: ${body.slice(0, 300)}` : ''}`,
+        { permanent, statusCode: res.status }
+      )
     }
   } catch (directErr: any) {
     console.error('[Webhook] Direct safeFetch delivery error:', directErr)
-    await db.internalNotification.updateMany({
-      where: { paymentIntentId: data.paymentIntentId, status: 'pending' },
-      data: {
-        status: 'failed',
-        lastAttemptAt: new Date(),
-        lastResponseBody: directErr instanceof Error ? directErr.message : 'Unknown direct delivery error',
-      },
-    })
+    // Transient error → schedule a backoff retry through the cron worker
+    // instead of dropping the notification on the floor.
+    await recordNotificationFailure(
+      data.paymentIntentId,
+      directErr instanceof Error ? directErr.message : 'Unknown direct delivery error'
+    )
   }
 }

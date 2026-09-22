@@ -6,7 +6,7 @@ import { verifyCronRequest } from '@/lib/qstash-verify'
 import { decrypt } from '@/lib/encryption'
 import { PLATFORM_FEE_TYPES } from '@/lib/constants'
 
-export async function POST(request: Request) {
+async function handleCron(request: Request) {
   try {
     const isAuthorized = await verifyCronRequest(request)
     if (!isAuthorized) {
@@ -116,4 +116,13 @@ export async function POST(request: Request) {
     console.error('QStash cron error:', error)
     return NextResponse.json({ error: error.message || 'Internal server error' }, { status: 500 })
   }
+}
+
+// Vercel Cron issues GET requests; QStash and manual triggers use POST.
+export async function GET(request: Request) {
+  return handleCron(request)
+}
+
+export async function POST(request: Request) {
+  return handleCron(request)
 }
