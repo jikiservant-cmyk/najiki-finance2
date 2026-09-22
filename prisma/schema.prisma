@@ -144,6 +144,7 @@ model PaymentIntent {
   createdAt   DateTime  @map("created_at") @default(now())
   updatedAt   DateTime  @map("updated_at") @updatedAt
   completedAt DateTime? @map("completed_at")
+  lastPolledAt DateTime? @map("last_polled_at")
 
   transactions          PaymentTransaction[]
   webhookLogs           WebhookLog[]
