@@ -4,6 +4,7 @@ import { db } from '@/lib/db'
 import { smsStore } from '@/lib/sms-store'
 import { smsQueue } from '@/lib/sms-queue'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
+import { findApplicationByApiKey } from '@/lib/application-auth'
 
 export function OPTIONS(request: Request) {
   const origin = request.headers.get('origin') || '*'
@@ -61,14 +62,15 @@ export async function POST(request: Request) {
 
     let application: any = null
 
-    // 2. Authenticate against the registered applications
+    // 2. Authenticate against the registered applications.
+    // Hash-first, with a fallback to the legacy cleartext column — see
+    // src/lib/application-auth.ts.
     if (apiKey) {
       try {
-        application = await db.application.findFirst({
-          where: { apiKey, isActive: true },
-        })
+        const auth = await findApplicationByApiKey(apiKey)
+        application = auth?.application ?? null
       } catch (dbErr) {
-        console.warn('[Messaging API] DB lookup by apiKey failed:', dbErr)
+        console.warn('[Messaging API] DB lookup by API key failed:', dbErr)
       }
     }
 

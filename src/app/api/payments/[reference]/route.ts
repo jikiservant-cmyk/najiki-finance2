@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
 import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
+import { webhookSecretFromRow, findApplicationByApiKey } from '@/lib/application-auth'
 import { Ratelimit } from '@upstash/ratelimit'
 import { Redis } from '@upstash/redis'
 
@@ -51,9 +52,8 @@ export async function GET(
       }
     }
 
-    const application = await db.application.findFirst({
-      where: { apiKey, isActive: true }
-    })
+    const auth = await findApplicationByApiKey(apiKey)
+    const application = auth?.application ?? null
 
     if (!application) {
       return NextResponse.json({ error: 'Invalid API key' }, { status: 401 })
@@ -129,7 +129,7 @@ export async function GET(
                   failureReason: statusResult.failureReason,
                   applicationId: application.id,
                   webhookUrl: `${application.baseUrl}${application.webhookPath}`,
-                  apiKey: application.apiKey,
+                  webhookSecret: webhookSecretFromRow(application),
                   externalEntityId: paymentIntent.externalEntityId,
                   metadata: (() => { try { return paymentIntent.metadata ? JSON.parse(paymentIntent.metadata) : {}; } catch(e) { return {}; } })(),
                 })

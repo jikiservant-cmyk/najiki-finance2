@@ -5,6 +5,7 @@ import { z } from 'zod'
 import { requireSuperAdmin } from '@/lib/auth'
 import { validateSafeUrl } from '@/lib/safe-fetch'
 import { encrypt } from '@/lib/encryption'
+import { generateApiKey, hashApiKey, apiKeyHint } from '@/lib/api-keys'
 
 // Every write path is validated. These payloads previously went straight from
 // `request.json()` into Prisma, so a typo in the dashboard (or a crafted
@@ -65,8 +66,26 @@ function validationError(error: z.ZodError) {
   return NextResponse.json({ error: 'Validation failed', details }, { status: 400 })
 }
 
-function generateApiKey(): string {
-  return `nk_${crypto.randomBytes(24).toString('hex')}`
+/**
+ * Mint an application key pair.
+ *
+ * The API key is returned to the operator exactly once and only its hash is
+ * stored. The webhook secret is a separate credential, kept encrypted because
+ * HMAC signing needs the plaintext back.
+ */
+function newApplicationCredentials() {
+  const apiKey = generateApiKey()
+  const webhookSecret = `njk_whsec_${crypto.randomBytes(32).toString('base64url')}`
+  return {
+    plaintextApiKey: apiKey,
+    webhookSecret,
+    data: {
+      apiKeyHash: hashApiKey(apiKey),
+      apiKeyHint: apiKeyHint(apiKey),
+      webhookSecretEncrypted: encrypt(webhookSecret),
+      apiKeyRotatedAt: new Date(),
+    },
+  }
 }
 
 export async function GET() {
@@ -75,6 +94,16 @@ export async function GET() {
 
     const [applications, providers, tenantProviderConfigs, tenants] = await Promise.all([
       db.application.findMany({
+        // `omit` is load-bearing, not tidiness. Selecting a whole Application
+        // would ship `apiKeyHash` and `webhookSecretEncrypted` to the browser,
+        // and an offline attack on a stored hash is the one thing hashing
+        // cannot defend against. The plaintext `apiKey` is omitted for the same
+        // reason — it is only ever returned once, from the create branch below.
+        omit: {
+          apiKey: true,
+          apiKeyHash: true,
+          webhookSecretEncrypted: true,
+        },
         include: {
           tenants: true,
           paymentTypes: true,
@@ -93,7 +122,9 @@ export async function GET() {
       }),
       db.tenant.findMany({
         include: {
-          application: true,
+          application: {
+            omit: { apiKey: true, apiKeyHash: true, webhookSecretEncrypted: true },
+          },
         },
         orderBy: { createdAt: 'desc' },
       }),
@@ -147,6 +178,7 @@ export async function POST(request: Request) {
       case 'application': {
         const parsed = ApplicationSchema.safeParse(data)
         if (!parsed.success) return validationError(parsed.error)
+        const credentials = newApplicationCredentials()
         result = await db.application.create({
           data: {
             code: parsed.data.code,
@@ -154,10 +186,12 @@ export async function POST(request: Request) {
             baseUrl: parsed.data.baseUrl,
             webhookPath: parsed.data.webhookPath,
             internalSecretRef: parsed.data.internalSecretRef,
-            apiKey: generateApiKey(),
+            ...credentials.data,
             isActive: parsed.data.isActive,
           },
         })
+        // Shown once. It is not stored in plaintext and cannot be shown again.
+        result = { ...result, apiKey: credentials.plaintextApiKey, webhookSecret: credentials.webhookSecret }
         break
       }
 

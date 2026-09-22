@@ -20,6 +20,7 @@ import { CreatePaymentRequestSchema } from '@/lib/schemas'
 import { processPayment } from '@/lib/payments'
 import { PLATFORM_FEE_TYPES } from '@/lib/constants'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
+import { findApplicationByApiKey } from '@/lib/application-auth'
 
 // crypto-random reference — replaces Date.now().slice(-6)+Math.random()*10000
 // which had collision probability under burst load (same millisecond = same prefix)
@@ -86,13 +87,10 @@ export async function POST(request: Request) {
     const rawBody = await request.json()
     const validatedBody = CreatePaymentRequestSchema.parse(rawBody)
 
-    const application = await db.application.findFirst({
-      where: {
-        code: validatedBody.applicationCode,
-        apiKey,
-        isActive: true,
-      },
-    })
+    // Hash-first lookup; falls back to the legacy cleartext column so apps
+    // provisioned before the migration keep working (see application-auth.ts).
+    const auth = await findApplicationByApiKey(apiKey, { code: validatedBody.applicationCode })
+    const application = auth?.application ?? null
 
     if (!application) {
       return NextResponse.json(

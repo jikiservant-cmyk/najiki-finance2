@@ -31,7 +31,9 @@ interface Application {
   baseUrl: string
   webhookPath: string
   internalSecretRef: string
-  apiKey: string | null
+  // Not returned by the API any more — only the hash is stored. See
+  // scripts/migrate-api-keys.ts and src/lib/api-keys.ts.
+  apiKeyHint: string | null
   isActive: boolean
   createdAt: string
   updatedAt: string
@@ -568,17 +570,20 @@ export default function SetupPage() {
                         <span>Payment Types: <strong>{app.paymentTypes?.length || 0}</strong></span>
                       </div>
 
-                      {app.apiKey && (
+                      {app.apiKeyHint && (
                         <div className="pt-2">
-                          <Label className="text-xs text-muted-foreground">Client API Key:</Label>
+                          <Label className="text-xs text-muted-foreground">
+                            Client API Key:
+                          </Label>
                           <div className="flex items-center gap-2 mt-1">
-                            <p className="text-xs font-mono bg-muted p-2 rounded flex-1 overflow-x-auto select-all">
-                              {app.apiKey}
+                            <p className="text-xs font-mono bg-muted p-2 rounded flex-1 overflow-x-auto">
+                              njk_••••••••{app.apiKeyHint}
                             </p>
-                            <Button onClick={() => copyToClipboard(app.apiKey!)} variant="outline" size="sm">
-                              <Copy className="w-3.5 h-3.5" />
-                            </Button>
                           </div>
+                          <p className="text-[11px] text-muted-foreground mt-1">
+                            Only a hash is stored, so the key cannot be shown again. If it
+                            is lost, rotate it — the old one stops working immediately.
+                          </p>
                         </div>
                       )}
                     </CardContent>

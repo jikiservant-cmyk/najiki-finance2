@@ -3,6 +3,7 @@ import { getPaymentProvider } from './providers'
 import { decrypt } from './encryption'
 import { PLATFORM_FEE_TYPES } from './constants'
 import { toMinorUnits } from './money'
+import { webhookSecretFromRow } from './application-auth'
 
 export async function processPayment(data: {
   paymentIntentId: string,
@@ -89,7 +90,7 @@ export async function processPayment(data: {
           failureReason: providerResponse.failureReason,
           applicationId: payment.applicationId,
           webhookUrl: `${payment.application.baseUrl}${payment.application.webhookPath}`,
-          apiKey: payment.application.apiKey,
+          webhookSecret: webhookSecretFromRow(payment.application),
           externalEntityId: payment.externalEntityId,
           metadata: payment.metadata ? JSON.parse(payment.metadata) : {},
         })
@@ -319,7 +320,7 @@ export {
  * used for replay protection on the receiving application.
  */
 export function buildNotificationHeaders(
-  apiKey: string | null,
+  secret: string | null,
   payloadString: string
 ): Record<string, string> {
   const headers: Record<string, string> = {
@@ -327,9 +328,9 @@ export function buildNotificationHeaders(
     'X-Najiki-Notification': 'true',
   }
 
-  if (apiKey) {
+  if (secret) {
     const timestamp = Date.now()
-    const signature = createHmac('sha256', apiKey)
+    const signature = createHmac('sha256', secret)
       .update(`${timestamp}.${payloadString}`)
       .digest('hex')
     headers['X-Najiki-Timestamp'] = String(timestamp)
@@ -425,7 +426,7 @@ export async function deliverQueuedNotification(row: {
 }): Promise<{ success: boolean; error?: string; statusCode?: number }> {
   const application = await db.application.findUnique({
     where: { id: row.applicationId },
-    select: { apiKey: true },
+    select: { apiKey: true, webhookSecretEncrypted: true },
   })
 
   try {
@@ -434,7 +435,9 @@ export async function deliverQueuedNotification(row: {
     return { success: false, error: `Unsafe webhook URL: ${urlErr?.message}`, statusCode: 0 }
   }
 
-  const headers = buildNotificationHeaders(application?.apiKey ?? null, row.payload)
+  // The signing secret, not the API key: they are separate credentials, so
+  // recovering one does not compromise the other.
+  const headers = buildNotificationHeaders(application ? webhookSecretFromRow(application) : null, row.payload)
 
   try {
     const res = await safeFetch(row.url, {
@@ -474,7 +477,8 @@ export async function enqueueWebhookNotification(data: {
   failureReason?: string | null
   applicationId: string
   webhookUrl: string
-  apiKey: string | null
+  /** Outbound signing secret — see `webhookSecretFromRow`. */
+  webhookSecret: string | null
   externalEntityId?: string | null
   metadata: any
 }) {
@@ -504,20 +508,10 @@ export async function enqueueWebhookNotification(data: {
 
   const payloadString = JSON.stringify(payloadObject)
 
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    'X-Najiki-Notification': 'true',
-  }
-
-  // P1-5: Replay protection with timestamped signature
-  if (data.apiKey) {
-    const timestamp = Date.now()
-    const signature = createHmac('sha256', data.apiKey)
-      .update(`${timestamp}.${payloadString}`)
-      .digest('hex')
-    headers['X-Najiki-Timestamp'] = String(timestamp)
-    headers['X-Najiki-Signature'] = `t=${timestamp},v=${signature}`
-  }
+  // P1-5: Replay protection with timestamped signature. Built by the shared
+  // helper rather than inline — the two copies had already drifted apart, and
+  // a signature only one of them could produce is a partner-side outage.
+  const headers = buildNotificationHeaders(data.webhookSecret, payloadString)
 
   // 1. Primary path: Use Upstash QStash with 5 automatic retries and exponential backoff
   try {

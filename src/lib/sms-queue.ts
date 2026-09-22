@@ -6,6 +6,7 @@ import { createHmac } from 'crypto'
 import { safeFetch, isPlaceholderUrl } from './safe-fetch'
 import { computeNextRetryAt, isExhausted } from './backoff'
 import { maskPhoneNumber } from './redact'
+import { webhookSecretFromRow } from './application-auth'
 
 const SMS_QUEUE_KEY = 'sms:queue'
 /** Set of ids currently in the queue — makes enqueue idempotent. */
@@ -155,9 +156,10 @@ export const smsQueue = {
               'X-Najiki-Notification': 'true'
             }
 
-            if (application.apiKey) {
-              headers['X-Najiki-Signature'] = createHmac('sha256', application.apiKey).update(payload).digest('hex')
-              headers['Authorization'] = `Bearer ${application.apiKey}`
+            const webhookSecret = webhookSecretFromRow(application)
+            if (webhookSecret) {
+              headers['X-Najiki-Signature'] = createHmac('sha256', webhookSecret).update(payload).digest('hex')
+              headers['Authorization'] = `Bearer ${webhookSecret}`
             }
 
             try {
@@ -234,9 +236,10 @@ export const smsQueue = {
               'X-Najiki-Notification': 'true'
             }
 
-            if (application.apiKey) {
-              headers['X-Najiki-Signature'] = createHmac('sha256', application.apiKey).update(payload).digest('hex')
-              headers['Authorization'] = `Bearer ${application.apiKey}`
+            const webhookSecret = webhookSecretFromRow(application)
+            if (webhookSecret) {
+              headers['X-Najiki-Signature'] = createHmac('sha256', webhookSecret).update(payload).digest('hex')
+              headers['Authorization'] = `Bearer ${webhookSecret}`
             }
 
             try {

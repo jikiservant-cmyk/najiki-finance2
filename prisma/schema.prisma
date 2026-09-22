@@ -16,7 +16,30 @@ model Application {
   baseUrl           String   @map("base_url")
   webhookPath       String   @map("webhook_path") @default("/api/internal/payment-completed")
   internalSecretRef String   @map("internal_secret_ref")
+
+  /// LEGACY. Held the partner's API key in cleartext, which made every partner
+  /// credential readable by anyone with a database dump (and, before RLS was
+  /// enabled, by the browser anon key through the Supabase Data API).
+  /// Superseded by `apiKeyHash`; kept only so un-migrated rows keep
+  /// authenticating. `npm run db:migrate-api-keys --clear-plaintext` empties it.
   apiKey            String?  @unique @map("api_key")
+
+  /// SHA-256 of the API key, hex. One-way: the plaintext is shown once at
+  /// creation or rotation and is not recoverable afterwards. Lookups hash the
+  /// presented token and compare.
+  apiKeyHash        String?  @unique @map("api_key_hash")
+
+  /// AES-256-GCM ciphertext of the outbound webhook signing secret. Separate
+  /// from the API key so that compromising the database does not hand over the
+  /// credential partners authenticate with. Must stay recoverable — HMAC
+  /// signing needs the plaintext — so it is encrypted with APP_ENCRYPTION_KEY
+  /// rather than hashed.
+  webhookSecretEncrypted String? @map("webhook_secret_encrypted")
+
+  /// Last four characters of the API key, for the dashboard. Not secret.
+  apiKeyHint        String?  @map("api_key_hint")
+  apiKeyRotatedAt   DateTime? @map("api_key_rotated_at")
+
   isActive          Boolean  @map("is_active") @default(true)
   createdAt         DateTime @map("created_at") @default(now())
   updatedAt         DateTime @map("updated_at") @updatedAt

@@ -22,6 +22,7 @@ import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
 import { decrypt } from '@/lib/encryption'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
 import { computeWebhookEventHash } from '@/lib/webhook-hash'
+import { webhookSecretFromRow } from '@/lib/application-auth'
 import { redactPhoneNumbersInText } from '@/lib/redact'
 import { buildSignatureUrlCandidates } from '@/lib/webhook-url'
 
@@ -306,7 +307,7 @@ export async function POST(
         failureReason: parsedWebhook.failureReason,
         applicationId: fullPaymentIntent.applicationId,
         webhookUrl: `${fullPaymentIntent.application.baseUrl}${fullPaymentIntent.application.webhookPath}`,
-        apiKey: fullPaymentIntent.application.apiKey,
+        webhookSecret: webhookSecretFromRow(fullPaymentIntent.application),
         externalEntityId: fullPaymentIntent.externalEntityId,
         metadata: (() => {
           try {
