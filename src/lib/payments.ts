@@ -2,6 +2,7 @@ import { db } from './db'
 import { getPaymentProvider } from './providers'
 import { decrypt } from './encryption'
 import { PLATFORM_FEE_TYPES } from './constants'
+import { toMinorUnits } from './money'
 
 export async function processPayment(data: {
   paymentIntentId: string,
@@ -180,7 +181,9 @@ export async function completePayment(data: {
     if (status === 'success' && fullPaymentIntent.tenant && !isPlatformPayment) {
       const appCode = fullPaymentIntent.application.code.toLowerCase()
       const tenantId = fullPaymentIntent.tenant.id
-      const amountMinor = BigInt(Math.round(amount * 100))
+      // Currency-aware: UGX has no minor unit, so this is not a x100. See
+      // src/lib/money.ts for why a flat x100 credited 100x the real money.
+      const amountMinor = toMinorUnits(amount, currency)
 
       const existingWallet = await tx.walletAccount.findUnique({
         where: {

@@ -19,7 +19,8 @@
     "db:reset": "prisma migrate reset",
     "db:seed": "npx tsx scripts/seed.ts",
     "db:harden": "npx tsx scripts/harden-database.ts",
-    "cron:setup": "npx tsx scripts/setup-cron-schedules.ts"
+    "cron:setup": "npx tsx scripts/setup-cron-schedules.ts",
+    "ledger:reconcile": "npx tsx scripts/reconcile-ledger.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.1.1",

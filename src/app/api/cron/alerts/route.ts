@@ -23,6 +23,7 @@ import { db } from '@/lib/db'
 import { redis } from '@/lib/redis'
 import { verifyCronRequest } from '@/lib/qstash-verify'
 import { safeFetch } from '@/lib/safe-fetch'
+import { reconcileAllWallets, describeDrift } from '@/lib/ledger'
 
 export const maxDuration = 60
 export const dynamic = 'force-dynamic'
@@ -44,6 +45,7 @@ function thresholds() {
     exhaustedNotifications: Number(process.env.ALERT_EXHAUSTED_NOTIFICATIONS || 1),
     smsQueueBacklog: Number(process.env.ALERT_SMS_QUEUE_BACKLOG || 100),
     failedSmsCount: Number(process.env.ALERT_FAILED_SMS || 20),
+    walletDriftWallets: Number(process.env.ALERT_WALLET_DRIFT_WALLETS || 1),
   }
 }
 
@@ -166,7 +168,41 @@ async function handleAlerts(request: Request) {
       console.error('[alerts] sms check failed:', error)
     }
 
-    // ── 5. Notify ───────────────────────────────────────────────────────────
+    // ── 5. Wallet balances that disagree with their ledger ──────────────────
+    // Balances are what a payout settles against, so drift here is money that
+    // may not exist. See src/lib/ledger.ts and scripts/reconcile-ledger.ts.
+    try {
+      const reconciliation = await reconcileAllWallets(
+        Number(process.env.ALERT_WALLET_SCAN_LIMIT || 1000)
+      )
+      metrics.walletsChecked = reconciliation.walletsChecked
+      metrics.walletsDrifted = reconciliation.driftedCount
+
+      if (reconciliation.driftedCount >= limits.walletDriftWallets) {
+        const examples = reconciliation.drifted.slice(0, 5).map(describeDrift)
+        alerts.push({
+          id: 'wallet-ledger-drift',
+          severity: 'critical',
+          title: `${reconciliation.driftedCount} wallet balance(s) disagree with the ledger`,
+          detail:
+            `Settlements must not run against these balances. Run ` +
+            `\`npm run ledger:reconcile\` for the full report.\n` +
+            examples.join('\n'),
+          value: reconciliation.driftedCount,
+          threshold: limits.walletDriftWallets,
+        })
+      }
+    } catch (error: any) {
+      console.error('[alerts] wallet reconciliation failed:', error)
+      alerts.push({
+        id: 'wallet-reconciliation-failed',
+        severity: 'warning',
+        title: 'Wallet reconciliation could not run',
+        detail: error?.message || 'Unknown error',
+      })
+    }
+
+    // ── 6. Notify ───────────────────────────────────────────────────────────
     let notified = false
     let notifyError: string | undefined
 
