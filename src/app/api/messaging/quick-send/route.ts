@@ -3,6 +3,14 @@ import { db } from '@/lib/db'
 import { smsStore } from '@/lib/sms-store'
 import { smsQueue } from '@/lib/sms-queue'
 import { requireSuperAdmin } from '@/lib/auth'
+import { checkRateLimit } from '@/lib/rate-limit'
+import { z } from 'zod'
+
+const QuickSendSchema = z.object({
+  to: z.string().min(9).max(20),
+  message: z.string().min(1).max(918),
+  applicationCode: z.string().min(1).max(64).optional(),
+})
 
 export async function POST(request: Request) {
   try {
@@ -26,11 +34,21 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Unsupported media type' }, { status: 415 })
     }
 
-    const { to, message, applicationCode } = await request.json()
-
-    if (!to || !message) {
-      return NextResponse.json({ error: 'Recipient (to) and message content are required' }, { status: 400 })
+    // Dashboard quick-send spends platform SMS credit on one click — cap it.
+    const decision = await checkRateLimit('quick-send', 'dashboard', { tokens: 30, window: '1 m' })
+    if (!decision.ok) {
+      return NextResponse.json(
+        { error: decision.message },
+        { status: decision.status, headers: decision.retryAfter ? { 'Retry-After': decision.retryAfter } : {} }
+      )
     }
+
+    const parsed = QuickSendSchema.safeParse(await request.json())
+    if (!parsed.success) {
+      const details = parsed.error.issues.map((issue) => `${issue.path.join('.') || 'body'}: ${issue.message}`)
+      return NextResponse.json({ error: 'Validation failed', details }, { status: 400 })
+    }
+    const { to, message, applicationCode } = parsed.data
 
     // 2. Resolve target application
     const appCode = applicationCode || 'church'

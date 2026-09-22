@@ -17,6 +17,9 @@ const REQUIRED_IN_PROD = [
   // Without this nobody can access the admin dashboard, and (previously) the
   // code silently fell back to hard-coded personal email addresses.
   'SUPER_ADMIN_EMAILS',
+  // The delivery-report endpoint fails closed in production without this, so a
+  // deployment that omits it silently stops receiving SMS delivery reports.
+  'AFRICASTALKING_CALLBACK_SECRET',
   // Public base URL — used to build the webhook URL handed to LivePay and part
   // of the signature string, so a wrong value breaks webhook verification.
   'NEXTAUTH_URL',

@@ -120,6 +120,10 @@ export const config = {
    * must stay reachable without a browser session.
    */
   matcher: [
-    '/((?!_next/static|_next/image|favicon.ico|manifest.json|manifest.webmanifest|sw.js|icons|logo.svg|robots.txt|api/webhooks|api/cron|api/qstash|api/payments|api/messaging/send).*)',
+    // Machine-to-machine paths are prefixed with a trailing slash so that a
+    // future route such as /api/payments-admin cannot accidentally inherit the
+    // public exemption (the previous patterns matched any prefix, e.g.
+    // `api/cron` also exempted `api/crons-anything`).
+    '/((?!_next/static|_next/image|favicon.ico|manifest.json|manifest.webmanifest|sw.js|icons|logo.svg|robots.txt|api/webhooks/|api/cron/|api/qstash/|api/payments/|api/payments$|api/messaging/send|api/messaging/callback|api/health).*)',
   ],
 }

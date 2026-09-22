@@ -3,23 +3,7 @@ import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { smsStore } from '@/lib/sms-store'
 import { smsQueue } from '@/lib/sms-queue'
-import { Ratelimit } from '@upstash/ratelimit'
-import { Redis } from '@upstash/redis'
-
-// Use Upstash Redis for distributed rate limiting if configured
-let ratelimit: Ratelimit | null = null;
-try {
-  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
-    const redis = Redis.fromEnv()
-    ratelimit = new Ratelimit({
-      redis,
-      limiter: Ratelimit.slidingWindow(60, '1 m'), // 60 SMS requests per minute per application
-      analytics: true,
-    })
-  }
-} catch (e) {
-  console.warn('Failed to initialize rate limiter:', e)
-}
+import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
 
 export function OPTIONS(request: Request) {
   const origin = request.headers.get('origin') || '*'
@@ -45,6 +29,14 @@ export function OPTIONS(request: Request) {
 
 export async function POST(request: Request) {
   try {
+    const ipDecision = await checkRateLimit('sms-ip', clientIdentifier(request), { tokens: 120, window: '1 m' })
+    if (!ipDecision.ok) {
+      return NextResponse.json(
+        { error: ipDecision.message },
+        { status: ipDecision.status, headers: ipDecision.retryAfter ? { 'Retry-After': ipDecision.retryAfter } : {} }
+      )
+    }
+
     const rawBody = await request.json()
     const { to, message, applicationCode, from, senderId, apiKey: bodyApiKey } = rawBody
 
@@ -88,25 +80,12 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Application code mismatch' }, { status: 403 })
     }
 
-    if (ratelimit) {
-      try {
-        const ratelimitPromise = ratelimit.limit(`sms_${apiKey}`)
-        const timeoutPromise = new Promise<{success: boolean}>((_, reject) => 
-          setTimeout(() => reject(new Error('Rate limit timeout')), 1000)
-        )
-        const { success } = await Promise.race([ratelimitPromise, timeoutPromise])
-        if (!success) {
-          return NextResponse.json(
-            { error: 'Too many requests' },
-            { status: 429, headers: { 'Retry-After': '60' } }
-          )
-        }
-      } catch (ratelimitError) {
-        console.warn('Rate limiter failed or timed out:', ratelimitError)
-        if (process.env.NODE_ENV === 'production') {
-          return NextResponse.json({ error: 'Service temporarily unavailable' }, { status: 503 })
-        }
-      }
+    const keyDecision = await checkRateLimit('sms-key', apiKey, { tokens: 60, window: '1 m' })
+    if (!keyDecision.ok) {
+      return NextResponse.json(
+        { error: keyDecision.message },
+        { status: keyDecision.status, headers: keyDecision.retryAfter ? { 'Retry-After': keyDecision.retryAfter } : {} }
+      )
     }
 
     const appCode = application.code

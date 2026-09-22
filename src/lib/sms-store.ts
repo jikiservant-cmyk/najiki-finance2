@@ -1,24 +1,63 @@
-import { redis } from './redis'
+/**
+ * SMS message store.
+ *
+ * Backed by Postgres (`sms_messages`), not by a single Redis hash.
+ *
+ * The previous implementation kept every message in one Redis hash and called
+ * `HGETALL` on every delivery-report callback and dashboard load. That is O(N)
+ * network traffic and O(N) Upstash command billing per request, has no
+ * retention story, and made the delivery-report path scan every message ever
+ * sent. Indexed Postgres lookups replace it.
+ *
+ * The Redis list is still used as the work queue (see sms-queue.ts) — only the
+ * message records moved.
+ */
+
+import { randomBytes } from 'crypto'
+import { db } from './db'
+import { normalizePhoneNumber } from './redact'
+
+export type SmsStatus = 'queued' | 'pending' | 'delivered' | 'failed'
 
 export interface SmsRequest {
   id: string
   reference: string
   recipient: string
   message: string
-  status: 'queued' | 'pending' | 'delivered' | 'failed'
+  status: SmsStatus
   attemptCount: number
-  applicationId?: string
+  applicationId?: string | null
   applicationCode: string
   providerCode: string
   cost: number
-  senderId?: string
-  providerMessageId?: string
-  failureReason?: string
+  senderId?: string | null
+  providerMessageId?: string | null
+  failureReason?: string | null
+  nextAttemptAt?: Date | null
   createdAt: string
   updatedAt: string
 }
 
-const SMS_HASH_KEY = 'sms:data'
+function newId(): string {
+  return `sms_${randomBytes(10).toString('hex')}`
+}
+
+function newReference(): string {
+  return `MSG-${Date.now().toString(16).toUpperCase()}-${randomBytes(3).toString('hex').toUpperCase()}`
+}
+
+/** Prisma rows are structurally compatible; the cast keeps callers honest. */
+function toSms(row: unknown): SmsRequest {
+  return row as SmsRequest
+}
+
+function normalizeStatus(value: unknown): SmsStatus {
+  const status = String(value || '').toLowerCase()
+  if (status === 'pending' || status === 'delivered' || status === 'failed' || status === 'queued') {
+    return status
+  }
+  return 'queued'
+}
 
 export const smsStore = {
   create: async (params: {
@@ -27,76 +66,147 @@ export const smsStore = {
     applicationCode: string
     providerCode: string
     cost: number
-    applicationId?: string
-    senderId?: string
-  }) => {
-    const item: SmsRequest = {
-      id: 'sms_' + Math.random().toString(36).substring(2, 11),
-      reference: 'MSG-' + Date.now().toString(16).toUpperCase() + '-' + Math.random().toString(36).substring(2, 5).toUpperCase(),
-      recipient: params.recipient,
-      message: params.message,
-      status: 'queued',
-      attemptCount: 0,
-      applicationId: params.applicationId,
-      applicationCode: params.applicationCode,
-      providerCode: params.providerCode,
-      cost: params.cost,
-      senderId: params.senderId,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    }
-    await redis.hset(SMS_HASH_KEY, { [item.id]: JSON.stringify(item) })
-    return item
-  },
-  
-  get: async (id: string) => {
-    const data = await redis.hget(SMS_HASH_KEY, id) as string | SmsRequest | null
-    if (data) {
-      // Depending on Upstash Redis client configuration, hget might return parsed JSON or a string.
-      // We handle both just in case.
-      const parsed = typeof data === 'string' ? JSON.parse(data) as SmsRequest : data as SmsRequest
-      if (parsed && typeof parsed.attemptCount !== 'number') {
-        parsed.attemptCount = 0
-      }
-      return parsed
-    }
-    return null
+    applicationId?: string | null
+    senderId?: string | null
+  }): Promise<SmsRequest> => {
+    const row = await db.smsMessage.create({
+      data: {
+        id: newId(),
+        reference: newReference(),
+        recipient: params.recipient,
+        message: params.message,
+        status: 'queued',
+        attemptCount: 0,
+        applicationId: params.applicationId ?? null,
+        applicationCode: params.applicationCode,
+        providerCode: params.providerCode,
+        cost: params.cost,
+        senderId: params.senderId ?? null,
+      },
+    })
+    return toSms(row)
   },
 
-  getAll: async () => {
-    const data = await redis.hvals(SMS_HASH_KEY) as Array<string | SmsRequest>
-    return data.map(item => {
-      const parsed = typeof item === 'string' ? JSON.parse(item) as SmsRequest : item as SmsRequest
-      if (parsed && typeof parsed.attemptCount !== 'number') {
-        parsed.attemptCount = 0
-      }
-      return parsed
+  get: async (id: string): Promise<SmsRequest | null> => {
+    if (!id) return null
+    const row = await db.smsMessage.findUnique({ where: { id } })
+    return row ? toSms(row) : null
+  },
+
+  /** Most recent messages, newest first. Bounded — the dashboard must not drain the table. */
+  getRecent: async (limit = 200): Promise<SmsRequest[]> => {
+    const rows = await db.smsMessage.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: Math.min(Math.max(limit, 1), 1000),
     })
+    return (rows as unknown[]).map(toSms)
+  },
+
+  /** Aggregates for the dashboard, computed by the database rather than in JS. */
+  getStats: async (): Promise<{
+    total: number
+    delivered: number
+    pending: number
+    failed: number
+    queued: number
+    deliveredCost: number
+    deliveryRate: string
+  }> => {
+    const [total, grouped, costRows] = await Promise.all([
+      db.smsMessage.count(),
+      db.smsMessage.groupBy({ by: ['status'], _count: true }),
+      db.smsMessage.aggregate({ _sum: { cost: true }, where: { status: 'delivered' } }),
+    ])
+
+    const counts: Record<string, number> = {}
+    for (const row of grouped as Array<{ status: string; _count: number }>) {
+      counts[String(row.status)] = row._count
+    }
+
+    const delivered = counts.delivered ?? 0
+    return {
+      total,
+      delivered,
+      pending: counts.pending ?? 0,
+      failed: counts.failed ?? 0,
+      queued: counts.queued ?? 0,
+      deliveredCost: Number((costRows as { _sum?: { cost?: number | null } })?._sum?.cost ?? 0),
+      deliveryRate: total > 0 ? ((delivered / total) * 100).toFixed(1) : '0',
+    }
   },
 
   updateStatus: async (
     id: string,
-    status: SmsRequest['status'],
+    status: SmsStatus,
     failureReason?: string,
     attemptCount?: number,
     providerMessageId?: string
-  ) => {
-    const item = await smsStore.get(id)
-    if (item) {
-      item.status = status
-      item.updatedAt = new Date().toISOString()
-      if (failureReason !== undefined) {
-        item.failureReason = failureReason
+  ): Promise<SmsRequest | null> => {
+    const data: Record<string, unknown> = { status: normalizeStatus(status) }
+    if (failureReason !== undefined) data.failureReason = failureReason
+    if (typeof attemptCount === 'number') data.attemptCount = attemptCount
+    if (providerMessageId) data.providerMessageId = providerMessageId
+
+    try {
+      const row = await db.smsMessage.update({ where: { id }, data })
+      return toSms(row)
+    } catch {
+      // Row removed or never existed — callers treat null as "not found".
+      return null
+    }
+  },
+
+  /**
+   * Delivery-report lookup: O(1) on the provider message id index.
+   * Replaces "fetch every SMS ever sent and scan in JS".
+   */
+  findByProviderMessageId: async (providerMessageId: string): Promise<SmsRequest | null> => {
+    if (!providerMessageId) return null
+    const row = await db.smsMessage.findFirst({
+      where: { providerMessageId },
+      orderBy: { createdAt: 'desc' },
+    })
+    return row ? toSms(row) : null
+  },
+
+  /**
+   * Fallback delivery-report lookup for providers that only echo the MSISDN.
+   * Bounded to recent, still-unresolved messages and matched on normalised
+   * digits (the stored value may be E.164 while the callback is local format).
+   */
+  findRecentUnresolvedByRecipient: async (
+    recipient: string,
+    withinHours = 48
+  ): Promise<SmsRequest | null> => {
+    const digits = normalizePhoneNumber(recipient)
+    if (digits.length < 9) return null
+
+    const since = new Date(Date.now() - withinHours * 60 * 60 * 1000)
+    const candidates = await db.smsMessage.findMany({
+      where: {
+        createdAt: { gte: since },
+        status: { in: ['queued', 'pending'] },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    })
+
+    for (const candidate of candidates as unknown[]) {
+      const row = toSms(candidate)
+      const stored = normalizePhoneNumber(row.recipient)
+      if (stored === digits || stored.endsWith(digits) || digits.endsWith(stored)) {
+        return row
       }
-      if (typeof attemptCount === 'number') {
-        item.attemptCount = attemptCount
-      }
-      if (providerMessageId) {
-        item.providerMessageId = providerMessageId
-      }
-      await redis.hset(SMS_HASH_KEY, { [id]: JSON.stringify(item) })
-      return item
     }
     return null
+  },
+
+  /** Queue bookkeeping: when the worker should look at this message again. */
+  setNextAttemptAt: async (id: string, at: Date | null): Promise<void> => {
+    try {
+      await db.smsMessage.update({ where: { id }, data: { nextAttemptAt: at } })
+    } catch {
+      // best effort — a missing row means the message was deleted
+    }
   },
 }
