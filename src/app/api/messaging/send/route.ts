@@ -41,6 +41,15 @@ export async function POST(request: Request) {
     const rawBody = await request.json()
     const { to, message, applicationCode, from, senderId, apiKey: bodyApiKey } = rawBody
 
+    // Standard `Idempotency-Key` header, with the body field as a fallback for
+    // clients that cannot set headers.
+    const idempotencyKey = (
+      request.headers.get('Idempotency-Key') ||
+      request.headers.get('idempotency-key') ||
+      rawBody.idempotencyKey ||
+      ''
+    ).toString().trim().slice(0, 255) || null
+
     if (!to || !message) {
       return NextResponse.json({ error: 'Recipient (to) and message content are required' }, { status: 400 })
     }
@@ -94,8 +103,11 @@ export async function POST(request: Request) {
     const appId = application.id
     const customSender = from || senderId || undefined
 
-    // 5. Create the SMS request in our Redis store (no schema change!)
-    const smsRequest = await smsStore.create({
+    // 5. Create the message record, deduplicated on the caller's key if given.
+    // A partner whose request times out cannot tell whether the SMS was sent,
+    // so the sane retry is the same request again. Without this, every retry
+    // is a second SMS and a second charge.
+    const { sms: smsRequest, created } = await smsStore.createOrGet({
       recipient: to,
       message,
       applicationCode: appCode,
@@ -103,10 +115,25 @@ export async function POST(request: Request) {
       cost: 50, // standard rate in UGX
       applicationId: appId,
       senderId: customSender,
+      idempotencyKey,
     })
 
-    // 6. Push to Redis queue for background execution
-    await smsQueue.enqueue(smsRequest.id)
+    // A reused record has already been queued and is on its way. Re-enqueuing
+    // it would send the message a second time, which is the exact bug this
+    // guards against.
+    if (created) {
+      // 6. Push to the queue for background execution
+      await smsQueue.enqueue(smsRequest.id)
+
+      // Trigger the worker asynchronously using Next.js 15 'after' API if available in request context
+      try {
+        after(() => {
+          smsQueue.processBatch(5).catch(err => console.error('Background worker error:', err))
+        })
+      } catch {
+        // Fallback: smsQueue.enqueue already triggered detached background batch processing
+      }
+    }
 
     // Trigger the worker asynchronously using Next.js 15 'after' API if available in request context
     try {
@@ -120,10 +147,15 @@ export async function POST(request: Request) {
     // 7. Return 202 Accepted fast-path
     return NextResponse.json({
       success: true,
-      message: 'SMS send job queued successfully',
+      message: created
+        ? 'SMS send job queued successfully'
+        : 'Duplicate request — the original SMS job was returned',
       smsId: smsRequest.id,
       reference: smsRequest.reference,
       status: smsRequest.status,
+      deduplicated: !created,
+      // Relative to when the ORIGINAL request was accepted, not this one.
+      createdAt: smsRequest.createdAt,
     }, { status: 202 })
 
   } catch (error) {

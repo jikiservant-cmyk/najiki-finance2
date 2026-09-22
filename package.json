@@ -21,7 +21,8 @@
     "db:harden": "npx tsx scripts/harden-database.ts",
     "cron:setup": "npx tsx scripts/setup-cron-schedules.ts",
     "ledger:reconcile": "npx tsx scripts/reconcile-ledger.ts",
-    "db:migrate-api-keys": "npx tsx scripts/migrate-api-keys.ts"
+    "db:migrate-api-keys": "npx tsx scripts/migrate-api-keys.ts",
+    "data:retention": "npx tsx scripts/apply-retention.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.1.1",

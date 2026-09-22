@@ -68,6 +68,15 @@ model SmsMessage {
   providerCode      String       @map("provider_code")
   cost              Int          @default(0)
   senderId          String?      @map("sender_id")
+
+  /// Caller-supplied Idempotency-Key. A partner retrying a send must not be
+  /// billed twice; the unique constraint below makes the second attempt return
+  /// the first message instead of dispatching a duplicate.
+  idempotencyKey    String?      @map("idempotency_key")
+
+  /// When `recipient` was masked by the retention worker. Null means the number
+  /// is still in its original form. Also makes the worker idempotent.
+  recipientRedactedAt DateTime?  @map("recipient_redacted_at")
   providerMessageId String?      @map("provider_message_id")
   failureReason     String?      @map("failure_reason")
   nextAttemptAt     DateTime?    @map("next_attempt_at")
@@ -77,6 +86,10 @@ model SmsMessage {
   @@index([status, nextAttemptAt])
   @@index([providerMessageId])
   @@index([recipient, createdAt])
+  // Scoped per application, like payment idempotency: two partners may pick the
+  // same key without colliding. NULLs are distinct in Postgres, so messages
+  // sent without a key are unaffected.
+  @@unique([applicationId, idempotencyKey])
   @@index([applicationCode, createdAt])
   @@map("sms_messages")
   @@schema("public")
@@ -168,6 +181,10 @@ model PaymentIntent {
   updatedAt   DateTime  @map("updated_at") @updatedAt
   completedAt DateTime? @map("completed_at")
   lastPolledAt DateTime? @map("last_polled_at")
+
+  /// When the customer's phone number was masked by the retention worker.
+  /// Null means the number is still in its original form.
+  phoneRedactedAt DateTime? @map("phone_redacted_at")
 
   transactions          PaymentTransaction[]
   webhookLogs           WebhookLog[]

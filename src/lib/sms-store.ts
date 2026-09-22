@@ -68,6 +68,7 @@ export const smsStore = {
     cost: number
     applicationId?: string | null
     senderId?: string | null
+    idempotencyKey?: string | null
   }): Promise<SmsRequest> => {
     const row = await db.smsMessage.create({
       data: {
@@ -82,9 +83,55 @@ export const smsStore = {
         providerCode: params.providerCode,
         cost: params.cost,
         senderId: params.senderId ?? null,
+        idempotencyKey: params.idempotencyKey ?? null,
       },
     })
     return toSms(row)
+  },
+
+  /**
+   * Create a message, or return the one a previous attempt with the same
+   * idempotency key already created.
+   *
+   * The lookup-then-insert would race under concurrent retries, so the unique
+   * constraint on (applicationId, idempotencyKey) is the real guard: whichever
+   * insert loses gets a P2002 and reads back the winner's row. SMS costs money
+   * per message, so a duplicate here is a duplicate charge.
+   *
+   * Returns `created: false` when an existing message was reused.
+   */
+  createOrGet: async (params: {
+    recipient: string
+    message: string
+    applicationCode: string
+    providerCode: string
+    cost: number
+    applicationId?: string | null
+    senderId?: string | null
+    idempotencyKey?: string | null
+  }): Promise<{ sms: SmsRequest; created: boolean }> => {
+    const key = params.idempotencyKey?.trim() || null
+
+    if (key && params.applicationId) {
+      const existing = await db.smsMessage.findFirst({
+        where: { applicationId: params.applicationId, idempotencyKey: key },
+      })
+      if (existing) return { sms: toSms(existing), created: false }
+    }
+
+    try {
+      const sms = await smsStore.create({ ...params, idempotencyKey: key })
+      return { sms, created: true }
+    } catch (error: any) {
+      // P2002: the unique constraint fired, so a concurrent retry won the race.
+      if (error?.code !== 'P2002' || !key || !params.applicationId) throw error
+
+      const winner = await db.smsMessage.findFirst({
+        where: { applicationId: params.applicationId, idempotencyKey: key },
+      })
+      if (!winner) throw error
+      return { sms: toSms(winner), created: false }
+    }
   },
 
   get: async (id: string): Promise<SmsRequest | null> => {
