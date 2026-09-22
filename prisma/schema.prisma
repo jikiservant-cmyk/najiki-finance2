@@ -25,8 +25,37 @@ model Application {
   paymentTypes          PaymentType[]
   paymentIntents        PaymentIntent[]
   internalNotifications InternalNotification[]
+  smsMessages           SmsMessage[]
 
   @@map("applications")
+  @@schema("public")
+}
+
+model SmsMessage {
+  id                String       @id @default(cuid())
+  reference         String       @unique
+  recipient         String
+  message           String
+  // queued | pending | delivered | failed
+  status            String       @default("queued")
+  attemptCount      Int          @map("attempt_count") @default(0)
+  applicationId     String?      @map("application_id")
+  application       Application? @relation(fields: [applicationId], references: [id])
+  applicationCode   String       @map("application_code")
+  providerCode      String       @map("provider_code")
+  cost              Int          @default(0)
+  senderId          String?      @map("sender_id")
+  providerMessageId String?      @map("provider_message_id")
+  failureReason     String?      @map("failure_reason")
+  nextAttemptAt     DateTime?    @map("next_attempt_at")
+  createdAt         DateTime     @default(now()) @map("created_at")
+  updatedAt         DateTime     @updatedAt @map("updated_at")
+
+  @@index([status, nextAttemptAt])
+  @@index([providerMessageId])
+  @@index([recipient, createdAt])
+  @@index([applicationCode, createdAt])
+  @@map("sms_messages")
   @@schema("public")
 }
 
@@ -95,7 +124,10 @@ model PaymentIntent {
 
   externalEntityId String? @map("external_entity_id")
   reference        String  @unique
-  idempotencyKey   String  @map("idempotency_key") @unique
+  // Idempotency is scoped per application. A globally unique key meant partner
+  // app B could never reuse a key already used by app A — the request silently
+  // returned app A's payment instead of creating B's.
+  idempotencyKey   String  @map("idempotency_key")
 
   amount      Decimal @db.Decimal(14, 2)
   currency    String  @default("UGX")
@@ -118,6 +150,8 @@ model PaymentIntent {
   internalNotifications InternalNotification[]
   ledgerEntries         LedgerEntry[]
 
+  @@unique([applicationId, idempotencyKey])
+  @@index([status, lastPolledAt])
   @@index([applicationId])
   @@index([tenantId])
   @@index([status])
