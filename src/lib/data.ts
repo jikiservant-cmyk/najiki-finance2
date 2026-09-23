@@ -5,34 +5,63 @@
 //  FIX 3: getPaymentByReference uses findUnique (not findFirst) to hit @unique index
 //  FIX 4: getPendingNotifications adds nextRetryAt filter so only due rows are loaded
 
+import { Prisma } from '@prisma/client'
+import { pickPrimaryCurrency } from './money'
 import { db } from './db'
 
 // ─── DASHBOARD ────────────────────────────────────────────────────────────────
 
-export async function getDashboardData(period: string = '14d') {
-  let dateFilter: Date | undefined = undefined;
+/**
+ * Reportable periods → the SQL interval used for the daily chart.
+ *
+ * A whitelist, not a fallback chain. The previous `else if` ladder left
+ * `dateFilter` undefined for any unrecognised value, so `?period=1d` (a
+ * plausible thing to try) returned **all-time** totals for the stat cards
+ * alongside a 14-day chart, with nothing indicating the mismatch.
+ */
+const DASHBOARD_PERIODS: Record<string, { days: number | null; interval: string }> = {
+  '14d': { days: 14, interval: '14 days' },
+  '1m': { days: 30, interval: '30 days' },
+  '3m': { days: 90, interval: '90 days' },
+  '1y': { days: 365, interval: '365 days' },
+  all: { days: null, interval: '100 years' },
+}
+
+export const DEFAULT_DASHBOARD_PERIOD = '14d'
+
+export async function getDashboardData(period: string = DEFAULT_DASHBOARD_PERIOD) {
   const now = new Date();
-  let intervalStr = "14 days";
-  
-  if (period === '14d') {
-    dateFilter = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
-    intervalStr = "14 days";
-  } else if (period === '1m') {
-    dateFilter = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-    intervalStr = "30 days";
-  } else if (period === '3m') {
-    dateFilter = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
-    intervalStr = "90 days";
-  } else if (period === '1y') {
-    dateFilter = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
-    intervalStr = "365 days";
-  } else if (period === 'all') {
-    dateFilter = undefined;
-    intervalStr = "100 years";
-  }
+  const requested = String(period ?? '').trim().toLowerCase()
+  const selected = DASHBOARD_PERIODS[requested] ?? DASHBOARD_PERIODS[DEFAULT_DASHBOARD_PERIOD]
+  const resolvedPeriod = DASHBOARD_PERIODS[requested] ? requested : DEFAULT_DASHBOARD_PERIOD
+  const intervalStr = selected.interval
+  const dateFilter = selected.days === null
+    ? undefined
+    : new Date(now.getTime() - selected.days * 24 * 60 * 60 * 1000)
 
   const baseWhere = dateFilter ? { createdAt: { gte: dateFilter } } : {};
-  const successWhere = { status: 'success', ...baseWhere };
+
+  // ── Currency: every money aggregate below is scoped to ONE currency ────────
+  // `_sum: { amount: true }` adds up the raw `amount` column, and `amount` is in
+  // major units of whatever currency the intent used. Summing a UGX intent and a
+  // USD intent produces a number that means nothing — and the dashboard then
+  // labelled it "UGX". So the platform's primary currency (the one most
+  // successful payments were taken in for this period) is chosen first, every
+  // revenue query is filtered to it, and the per-currency totals are returned
+  // separately so nothing is hidden.
+  const currencyRows = await db.paymentIntent.groupBy({
+    by: ['currency'],
+    where: { status: 'success', ...baseWhere },
+    _count: { _all: true },
+  })
+
+  const currencyBreakdown = currencyRows
+    .map((row) => ({ currency: String(row.currency).toUpperCase(), count: row._count._all }))
+    .sort((a, b) => b.count - a.count || a.currency.localeCompare(b.currency))
+
+  const revenueCurrency = pickPrimaryCurrency(currencyBreakdown)
+
+  const successWhere = { status: 'success', currency: revenueCurrency, ...baseWhere };
 
   const [
     totalPayments,
@@ -105,15 +134,21 @@ export async function getDashboardData(period: string = '14d') {
       _count: true,
     }),
 
-    // FIX 1: single raw SQL query — DB does the date bucketing and summing
-    db.$queryRawUnsafe<{ date: string; revenue: number; count: bigint; failed: bigint }[]>(`
+    // FIX 1: single raw SQL query — DB does the date bucketing and summing.
+    //
+    // The currency is bound as a parameter rather than interpolated, and scoped
+    // to the same one the stat cards use, so the chart and the totals cannot
+    // disagree. The interval stays a whitelisted literal (see
+    // DASHBOARD_PERIODS) because a parameter cannot stand in for an INTERVAL.
+    db.$queryRaw<{ date: string; revenue: number; count: bigint; failed: bigint }[]>(Prisma.sql`
       SELECT
         TO_CHAR(DATE_TRUNC('day', COALESCE(completed_at, created_at)), 'YYYY-MM-DD') AS date,
         COALESCE(SUM(CASE WHEN status = 'success' THEN amount ELSE 0 END), 0)         AS revenue,
         COUNT(CASE WHEN status = 'success' THEN 1 END)                                AS count,
         COUNT(CASE WHEN status = 'failed'  THEN 1 END)                                AS failed
       FROM payment_intents
-      WHERE created_at >= NOW() - INTERVAL '${intervalStr}'
+      WHERE created_at >= NOW() - INTERVAL '${Prisma.raw(intervalStr)}'
+        AND currency = ${revenueCurrency}
       GROUP BY DATE_TRUNC('day', COALESCE(completed_at, created_at))
       ORDER BY date ASC
     `),
@@ -246,6 +281,13 @@ export async function getDashboardData(period: string = '14d') {
 
   return {
     totalRevenue,
+    // The currency every money figure in this payload is denominated in. The UI
+    // must label with this rather than assuming UGX.
+    revenueCurrency,
+    // Per-currency payment counts, so a deployment taking more than one currency
+    // can see that the headline figure covers only one of them.
+    currencyBreakdown,
+    period: resolvedPeriod,
     statusCounts,
     successRate,
     appRevenue,

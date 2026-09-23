@@ -16,6 +16,7 @@ import {
   MAX_MAJOR_AMOUNT,
   normalizeCurrency,
   isValidCurrencyCode,
+  pickPrimaryCurrency,
   currencyExponent,
   fromMinorUnits,
   isKnownCurrency,
@@ -283,4 +284,53 @@ test('normalisation does not change the exponent, so no money changes value', ()
   for (const code of ['UGX', 'usd', 'jpy', 'Kwd']) {
     assert.equal(currencyExponent(code), currencyExponent(normalizeCurrency(code)))
   }
+})
+
+// ─── reporting currency ──────────────────────────────────────────────────────
+
+test('the reporting currency is the most-used one', () => {
+  // Money totals cannot be summed across currencies, so a headline figure has to
+  // pick one. Whichever it picks, it must be deterministic.
+  assert.equal(
+    pickPrimaryCurrency([
+      { currency: 'USD', count: 5 },
+      { currency: 'UGX', count: 100 },
+    ]),
+    'UGX'
+  )
+  assert.equal(
+    pickPrimaryCurrency([
+      { currency: 'USD', count: 90 },
+      { currency: 'UGX', count: 10 },
+    ]),
+    'USD'
+  )
+})
+
+test('ties break alphabetically so the headline never drifts', () => {
+  // An unstable headline looks like the revenue itself moved between renders.
+  assert.equal(pickPrimaryCurrency([{ currency: 'USD', count: 7 }, { currency: 'UGX', count: 7 }]), 'UGX')
+  assert.equal(pickPrimaryCurrency([{ currency: 'UGX', count: 7 }, { currency: 'USD', count: 7 }]), 'UGX')
+})
+
+test('case and padding do not create a second currency', () => {
+  assert.equal(pickPrimaryCurrency([{ currency: 'ugx', count: 3 }]), 'UGX')
+  assert.equal(pickPrimaryCurrency([{ currency: ' ugx ', count: 3 }]), 'UGX')
+})
+
+test('the fallback is used when there is nothing to report', () => {
+  assert.equal(pickPrimaryCurrency([]), 'UGX')
+  assert.equal(pickPrimaryCurrency([], 'KES'), 'KES')
+  assert.equal(pickPrimaryCurrency([{ currency: null, count: 3 }]), 'UGX')
+  assert.equal(pickPrimaryCurrency([{ currency: '', count: 3 }]), 'UGX')
+  assert.equal(pickPrimaryCurrency([{ currency: 'NOPE', count: 3 }]), 'UGX')
+  assert.equal(pickPrimaryCurrency([{ currency: 'UGX', count: 0 }]), 'UGX')
+  assert.equal(pickPrimaryCurrency([{ currency: 'UGX', count: -5 }]), 'UGX')
+  assert.equal(pickPrimaryCurrency([{ currency: 'UGX', count: NaN }]), 'UGX')
+})
+
+test('the fallback is never an empty string', () => {
+  // Callers label a figure with this, so "" would render as "  123" or similar.
+  assert.notEqual(pickPrimaryCurrency([], ''), '')
+  assert.notEqual(pickPrimaryCurrency([]), '')
 })

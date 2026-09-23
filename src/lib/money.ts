@@ -69,6 +69,40 @@ export function normalizeCurrency(code: string | null | undefined): string {
   return String(code ?? '').trim().toUpperCase()
 }
 
+/**
+ * Pick the currency a dashboard's money totals should be reported in.
+ *
+ * Summing `amount` across currencies produces a meaningless number, so a
+ * multi-currency deployment has to report in one currency and disclose the rest.
+ * The rule is the currency with the most payments in the window, ties broken
+ * alphabetically so the same data always yields the same headline (an unstable
+ * headline looks like the revenue itself moved).
+ *
+ * Returns `fallback` for an empty or unparseable set — never an empty string, so
+ * callers always have something safe to label a figure with.
+ */
+export function pickPrimaryCurrency(
+  rows: Array<{ currency?: string | null; count?: number | null }>,
+  fallback = 'UGX'
+): string {
+  const normalised = rows
+    .map((row) => ({
+      currency: normalizeCurrency(row.currency),
+      count: Number.isFinite(Number(row.count)) ? Number(row.count) : 0,
+    }))
+    .filter((row) => isValidCurrencyCode(row.currency) && row.count > 0)
+
+  if (normalised.length === 0) {
+    // The fallback itself is validated: returning '' would leave a caller with
+    // nothing to label a figure with.
+    const normalisedFallback = normalizeCurrency(fallback)
+    return isValidCurrencyCode(normalisedFallback) ? normalisedFallback : 'UGX'
+  }
+
+  normalised.sort((a, b) => b.count - a.count || a.currency.localeCompare(b.currency))
+  return normalised[0].currency
+}
+
 /** True when the code is exactly three ASCII letters. */
 export function isValidCurrencyCode(code: string | null | undefined): boolean {
   return /^[A-Z]{3}$/.test(normalizeCurrency(code))
