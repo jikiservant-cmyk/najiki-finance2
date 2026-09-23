@@ -168,11 +168,11 @@ export async function POST(
     // provider stopped retrying and the payment never settled, silently. Reusing
     // the row lets the delivery complete; every step below is idempotent, so
     // running it twice is harmless.
-    let webhookLog: { id: string } | null = existingLog
+    let resolvedLog: { id: string } | null = existingLog
 
-    if (!webhookLog) {
+    if (!resolvedLog) {
       try {
-        webhookLog = await createWebhookLog({
+        resolvedLog = await createWebhookLog({
           provider: normalizedProvider,
           eventType: 'WEBHOOK_RECEIVED',
           payload: sanitizedPayload,
@@ -193,9 +193,16 @@ export async function POST(
         if (decideWebhookLogAction(concurrent) === 'duplicate') {
           return NextResponse.json({ success: true, duplicate: true })
         }
-        webhookLog = concurrent
+        resolvedLog = concurrent
       }
     }
+
+    // Narrowed once, explicitly: the compiler cannot see that every branch above
+    // either assigns or returns, and the rest of the handler needs a non-null id.
+    if (!resolvedLog) {
+      throw new Error('webhook log row missing after dedupe resolution')
+    }
+    const webhookLog: { id: string } = resolvedLog
 
     if (!parsedBody) {
       await db.webhookLog.update({

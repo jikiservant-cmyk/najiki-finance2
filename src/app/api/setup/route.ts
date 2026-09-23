@@ -9,8 +9,9 @@ import {
   isProviderImplemented,
   providerDisplayName,
 } from '@/lib/providers'
-import { encrypt } from '@/lib/encryption'
+import { encrypt, decrypt } from '@/lib/encryption'
 import { generateApiKey, hashApiKey, apiKeyHint } from '@/lib/api-keys'
+import { summarizeProviderConfig, shouldPreserveStoredSecret } from '@/lib/provider-config-summary'
 
 // Every write path is validated. These payloads previously went straight from
 // `request.json()` into Prisma, so a typo in the dashboard (or a crafted
@@ -132,13 +133,25 @@ export async function GET() {
       db.provider.findMany({
         orderBy: { createdAt: 'desc' },
       }),
-      db.tenantProviderConfig.findMany({
-        include: {
-          tenant: true,
-          provider: true,
-        },
-        orderBy: { createdAt: 'desc' },
-      }),
+      // `configJson` holds this tenant's provider credentials. It is NOT
+      // returned: the dashboard only needs to know whether credentials exist and
+      // what the non-secret fields are. Rows written before encryption was added
+      // still hold { apiKey, webhookSecret } in the clear, and shipping those to
+      // a browser is exactly what the Application `omit` above exists to prevent.
+      db.tenantProviderConfig
+        .findMany({
+          include: {
+            tenant: true,
+            provider: true,
+          },
+          orderBy: { createdAt: 'desc' },
+        })
+        .then((configs) =>
+          configs.map(({ configJson, ...rest }) => ({
+            ...rest,
+            configSummary: summarizeProviderConfig(configJson),
+          }))
+        ),
       db.tenant.findMany({
         include: {
           application: {
@@ -375,13 +388,52 @@ export async function POST(request: Request) {
           )
         }
 
-        const rawCreds = {
-          apiKey: config.apiKey?.trim() || '',
-          accountNo: config.accountNo?.trim() || '',
-          webhookSecret: config.webhookSecret?.trim() || '',
-          baseUrl: config.baseUrl?.trim() || 'https://livepay.me',
+        // Editing must not erase a credential it was never shown. The form
+        // cannot prefill the API key (the server will not send it), so a blank
+        // value here means "unchanged", not "delete" — read the stored blob and
+        // carry the existing secret forward.
+        let preserved: Record<string, string> = {}
+        if (config.id) {
+          const current = await db.tenantProviderConfig.findUnique({ where: { id: config.id } })
+          const stored = current?.configJson as Record<string, unknown> | undefined
+          if (stored && typeof stored === 'object') {
+            if (typeof stored._encrypted === 'string') {
+              try {
+                const decoded = JSON.parse(decrypt(stored._encrypted))
+                if (decoded && typeof decoded === 'object') preserved = decoded
+              } catch (decryptErr) {
+                console.error(
+                  `[setup] Could not decrypt the stored provider config for ${config.id}; ` +
+                    'refusing to guess at its credentials.',
+                  decryptErr
+                )
+                return NextResponse.json(
+                  {
+                    error:
+                      'The stored credentials for this configuration could not be read, so ' +
+                      'saving would have overwritten them. Re-enter the API key to replace them.',
+                  },
+                  { status: 409 }
+                )
+              }
+            } else {
+              // Legacy plaintext blob.
+              preserved = stored as Record<string, string>
+            }
+          }
         }
-        
+
+        const rawCreds = {
+          apiKey: shouldPreserveStoredSecret(config.apiKey)
+            ? String(preserved.apiKey ?? '')
+            : config.apiKey!.trim(),
+          accountNo: config.accountNo?.trim() || String(preserved.accountNo ?? ''),
+          webhookSecret: shouldPreserveStoredSecret(config.webhookSecret)
+            ? String(preserved.webhookSecret ?? '')
+            : config.webhookSecret!.trim(),
+          baseUrl: config.baseUrl?.trim() || String(preserved.baseUrl ?? 'https://livepay.me'),
+        }
+
         const configJson = {
           _encrypted: encrypt(JSON.stringify(rawCreds))
         }

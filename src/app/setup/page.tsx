@@ -96,17 +96,16 @@ interface TenantProviderConfig {
     code: string
   }
   credentialsRef: string | null
-  configJson: {
-    apiKey?: string
-    api_key?: string
-    accountNo?: string
-    account_number?: string
-    accountNumber?: string
-    webhookSecret?: string
-    webhook_secret?: string
-    baseUrl?: string
-    base_url?: string
-    [key: string]: any
+  /**
+   * Non-secret summary only. The server never sends the credential blob, so the
+   * form cannot prefill the API key — leaving it blank means "unchanged".
+   */
+  configSummary?: {
+    hasApiKey: boolean
+    hasWebhookSecret: boolean
+    accountNo: string
+    baseUrl: string
+    encrypted: boolean
   }
   isActive: boolean
   createdAt: string
@@ -332,8 +331,15 @@ export default function SetupPage() {
       setStatusMessage({ type: 'error', text: 'Please select a Provider' })
       return
     }
-    if (!configApiKey || !configAccountNo) {
-      setStatusMessage({ type: 'error', text: 'Both Provider API Key and Account Number are required' })
+    // When editing, a blank key means "keep the stored one" — the server carries
+    // the existing credential forward. Requiring it again would force an operator
+    // to re-paste a secret just to change a base URL.
+    if (!configAccountNo) {
+      setStatusMessage({ type: 'error', text: 'Account Number is required' })
+      return
+    }
+    if (!editingConfigId && !configApiKey) {
+      setStatusMessage({ type: 'error', text: 'Provider API Key is required when adding a new configuration' })
       return
     }
 
@@ -384,11 +390,13 @@ export default function SetupPage() {
     setEditingConfigId(cfg.id)
     setConfigTenantId(cfg.tenantId)
     setConfigProviderId(cfg.providerId)
-    const json = cfg.configJson || {}
-    setConfigApiKey(json.apiKey || json.api_key || '')
-    setConfigAccountNo(json.accountNo || json.account_number || json.accountNumber || '')
-    setConfigWebhookSecret(json.webhookSecret || json.webhook_secret || '')
-    setConfigBaseUrl(json.baseUrl || json.base_url || 'https://livepay.me')
+    const summary = cfg.configSummary
+    // Deliberately blank: the server does not send secrets, so the operator
+    // re-enters the key only when they want to change it.
+    setConfigApiKey('')
+    setConfigWebhookSecret('')
+    setConfigAccountNo(summary?.accountNo || '')
+    setConfigBaseUrl(summary?.baseUrl || 'https://livepay.me')
     setConfigCredentialsRef(cfg.credentialsRef || '')
     setConfigIsActive(cfg.isActive)
     setActiveTab('tenant-providers')
@@ -1055,10 +1063,9 @@ export default function SetupPage() {
               ) : (
                 <div className="space-y-3">
                   {tenantConfigs.map((cfg) => {
-                    const json = cfg.configJson || {}
-                    const apiKey = json.apiKey || json.api_key
-                    const accountNo = json.accountNo || json.account_number || json.accountNumber
-                    const baseUrl = json.baseUrl || json.base_url || 'https://livepay.me'
+                    const summary = cfg.configSummary
+                    const accountNo = summary?.accountNo
+                    const baseUrl = summary?.baseUrl || 'https://livepay.me'
 
                     return (
                       <Card
@@ -1114,7 +1121,15 @@ export default function SetupPage() {
                                 API Key:
                               </span>
                               <span className="text-foreground">
-                                {maskKey(apiKey)}
+                                {summary?.hasApiKey ? (
+                                  <span className="text-emerald-600 dark:text-emerald-400">
+                                    •••• configured
+                                  </span>
+                                ) : (
+                                  <span className="text-amber-600 dark:text-amber-400">
+                                    not set — using platform fallback
+                                  </span>
+                                )}
                               </span>
                             </div>
                             <div>
