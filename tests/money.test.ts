@@ -13,6 +13,9 @@ import assert from 'node:assert/strict'
 
 import {
   amountsMatch,
+  MAX_MAJOR_AMOUNT,
+  normalizeCurrency,
+  isValidCurrencyCode,
   currencyExponent,
   fromMinorUnits,
   isKnownCurrency,
@@ -221,4 +224,63 @@ test('reconciliation reports the drift in the wallet currency', () => {
     [{ direction: 'credit', amountMinor: 1000n }]
   )
   assert.equal(minorUnitsToDecimalString(usd.driftMinor, usd.currency), '2.50')
+})
+
+// ─── input bounds and currency normalisation ─────────────────────────────────
+
+test('the maximum amount matches what Decimal(14,2) can actually store', () => {
+  // The schema bound and the column width must agree, or the boundary admits a
+  // value Postgres rejects as an overflow (a 500 instead of a 400).
+  assert.equal(MAX_MAJOR_AMOUNT, 999_999_999_999.99)
+  assert.ok(MAX_MAJOR_AMOUNT < 1e14, 'must fit in 14 digits of precision')
+})
+
+test('an amount at the maximum converts exactly, with no float drift', () => {
+  // USD keeps both decimals exactly.
+  assert.equal(toMinorUnits(MAX_MAJOR_AMOUNT, 'USD'), 99999999999999n)
+
+  // UGX has no minor unit, so the trailing .99 is not a representable amount and
+  // is rounded half-up to the next whole shilling — 1,000,000,000,000 UGX, not
+  // 999,999,999,999. That is the correct half-up rule for a zero-decimal
+  // currency, and it is asserted here so the boundary cannot silently start
+  // truncating instead.
+  assert.equal(toMinorUnits(MAX_MAJOR_AMOUNT, 'UGX'), 1000000000000n)
+
+  // The exact value still round-trips through the decimal-string helper that
+  // writes to Decimal columns, with no exponent notation.
+  assert.equal(
+    minorUnitsToDecimalString(toMinorUnits(MAX_MAJOR_AMOUNT, 'USD'), 'USD'),
+    '999999999999.99'
+  )
+})
+
+test('currency codes are normalised so one currency is one wallet', () => {
+  // Wallet identity is (tenantId, appCode, currency). If case mattered, "ugx"
+  // would open a second wallet for the same money and split the balance.
+  assert.equal(normalizeCurrency('ugx'), 'UGX')
+  assert.equal(normalizeCurrency('  Ugx  '), 'UGX')
+  assert.equal(normalizeCurrency('USD'), 'USD')
+  assert.equal(normalizeCurrency(null), '')
+  assert.equal(normalizeCurrency(undefined), '')
+
+  assert.equal(normalizeCurrency('ugx'), normalizeCurrency('UGX'))
+})
+
+test('malformed currency codes are rejected', () => {
+  assert.equal(isValidCurrencyCode('UGX'), true)
+  assert.equal(isValidCurrencyCode('ugx'), true)
+  assert.equal(isValidCurrencyCode('US'), false)
+  assert.equal(isValidCurrencyCode('USDD'), false)
+  assert.equal(isValidCurrencyCode('U1X'), false)
+  assert.equal(isValidCurrencyCode('U X'), false)
+  assert.equal(isValidCurrencyCode(''), false)
+  assert.equal(isValidCurrencyCode(null), false)
+  // Non-ASCII lookalikes must not pass as a currency code.
+  assert.equal(isValidCurrencyCode('U\u0413X'), false)
+})
+
+test('normalisation does not change the exponent, so no money changes value', () => {
+  for (const code of ['UGX', 'usd', 'jpy', 'Kwd']) {
+    assert.equal(currencyExponent(code), currencyExponent(normalizeCurrency(code)))
+  }
 })

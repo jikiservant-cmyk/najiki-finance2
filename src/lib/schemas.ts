@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MAX_MAJOR_AMOUNT, normalizeCurrency } from "./money";
 
 // ============================================================================
 // 1. CREATE PAYMENT — what SACCO/Church send TO the Payment Service
@@ -27,8 +28,19 @@ export const CreatePaymentRequestSchema = z.object({
   // Money. Reject non-positive amounts here rather than relying solely on
   // the DB check constraint - better to fail with a clear 400 message than
   // a raw Postgres constraint error.
-  amount: z.number().positive(),
-  currency: z.string().length(3).default("UGX"),
+  // Upper-bounded, not just positive: the column is Decimal(14,2), so an
+  // out-of-range amount reaches Postgres as a numeric overflow and comes back
+  // as a 500 instead of a validation error.
+  amount: z.number().finite().positive().max(MAX_MAJOR_AMOUNT),
+  // Normalised to upper case at the boundary. Currency is part of the wallet
+  // key, so "ugx" and "UGX" would otherwise create two wallets for one currency
+  // and split the tenant's balance between them.
+  currency: z
+    .string()
+    .trim()
+    .regex(/^[A-Za-z]{3}$/, "must be a three-letter ISO 4217 currency code")
+    .default("UGX")
+    .transform(normalizeCurrency),
 
   // Loose validation here (provider-specific formatting happens in the
   // gateway adapter, not at this boundary).
@@ -81,8 +93,8 @@ export const ProviderWebhookPayloadSchema = z.object({
   transactionId: z.string().min(1),
   reference: z.string().min(1).optional(), // your own reference, if the
                                            // provider echoes it back
-  amount: z.number().positive(),
-  currency: z.string().length(3).optional(),
+  amount: z.number().finite().positive().max(MAX_MAJOR_AMOUNT),
+  currency: z.string().trim().regex(/^[A-Za-z]{3}$/).optional().transform((c) => (c ? normalizeCurrency(c) : c)),
   status: z.string().min(1), // kept as raw string here - map to your
                                // internal PaymentStatus enum in code,
                                // don't trust the provider's vocabulary

@@ -46,6 +46,35 @@ const THREE_DECIMAL_CURRENCIES = new Set([
 export const DEFAULT_CURRENCY_EXPONENT = 2
 
 /**
+ * Largest value the money columns can hold.
+ *
+ * `PaymentIntent.amount` is `Decimal(14, 2)`, whose maximum is 999,999,999,999.99.
+ * Validating against this at the request boundary turns an out-of-range amount
+ * into a clear 400 instead of a Postgres "numeric field overflow" surfaced as a
+ * 500 — and it keeps `toMinorUnits` below the magnitude where floats lose
+ * integer precision.
+ */
+export const MAX_MAJOR_AMOUNT = 999_999_999_999.99
+
+/**
+ * Normalise a currency code for storage and lookup.
+ *
+ * Currency is part of the wallet identity
+ * (`@@unique([tenantId, appCode, currency])`), so it must not be
+ * case-significant: `"ugx"` and `"UGX"` would otherwise open two wallets for the
+ * same currency and split a tenant's balance across them, making both
+ * understated and settlement wrong.
+ */
+export function normalizeCurrency(code: string | null | undefined): string {
+  return String(code ?? '').trim().toUpperCase()
+}
+
+/** True when the code is exactly three ASCII letters. */
+export function isValidCurrencyCode(code: string | null | undefined): boolean {
+  return /^[A-Z]{3}$/.test(normalizeCurrency(code))
+}
+
+/**
  * Number of decimal places for a currency's minor unit.
  *
  * Unknown or malformed codes fall back to the ISO 4217 default of 2 rather than
@@ -184,7 +213,14 @@ export function minorUnitsToDecimalString(minor: bigint | number, currency: stri
 
 /**
  * Compare two major-unit amounts for equality at the currency's precision,
- * tolerating float representation noise. Used by the webhook amount gate.
+ * tolerating float representation noise.
+ *
+ * NOTE: the inbound webhook gate does not currently use this. It rejects when
+ * `Math.abs(expected - reported) > 0.001`, which is *stricter* for a
+ * zero-decimal currency such as UGX (it rejects a 5,000.4 report for a 5,000
+ * intent, where this function — correctly for UGX — would call them equal).
+ * Keeping the stricter check is deliberate; this helper is available for callers
+ * that want currency-aware equality rather than a float epsilon.
  */
 export function amountsMatch(a: MoneyInput, b: MoneyInput, currency: string): boolean {
   return toMinorUnits(a, currency) === toMinorUnits(b, currency)
