@@ -1,5 +1,6 @@
 import { createServerClient, type CookieOptions } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
+import { isSupabaseConfigured } from '@/lib/supabase-config'
 
 /**
  * Routes that are reachable without a dashboard session.
@@ -42,7 +43,7 @@ export async function middleware(request: NextRequest) {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
   const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
 
-  if (!supabaseUrl || !supabaseKey || !supabaseUrl.startsWith('http')) {
+  if (!isSupabaseConfigured(supabaseUrl, supabaseKey)) {
     // Auth is not configured. Never expose the dashboard in this state.
     if (process.env.NODE_ENV === 'production') {
       console.error('[Middleware] Supabase auth is not configured (fail-closed)')
@@ -50,7 +51,7 @@ export async function middleware(request: NextRequest) {
     }
     // Development without Supabase configured: allow through so the UI can be
     // worked on locally, but make it loud.
-    console.warn('[Middleware] Supabase env vars missing — auth is DISABLED (development only)')
+    console.warn('[Middleware] Supabase env vars missing or placeholder — auth is DISABLED (development only)')
     return response
   }
 

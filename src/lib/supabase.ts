@@ -4,24 +4,26 @@
 // key can never end up in a browser bundle.
 import 'server-only'
 import { createClient } from '@supabase/supabase-js'
+import { isSupabaseConfigured as checkConfigured } from '@/lib/supabase-config'
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || ''
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || ''
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || ''
 
 // Check if Supabase is properly configured
-const isConfigured = supabaseUrl && 
-  supabaseAnonKey && 
-  !supabaseUrl.includes('your-project') && 
-  !supabaseAnonKey.includes('your-anon-key')
+const isConfigured = checkConfigured(supabaseUrl, supabaseAnonKey)
 
 // Public client (uses anon key, respects RLS)
 export const supabase = isConfigured 
   ? createClient(supabaseUrl, supabaseAnonKey)
   : null
 
+const hasServiceKey = supabaseServiceKey &&
+  !supabaseServiceKey.includes('your-service-role') &&
+  !supabaseServiceKey.includes('placeholder')
+
 // Admin client (uses service role key, bypasses RLS) — server-side only
-export const supabaseAdmin = isConfigured && supabaseServiceKey && !supabaseServiceKey.includes('your-service-role')
+export const supabaseAdmin = isConfigured && hasServiceKey
   ? createClient(supabaseUrl, supabaseServiceKey)
   : null
 
@@ -29,7 +31,7 @@ export const isSupabaseConfigured = () => !!isConfigured
 
 // Helper to check connection
 export async function checkSupabaseConnection() {
-  if (!supabaseAdmin) return { connected: false, error: 'Supabase not configured' }
+  if (!supabaseAdmin) return { connected: false, error: 'Supabase admin client not configured' }
   try {
     const { error } = await supabaseAdmin.from('applications').select('id').limit(1)
     if (error) return { connected: false, error: error.message }

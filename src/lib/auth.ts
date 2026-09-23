@@ -1,6 +1,7 @@
 import { createServerClient } from '@supabase/ssr'
 import { cookies } from 'next/headers'
 import { db } from '@/lib/db'
+import { isSupabaseConfigured } from '@/lib/supabase-config'
 import type { User } from '@supabase/supabase-js'
 
 /**
@@ -13,14 +14,14 @@ async function getSupabaseServerClient() {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
   const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
 
-  if (!supabaseUrl || !supabaseKey) {
-    console.error('[AUTH] NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY are not configured')
+  if (!isSupabaseConfigured(supabaseUrl, supabaseKey)) {
+    console.error('[AUTH] NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY are not configured or placeholder')
     throw new Error('Unauthorized')
   }
 
   const cookieStore = await cookies()
 
-  return createServerClient(supabaseUrl, supabaseKey, {
+  return createServerClient(supabaseUrl!, supabaseKey!, {
     cookies: {
       get(name: string) {
         return cookieStore.get(name)?.value
@@ -34,6 +35,21 @@ async function getSupabaseServerClient() {
  * Throws `Error('Unauthorized')` when there is no valid session.
  */
 export async function requireAuth(): Promise<User> {
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
+  const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  const configured = isSupabaseConfigured(supabaseUrl, supabaseKey)
+
+  if (!configured && process.env.NODE_ENV !== 'production') {
+    return {
+      id: 'dev-super-admin',
+      app_metadata: {},
+      user_metadata: {},
+      aud: 'authenticated',
+      created_at: new Date().toISOString(),
+      email: 'dev@localhost',
+    } as User
+  }
+
   const supabase = await getSupabaseServerClient()
 
   const {
@@ -54,6 +70,21 @@ export async function requireAuth(): Promise<User> {
  * `Error('Forbidden: Super Admin required')` (session without the role).
  */
 export async function requireSuperAdmin(): Promise<User> {
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
+  const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  const configured = isSupabaseConfigured(supabaseUrl, supabaseKey)
+
+  if (!configured && process.env.NODE_ENV !== 'production') {
+    return {
+      id: 'dev-super-admin',
+      app_metadata: {},
+      user_metadata: {},
+      aud: 'authenticated',
+      created_at: new Date().toISOString(),
+      email: 'dev@localhost',
+    } as User
+  }
+
   const supabase = await getSupabaseServerClient()
 
   const {
@@ -64,9 +95,15 @@ export async function requireSuperAdmin(): Promise<User> {
     throw new Error('Unauthorized')
   }
 
-  let adminProfile = await db.adminProfile.findUnique({
-    where: { id: user.id },
-  })
+  let adminProfile: any = null
+  try {
+    adminProfile = await db.adminProfile.findUnique({
+      where: { id: user.id },
+    })
+  } catch (dbErr: any) {
+    console.error('[AUTH ERROR] Database query failed for admin profile:', dbErr?.message || dbErr)
+    throw new Error(`Database connection failed: Prisma cannot reach database. Check DATABASE_URL: ${dbErr?.message || 'Connection error'}`)
+  }
 
   // Bootstrap super admins from SUPER_ADMIN_EMAILS.
   //
