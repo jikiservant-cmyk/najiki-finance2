@@ -152,6 +152,17 @@ that header has no defined provenance.
 Documented so they are not mistaken for working code:
 
 - Only LivePay has a real adapter. MTN, Airtel and Pesapal are stubs.
+- **The SMS queue can lose a message in a crash window.** `smsQueue` pops from
+  the Redis list and *then* clears the "seen" marker, and the retry/defer paths
+  push and re-mark as two separate calls. A crash between them leaves an id in
+  the list but not in the set, and the worker's "already claimed" branch then
+  drops it rather than sending it. The window is small and requires a crash
+  mid-operation, but the message is lost silently. The fix is a reliable queue —
+  `RPOPLPUSH` onto a processing list (or an `EVAL` doing pop+claim atomically)
+  with a sweeper for stale entries — which is a change to the send path and
+  should be made deliberately rather than as a drive-by. Documented here rather
+  than half-fixed: an untested atomicity change on the path that spends money is
+  worse than a documented window.
 - Settlement **payout** is not implemented, and `WalletAccount.balanceMinor` can
   only ever increase: there is no debit path, no payout model or route, and the
   single `entryType` written is `payment_in`. Balances are therefore a record of

@@ -374,6 +374,19 @@ export async function getPaymentByReference(reference: string) {
   })
 }
 
+/**
+ * @deprecated Do not use this to settle a payment.
+ *
+ * It writes `paymentIntent.status` directly, which means no wallet credit, no
+ * immutable `LedgerEntry`, no `PaymentTransaction` audit row and no
+ * `InternalNotification` to the partner — the four things `completePayment()`
+ * does inside one transaction. A payment "completed" through here is a status
+ * with no money behind it.
+ *
+ * It currently has no callers; it is kept only because removing an exported
+ * function is a breaking change for anything importing it. Route everything
+ * through `completePayment()` in `src/lib/payments.ts`.
+ */
 export async function updatePaymentStatus(
   reference: string,
   status: string,
@@ -448,11 +461,18 @@ export async function updateWebhookLog(
   })
 }
 
+/**
+ * Append an audit row for a payment.
+ *
+ * `amount` was accepted and never written anywhere — the column does not exist —
+ * so a caller passing one could reasonably believe the figure was recorded.
+ * Removed rather than left as a silent no-op; the amount lives on
+ * `PaymentIntent.amount` and on `LedgerEntry.amountMinor`.
+ */
 export async function createPaymentTransaction(data: {
   paymentId: string
   type: string
   status: string
-  amount: number
   metadata: string
 }) {
   return db.paymentTransaction.create({
