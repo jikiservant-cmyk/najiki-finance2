@@ -51,6 +51,7 @@ can access the dashboard.
 | `npm run lint` | ESLint |
 | `npm run db:push` | Push the Prisma schema to the database |
 | `npm run db:migrate` | Create/apply a Prisma migration |
+| `npm run db:check` | Verify Prisma <-> Supabase PostgreSQL and Supabase Auth connectivity |
 | `npm run db:seed` | Seed demo data (`scripts/seed.ts` — never run in production) |
 | `npm run db:harden` | Enable RLS + revoke anon/authenticated grants, then verify |
 | `npm run cron:setup` | Register the QStash schedules for the background workers |
@@ -166,9 +167,34 @@ without reprocessing.
    deployment with `* * * * *` fails to build). Minute-level scheduling is done
    through QStash, which works on any plan and any host:
 
-   ```bash
-   npm run cron:setup             # creates/replaces all four QStash schedules
-   ```
+```bash
+npm run cron:setup             # creates/replaces all four QStash schedules
+```
+
+---
+
+## Connecting Supabase & Troubleshooting
+
+### 1. Database Connection (`DATABASE_URL` and `DIRECT_URL`)
+- **Port 6543 (Transaction Pooler):** Prisma requires `?pgbouncer=true` when connecting through PgBouncer / Supavisor in transaction mode (port 6543). Without it, Prisma prepared statements fail.
+  ```bash
+  DATABASE_URL="postgresql://postgres.[REF]:[PASS]@aws-0-[REGION].pooler.supabase.com:6543/postgres?pgbouncer=true"
+  DIRECT_URL="postgresql://postgres.[REF]:[PASS]@aws-0-[REGION].pooler.supabase.com:5432/postgres"
+  ```
+- **Port 5432 (Session Mode / Direct):** Used for migrations (`DIRECT_URL`) and direct queries.
+
+### 2. Dashboard Login & Supabase Auth (`NEXT_PUBLIC_SUPABASE_*`)
+- **"Failed to fetch" on `/login`:** Occurs when:
+  - `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` are missing or set to placeholder values.
+  - The Supabase project is **paused** (free tier projects pause after 7 days of inactivity — restore it via the Supabase dashboard).
+  - Network policies or CORS prevent reaching the Supabase Auth endpoint.
+- **Local Development:** When Supabase Auth is unconfigured in development mode (`process.env.NODE_ENV !== 'production'`), the `/login` page provides a clear diagnostic warning and a dev-mode bypass to explore the dashboard.
+
+### 3. Verify Connection Status
+Run the built-in diagnostic tool to test both Prisma database connectivity and Supabase Auth:
+```bash
+npm run db:check
+```
 
 6. Set `NEXTAUTH_URL` to your public HTTPS origin — it must match the URL
    registered with LivePay or webhook signatures will not verify.
