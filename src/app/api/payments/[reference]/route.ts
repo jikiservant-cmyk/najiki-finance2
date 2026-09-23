@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
 import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
 import { webhookSecretFromRow, findApplicationByApiKey } from '@/lib/application-auth'
+import { safeJsonObject } from '@/lib/json'
 import { Ratelimit } from '@upstash/ratelimit'
 import { Redis } from '@upstash/redis'
 
@@ -131,7 +132,7 @@ export async function GET(
                   webhookUrl: `${application.baseUrl}${application.webhookPath}`,
                   webhookSecret: webhookSecretFromRow(application),
                   externalEntityId: paymentIntent.externalEntityId,
-                  metadata: (() => { try { return paymentIntent.metadata ? JSON.parse(paymentIntent.metadata) : {}; } catch(e) { return {}; } })(),
+                  metadata: safeJsonObject(paymentIntent.metadata),
                 })
               }
 

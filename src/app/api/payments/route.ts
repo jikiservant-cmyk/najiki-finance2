@@ -15,7 +15,12 @@
 import { NextResponse } from 'next/server'
 import { randomBytes } from 'crypto'
 import { db } from '@/lib/db'
-import { getPaymentProvider } from '@/lib/providers'
+import {
+  getPaymentProvider,
+  getAvailableProviders,
+  isProviderImplemented,
+  providerDisplayName,
+} from '@/lib/providers'
 import { CreatePaymentRequestSchema } from '@/lib/schemas'
 import { processPayment } from '@/lib/payments'
 import { PLATFORM_FEE_TYPES } from '@/lib/constants'
@@ -117,7 +122,57 @@ export async function POST(request: Request) {
       })
     }
 
-    const activeProvider = await db.provider.findFirst({ where: { isActive: true } })
+    // ── Provider selection ────────────────────────────────────────────────
+    // Three things were wrong with `findFirst({ where: { isActive: true } })`:
+    //
+    //   1. No `orderBy` — Postgres may return any row, so which provider new
+    //      payments used was unspecified.
+    //   2. No implementation filter — three of the four seeded providers are
+    //      stubs whose initiatePayment() throws, so the "default" could be a
+    //      provider that cannot take the payment at all.
+    //   3. The caller had no way to ask for a specific provider.
+    //
+    // Selection is now: explicit request → tenant default → configured default
+    // → oldest active implemented provider. Every path filters on
+    // IMPLEMENTED_PROVIDER_CODES, and a misconfigured tenant gets a clear 503
+    // rather than an opaque provider throw.
+    const requestedProviderCode = validatedBody.providerCode?.trim().toLowerCase()
+
+    if (requestedProviderCode && !isProviderImplemented(requestedProviderCode)) {
+      return NextResponse.json(
+        {
+          error: `Provider "${requestedProviderCode}" is not available for payments.`,
+          availableProviders: getAvailableProviders(),
+        },
+        { status: 400 }
+      )
+    }
+
+    const usableProviderWhere = {
+      isActive: true,
+      code: { in: getAvailableProviders() },
+    } as const
+
+    const configuredDefaultCode = (process.env.DEFAULT_PROVIDER_CODE || '').trim().toLowerCase()
+
+    const [requestedProvider, configuredDefaultProvider] = await Promise.all([
+      requestedProviderCode
+        ? db.provider.findFirst({ where: { ...usableProviderWhere, code: requestedProviderCode } })
+        : Promise.resolve(null),
+      configuredDefaultCode && isProviderImplemented(configuredDefaultCode)
+        ? db.provider.findFirst({ where: { ...usableProviderWhere, code: configuredDefaultCode } })
+        : Promise.resolve(null),
+    ])
+
+    // Unspecified ordering is the bug, so ordering is now explicit everywhere.
+    // Oldest-first is stable and does not change as rows are edited.
+    const activeProvider =
+      requestedProvider ??
+      configuredDefaultProvider ??
+      (await db.provider.findFirst({
+        where: usableProviderWhere,
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      }))
 
     // Tenant + payment type (conditional on request body)
     const [tenant, paymentType] = await Promise.all([
@@ -146,14 +201,49 @@ export async function POST(request: Request) {
       paymentType && PLATFORM_FEE_TYPES.includes(String(paymentType.code).toUpperCase())
 
     let provider = activeProvider
-    if (tenant?.defaultProviderId && !isPlatformPayment) {
+    if (tenant?.defaultProviderId && !isPlatformPayment && !requestedProvider) {
       const tenantProvider = await db.provider.findFirst({
-        where: { id: tenant.defaultProviderId, isActive: true },
+        where: { ...usableProviderWhere, id: tenant.defaultProviderId },
       })
-      if (tenantProvider) provider = tenantProvider
+
+      if (tenantProvider) {
+        provider = tenantProvider
+      } else {
+        // The tenant is pointed at a provider with no working adapter (or an
+        // inactive one). Refuse loudly instead of silently taking the payment
+        // through a different provider than the one configured — an operator
+        // needs to see this, not have it papered over.
+        const misconfigured = await db.provider.findUnique({
+          where: { id: tenant.defaultProviderId },
+          select: { code: true, isActive: true },
+        })
+
+        if (misconfigured && !isProviderImplemented(misconfigured.code)) {
+          console.error(
+            `[payments] Tenant "${tenant.code}" is configured to use provider ` +
+              `"${misconfigured.code}", which has no working adapter.`
+          )
+          return NextResponse.json(
+            {
+              error:
+                `Tenant "${tenant.code}" is configured to use ${providerDisplayName(misconfigured.code)}, ` +
+                'which is not implemented. Change the tenant\'s default provider in Setup.',
+              availableProviders: getAvailableProviders(),
+            },
+            { status: 503 }
+          )
+        }
+      }
     }
+
     if (!provider) {
-      return NextResponse.json({ error: 'No active payment provider' }, { status: 500 })
+      return NextResponse.json(
+        {
+          error: 'No implemented payment provider is active.',
+          availableProviders: getAvailableProviders(),
+        },
+        { status: 503 }
+      )
     }
 
     const reference = generateReference(validatedBody.applicationCode, validatedBody.paymentTypeCode)

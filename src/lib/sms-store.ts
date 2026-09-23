@@ -38,6 +38,14 @@ export interface SmsRequest {
   updatedAt: string
 }
 
+/**
+ * Placeholder unit cost, in UGX, until the provider reports the real one.
+ *
+ * UGX has no minor unit, so this is a whole-shilling figure. Exported so the
+ * send routes and the reconciliation logic agree on the sentinel value.
+ */
+export const SMS_COST_PLACEHOLDER = 50
+
 function newId(): string {
   return `sms_${randomBytes(10).toString('hex')}`
 }
@@ -200,6 +208,33 @@ export const smsStore = {
     } catch {
       // Row removed or never existed — callers treat null as "not found".
       return null
+    }
+  },
+
+  /**
+   * Replace the placeholder cost with what the provider actually charged.
+   *
+   * `cost` was hardcoded to 50 at creation and the real figure returned by the
+   * provider was discarded, yet the dashboard sums this column and labels it
+   * "Total Cost". Real cost varies by destination, by sender ID and by message
+   * length (a long SMS is billed as multiple parts), so the placeholder was
+   * wrong in every direction.
+   *
+   * Only overwrites a zero/placeholder value: a settled cost is not re-derived
+   * from a later retry, which could double-count parts.
+   */
+  updateProviderCost: async (id: string, cost: number | null | undefined): Promise<boolean> => {
+    if (typeof cost !== 'number' || !Number.isFinite(cost) || cost < 0) return false
+    const rounded = Math.round(cost)
+
+    try {
+      const result = await db.smsMessage.updateMany({
+        where: { id, cost: SMS_COST_PLACEHOLDER },
+        data: { cost: rounded },
+      })
+      return result.count > 0
+    } catch {
+      return false
     }
   },
 

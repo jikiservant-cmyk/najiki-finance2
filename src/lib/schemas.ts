@@ -39,6 +39,14 @@ export const CreatePaymentRequestSchema = z.object({
   // intent instead of creating a duplicate.
   idempotencyKey: z.string().min(8),
 
+  // Optional: which provider should take this payment ("livepay").
+  //
+  // Providers with no working adapter are rejected with a 400 and the list of
+  // usable ones. Without this field the caller had no way to influence
+  // routing at all, and selection fell back to an unordered query that could
+  // pick a provider incapable of taking the payment.
+  providerCode: z.string().min(1).max(32).optional(),
+
   // Opaque passthrough. Payment Service never reads these keys, just
   // stores and echoes them back in the completion notification.
   metadata: z.record(z.string(), z.unknown()).optional().default({}),

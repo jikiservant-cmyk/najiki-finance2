@@ -7,6 +7,7 @@ import { safeFetch, isPlaceholderUrl } from './safe-fetch'
 import { computeNextRetryAt, isExhausted } from './backoff'
 import { maskPhoneNumber } from './redact'
 import { webhookSecretFromRow } from './application-auth'
+import { parseProviderCost } from './provider-cost'
 
 const SMS_QUEUE_KEY = 'sms:queue'
 /** Set of ids currently in the queue — makes enqueue idempotent. */
@@ -129,7 +130,20 @@ export const smsQueue = {
           result.providerId
         )
         await smsStore.setNextAttemptAt(smsId, null)
-        
+
+        // Replace the placeholder cost with what the provider charged. Real cost
+        // varies by destination, sender ID and message length (long messages are
+        // billed per part); the dashboard sums this column as "Total Cost".
+        const parsedCost = parseProviderCost(result.cost)
+        if (parsedCost) {
+          const updated = await smsStore.updateProviderCost(smsId, parsedCost.amountMinor)
+          if (!updated) {
+            console.warn(
+              `[smsQueue] Provider cost for ${smsId} not applied (already recorded or row missing)`
+            )
+          }
+        }
+
         results.push({ smsId, success: true, providerId: result.providerId })
 
         // Fire webhook to connected app

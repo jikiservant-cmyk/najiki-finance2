@@ -26,36 +26,6 @@
     "paths": {
       "@/*": [
         "./src/*"
-      ],
-      "@najiki/payments/*": [
-        "./apps/payments/*"
-      ],
-      "@najiki/messaging/*": [
-        "./apps/messaging/*"
-      ],
-      "@najiki/notifications/*": [
-        "./apps/notifications/*"
-      ],
-      "@najiki/dashboard/*": [
-        "./apps/dashboard/*"
-      ],
-      "@najiki/ui/*": [
-        "./packages/ui/*"
-      ],
-      "@najiki/database/*": [
-        "./packages/database/*"
-      ],
-      "@najiki/auth/*": [
-        "./packages/auth/*"
-      ],
-      "@najiki/shared/*": [
-        "./packages/shared/*"
-      ],
-      "@najiki/types/*": [
-        "./packages/types/*"
-      ],
-      "@najiki/sdk/*": [
-        "./packages/sdk/*"
       ]
     }
   },

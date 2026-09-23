@@ -4,6 +4,11 @@ import crypto from 'crypto'
 import { z } from 'zod'
 import { requireSuperAdmin } from '@/lib/auth'
 import { validateSafeUrl } from '@/lib/safe-fetch'
+import {
+  getAvailableProviders,
+  isProviderImplemented,
+  providerDisplayName,
+} from '@/lib/providers'
 import { encrypt } from '@/lib/encryption'
 import { generateApiKey, hashApiKey, apiKeyHint } from '@/lib/api-keys'
 
@@ -214,6 +219,22 @@ export async function POST(request: Request) {
       case 'provider': {
         const parsed = ProviderSchema.safeParse(data)
         if (!parsed.success) return validationError(parsed.error)
+
+        // Activating a provider with no adapter is the other half of the same
+        // landmine: it becomes eligible for "first active provider" selection
+        // and then throws on the first payment.
+        if (parsed.data.isActive && !isProviderImplemented(parsed.data.code)) {
+          return NextResponse.json(
+            {
+              error:
+                `${providerDisplayName(parsed.data.code)} has no working payment adapter yet. ` +
+                'Create it inactive, or leave it out until the adapter ships.',
+              availableProviders: getAvailableProviders(),
+            },
+            { status: 400 }
+          )
+        }
+
         result = await db.provider.create({
           data: {
             code: parsed.data.code,
@@ -228,6 +249,38 @@ export async function POST(request: Request) {
       case 'tenant': {
         const parsed = TenantSchema.safeParse(data)
         if (!parsed.success) return validationError(parsed.error)
+
+        // A tenant pointed at a provider with no working adapter means every
+        // payment for that tenant fails. Refuse the configuration rather than
+        // storing a landmine — /api/payments also refuses at request time, but
+        // catching it here tells the operator which dropdown value is wrong.
+        if (parsed.data.defaultProviderId) {
+          const selected = await db.provider.findUnique({
+            where: { id: parsed.data.defaultProviderId },
+            select: { code: true, isActive: true },
+          })
+          if (!selected) {
+            return NextResponse.json({ error: 'Selected provider does not exist' }, { status: 400 })
+          }
+          if (!isProviderImplemented(selected.code)) {
+            return NextResponse.json(
+              {
+                error:
+                  `${providerDisplayName(selected.code)} has no working payment adapter yet, so it ` +
+                  'cannot be a tenant default. Leave the default empty to use the platform default.',
+                availableProviders: getAvailableProviders(),
+              },
+              { status: 400 }
+            )
+          }
+          if (!selected.isActive) {
+            return NextResponse.json(
+              { error: `${providerDisplayName(selected.code)} is inactive. Activate it first.` },
+              { status: 400 }
+            )
+          }
+        }
+
         result = await db.tenant.create({
           data: {
             applicationId: parsed.data.applicationId,

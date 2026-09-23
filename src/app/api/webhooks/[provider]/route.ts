@@ -6,7 +6,8 @@
 //   2. resolve provider / tenant creds   ← read-only
 //   3. VERIFY THE SIGNATURE              ← nothing is written before this
 //   4. idempotency (event hash)          ← dedupe on the provider's event identity
-//   5. load intent → amount/currency gates → completePayment()
+//   5. load intent → provider must match this route → amount/currency gates
+//      → completePayment()
 //
 // Previously the audit row was inserted *before* verification and the
 // invalid-signature path marked it `processed: true`. Because the dedupe check
@@ -25,6 +26,8 @@ import { computeWebhookEventHash } from '@/lib/webhook-hash'
 import { webhookSecretFromRow } from '@/lib/application-auth'
 import { redactPhoneNumbersInText } from '@/lib/redact'
 import { buildSignatureUrlCandidates } from '@/lib/webhook-url'
+import { readTextWithLimit } from '@/lib/request-body'
+import { safeJsonObject } from '@/lib/json'
 
 /** Providers retry with at-least-once semantics; 64 KB is far above any real payload. */
 const MAX_WEBHOOK_BYTES = 64 * 1024
@@ -49,14 +52,18 @@ export async function POST(
       )
     }
 
-    const declaredLength = Number(request.headers.get('content-length') || 0)
-    if (declaredLength && declaredLength > MAX_WEBHOOK_BYTES) {
-      return NextResponse.json({ error: 'Payload too large' }, { status: 413 })
-    }
-
-    const rawBody = await request.text()
-    if (rawBody.length > MAX_WEBHOOK_BYTES) {
-      return NextResponse.json({ error: 'Payload too large' }, { status: 413 })
+    // Read with the cap applied DURING the read. The previous version checked
+    // `content-length` and then called `request.text()`, which buffers the whole
+    // body first — a chunked request omits content-length, so nothing bounded
+    // the allocation on an endpoint that is reachable without credentials.
+    let rawBody: string
+    try {
+      rawBody = await readTextWithLimit(request, MAX_WEBHOOK_BYTES)
+    } catch (readError: any) {
+      if (readError?.name === 'PayloadTooLargeError' || readError?.limitBytes) {
+        return NextResponse.json({ error: 'Payload too large' }, { status: 413 })
+      }
+      throw readError
     }
 
     const signature =
@@ -199,7 +206,7 @@ export async function POST(
 
     const fullPaymentIntent = await db.paymentIntent.findUnique({
       where: { id: paymentIntent.id },
-      include: { application: true, tenant: true },
+      include: { application: true, tenant: true, provider: { select: { code: true } } },
     })
 
     if (!fullPaymentIntent) {
@@ -208,6 +215,31 @@ export async function POST(
         data: { processingError: 'Payment not found', processed: true },
       })
       return NextResponse.json({ error: 'Payment not found' }, { status: 404 })
+    }
+
+    // ── The intent must belong to the provider that signed this request ─────
+    // Otherwise a callback signed by provider A can settle a payment created
+    // through provider B: the signature verifies against A's secret, the
+    // reference is a B reference, and the amount/currency gates below compare
+    // against the stored intent — so a *correctly sized* A-signed body would
+    // flip a B payment to success. Harmless while exactly one provider is
+    // implemented, which is precisely why it must be enforced before a second
+    // adapter is added (see IMPLEMENTED_PROVIDER_CODES).
+    if (String(fullPaymentIntent.provider?.code || '').toLowerCase() !== normalizedProvider) {
+      await db.webhookLog.update({
+        where: { id: webhookLog.id },
+        data: {
+          paymentIntentId: paymentIntent.id,
+          processed: true,
+          processingError:
+            `PROVIDER_MISMATCH intent=${fullPaymentIntent.provider?.code} route=${normalizedProvider}`,
+        },
+      })
+      console.error(
+        `[Webhook] Rejected ${normalizedProvider} callback for ${paymentIntent.reference}: ` +
+          `payment belongs to provider "${fullPaymentIntent.provider?.code}".`
+      )
+      return NextResponse.json({ error: 'Provider mismatch' }, { status: 409 })
     }
 
     const normalizedStatus = String(parsedWebhook.status || '').toLowerCase()
@@ -311,7 +343,7 @@ export async function POST(
         externalEntityId: fullPaymentIntent.externalEntityId,
         metadata: (() => {
           try {
-            return fullPaymentIntent.metadata ? JSON.parse(fullPaymentIntent.metadata) : {}
+            return safeJsonObject(fullPaymentIntent.metadata)
           } catch {
             return {}
           }

@@ -37,13 +37,25 @@ async function seed() {
     data: { code: 'livepay', name: 'LivePay', credentialsRef: 'LIVEPAY_', isActive: true },
   })
   const mtn = await db.provider.create({
-    data: { code: 'mtn', name: 'MTN MoMo', credentialsRef: 'MTN_', isActive: true },
+    // Seeded INACTIVE on purpose: there is no adapter for this provider, and
+    // an active row with no implementation is a payment failure waiting to
+    // happen (see IMPLEMENTED_PROVIDER_CODES in src/lib/providers/index.ts).
+    // Flip isActive only when the adapter ships.
+    data: { code: 'mtn', name: 'MTN MoMo', credentialsRef: 'MTN_', isActive: false },
   })
   const airtel = await db.provider.create({
-    data: { code: 'airtel', name: 'Airtel Money', credentialsRef: 'AIRTEL_', isActive: true },
+    // Seeded INACTIVE on purpose: there is no adapter for this provider, and
+    // an active row with no implementation is a payment failure waiting to
+    // happen (see IMPLEMENTED_PROVIDER_CODES in src/lib/providers/index.ts).
+    // Flip isActive only when the adapter ships.
+    data: { code: 'airtel', name: 'Airtel Money', credentialsRef: 'AIRTEL_', isActive: false },
   })
   const pesapal = await db.provider.create({
-    data: { code: 'pesapal', name: 'Pesapal', credentialsRef: 'PESAPAL_', isActive: true },
+    // Seeded INACTIVE on purpose: there is no adapter for this provider, and
+    // an active row with no implementation is a payment failure waiting to
+    // happen (see IMPLEMENTED_PROVIDER_CODES in src/lib/providers/index.ts).
+    // Flip isActive only when the adapter ships.
+    data: { code: 'pesapal', name: 'Pesapal', credentialsRef: 'PESAPAL_', isActive: false },
   })
 
   // === APPLICATIONS ===

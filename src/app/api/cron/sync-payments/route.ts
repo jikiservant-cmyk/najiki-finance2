@@ -6,6 +6,7 @@ import { verifyCronRequest } from '@/lib/qstash-verify'
 import { decrypt } from '@/lib/encryption'
 import { PLATFORM_FEE_TYPES } from '@/lib/constants'
 import { webhookSecretFromRow } from '@/lib/application-auth'
+import { safeJsonObject } from '@/lib/json'
 
 async function handleSync(request: Request) {
   try {
@@ -100,7 +101,7 @@ async function handleSync(request: Request) {
                 webhookUrl: `${payment.application.baseUrl}${payment.application.webhookPath}`,
                 webhookSecret: webhookSecretFromRow(payment.application),
                 externalEntityId: payment.externalEntityId,
-                metadata: payment.metadata ? JSON.parse(payment.metadata) : {},
+                metadata: safeJsonObject(payment.metadata),
               })
             }
 

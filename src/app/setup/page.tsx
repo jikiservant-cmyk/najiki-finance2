@@ -71,6 +71,15 @@ interface Provider {
   updatedAt: string
 }
 
+/**
+ * Providers that can actually take a payment.
+ *
+ * Kept in sync with IMPLEMENTED_PROVIDER_CODES in src/lib/providers/index.ts.
+ * The Setup API rejects anything not on this list, so offering it in the
+ * dropdown would only produce a failed setup.
+ */
+const IMPLEMENTED_PROVIDER_CODES = ['livepay']
+
 interface TenantProviderConfig {
   id: string
   tenantId: string
@@ -107,6 +116,10 @@ interface TenantProviderConfig {
 export default function SetupPage() {
   const [applications, setApplications] = useState<Application[]>([])
   const [providers, setProviders] = useState<Provider[]>([])
+  const usableProviders = providers.filter(
+    (p) => IMPLEMENTED_PROVIDER_CODES.includes(p.code.toLowerCase()) && p.isActive
+  )
+
   const [tenantConfigs, setTenantConfigs] = useState<TenantProviderConfig[]>([])
   const [tenantsList, setTenantsList] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
@@ -687,14 +700,30 @@ export default function SetupPage() {
                   </div>
                   <div>
                     <Label>Default Provider</Label>
+                    {/*
+                      Only providers with a working adapter and an active row are
+                      selectable. Listing every provider row let an operator point a
+                      tenant at MTN/Airtel/Pesapal, which have no implementation and
+                      throw on the first payment (the API now refuses this too).
+                    */}
                     <select name="defaultProviderId" className="w-full p-2 border rounded bg-background text-sm">
                       <option value="">None (Global default)</option>
-                      {providers.map((provider) => (
+                      {usableProviders.map((provider) => (
                         <option key={provider.id} value={provider.id}>
                           {provider.name} ({provider.code})
                         </option>
                       ))}
                     </select>
+                    {providers.length > usableProviders.length && (
+                      <p className="text-[11px] text-muted-foreground mt-1">
+                        {providers
+                          .filter((p) => !usableProviders.some((u) => u.id === p.id))
+                          .map((p) => p.name)
+                          .join(', ')}{' '}
+                        {providers.length - usableProviders.length === 1 ? 'is' : 'are'} not selectable —
+                        no working adapter yet.
+                      </p>
+                    )}
                   </div>
                   <div className="flex items-center gap-2">
                     <Label>Active</Label>

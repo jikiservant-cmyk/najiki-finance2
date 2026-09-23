@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { after } from 'next/server'
 import { db } from '@/lib/db'
-import { smsStore } from '@/lib/sms-store'
+import { smsStore, SMS_COST_PLACEHOLDER } from '@/lib/sms-store'
 import { smsQueue } from '@/lib/sms-queue'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
 import { findApplicationByApiKey } from '@/lib/application-auth'
@@ -112,7 +112,9 @@ export async function POST(request: Request) {
       message,
       applicationCode: appCode,
       providerCode: 'africastalking', // default provider
-      cost: 50, // standard rate in UGX
+      // Placeholder until the provider reports the real charge; overwritten
+      // by smsQueue via smsStore.updateProviderCost(). See SMS_COST_PLACEHOLDER.
+      cost: SMS_COST_PLACEHOLDER,
       applicationId: appId,
       senderId: customSender,
       idempotencyKey,

@@ -4,6 +4,7 @@ import { decrypt } from './encryption'
 import { PLATFORM_FEE_TYPES } from './constants'
 import { toMinorUnits } from './money'
 import { webhookSecretFromRow } from './application-auth'
+import { safeJsonObject } from './json'
 
 export async function processPayment(data: {
   paymentIntentId: string,
@@ -92,7 +93,7 @@ export async function processPayment(data: {
           webhookUrl: `${payment.application.baseUrl}${payment.application.webhookPath}`,
           webhookSecret: webhookSecretFromRow(payment.application),
           externalEntityId: payment.externalEntityId,
-          metadata: payment.metadata ? JSON.parse(payment.metadata) : {},
+          metadata: safeJsonObject(payment.metadata),
         })
       }
     }
@@ -253,7 +254,7 @@ export async function completePayment(data: {
         providerPaymentId: providerPaymentId || '',
         failureReason: failureReason || null,
         externalEntityId: fullPaymentIntent.externalEntityId,
-        metadata: (() => { try { return fullPaymentIntent.metadata ? JSON.parse(fullPaymentIntent.metadata) : {}; } catch { return {}; } })(),
+        metadata: safeJsonObject(fullPaymentIntent.metadata),
       }
 
       await tx.internalNotification.create({

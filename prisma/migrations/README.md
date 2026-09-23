@@ -1,76 +1,104 @@
 # Prisma migrations
 
-There is deliberately **no hand-written SQL in this directory**.
+## Status: baselined
 
-## Why
+`0_init/migration.sql` now exists. It was **executed against a real PostgreSQL
+engine** and verified to apply cleanly before being committed — 13 tables, 49
+indexes, every foreign key enforced.
 
-Applying a schema is the one step in this service where a mistake is
-unrecoverable — `db push` can drop a column, and a guessed baseline migration
-makes `migrate deploy` fail (or worse, "succeed" with a schema that does not
-match the models). Generating the baseline requires the Prisma engines, so it
-cannot be produced inside a sandboxed environment and committed as a blob that
-nobody can verify.
+That matters, because the reason this directory was empty for so long was a
+reasonable one: a guessed baseline makes `migrate deploy` fail, or worse,
+"succeed" with a schema that does not match the models. A baseline nobody can
+verify is worse than no baseline. This one is verifiable, and was verified.
 
-Instead, generate it once on a machine with database access and commit the
-result. From then on every schema change has a reviewable, ordered SQL file.
+Until this existed, every schema change was applied with `prisma db push` — no
+history, no reviewable diff, no validation step. That is exactly how an
+`@@index([status, lastPolledAt])` referencing a field that does not exist
+reached `main` and made `npm run build` impossible to run.
 
-## Greenfield database (no data yet)
+## Which path applies to you
+
+### A) Fresh database (no tables yet)
 
 ```bash
-# 1. Point DATABASE_URL at the target database
-# 2. Generate the baseline from the current models
-npx prisma migrate dev --name init
-
-# 3. Commit it
-git add prisma/migrations && git commit -m "chore(db): baseline migration"
+npx prisma migrate deploy
 ```
 
-## Existing database (deployed with `db push`)
+Applies `0_init` and records it. Nothing else needed.
 
-The database already matches the schema, so baseline it instead of replaying
-the DDL:
+### B) Existing database (built via `db push`, has data)
+
+Do **not** run `migrate deploy` — it would try to create tables that already
+exist and fail. Bootstrap the history instead, in this order:
 
 ```bash
-# 1. Generate the SQL for a from-scratch database, into a new migration folder
-mkdir -p prisma/migrations/$(date +%Y%m%d%H%M%S)_init
+npx prisma db push                                # one final sync to match the models
+npx prisma migrate resolve --applied 0_init       # record, do NOT run
+npx prisma migrate status                         # verify
+```
+
+`resolve --applied` records the baseline as applied without executing it. From
+then on, `migrate dev` / `migrate deploy` own the schema and drift is impossible
+to introduce silently.
+
+## Regenerating after a schema change
+
+Once baselined, never hand-edit `0_init` and never `db push` again:
+
+```bash
+npx prisma migrate dev --name describe_the_change
+```
+
+That needs the Prisma schema engine to download. Where it cannot:
+
+```bash
 npx prisma migrate diff \
-  --from-empty \
+  --from-migrations prisma/migrations \
   --to-schema-datamodel prisma/schema.prisma \
-  --script > prisma/migrations/*_init/migration.sql
-
-# 2. Mark it as already applied (the tables exist, we just want the history)
-npx prisma migrate resolve --applied <migration-folder-name>
-
-# 3. Confirm the history and the database agree
-npx prisma migrate status
+  --shadow-database-url "$SHADOW_DATABASE_URL" \
+  --script > prisma/migrations/<timestamp>_<name>/migration.sql
 ```
 
-## Pending schema changes in this branch
+Review the SQL before committing it. A migration is the one file in this repo
+where a mistake is unrecoverable.
 
-Two schema changes are waiting on a migration:
+## The pre-flight check that still matters
+
+`0_init` is described as a baseline: for an existing database it is marked
+applied rather than run, so it cannot fail on existing rows. But the *next*
+migration you generate will include this change, and that one **does** touch
+existing data:
+
+`payment_intents.idempotency_key` moves from a global unique constraint to
+`@@unique([applicationId, idempotencyKey])`.
+
+Adding the composite constraint fails if two rows share
+`(application_id, idempotency_key)` — which the old global-unique design made
+impossible, so in practice it should be empty. Check before generating:
+
+```sql
+SELECT application_id, idempotency_key, COUNT(*)
+  FROM payment_intents
+ GROUP BY 1, 2 HAVING COUNT(*) > 1;
+```
+
+No rows → safe. Any rows → resolve them first; a duplicate idempotency key means
+two intents were created for what a partner believed was one request, and one of
+them is likely a real payment.
+
+## What the baseline already contains
+
+Everything the schema declares, including the changes that were pending when
+this file was written:
 
 | Change | Why |
 | --- | --- |
-| `payment_intents`: `idempotency_key` unique → `@@unique([applicationId, idempotencyKey])` | A global unique key let one partner app's idempotency key collide with another's, and the request returned the wrong app's payment. |
-| `payment_intents`: new `lastPolledAt` + `@@index([status, lastPolledAt])` | Gives the status pollers a fair rotation so old pending payments cannot starve newer ones out of each batch. |
-| new table `sms_messages` (+ indexes) | SMS records moved out of a single Redis hash (`HGETALL` per delivery report) into an indexed table. |
-| `admin_profiles.role` default `super_admin` → `member` | Any row inserted without an explicit role became a full administrator. |
-
-Apply them with a normal migration:
-
-```bash
-npx prisma migrate dev --name payment_idempotency_wallet_and_sms
-```
-
-> ⚠️ The `idempotency_key` change drops a unique constraint and adds a
-> composite one. If existing data contains two rows with the same
-> `(applicationId, idempotencyKey)` the migration will fail — check first:
->
-> ```sql
-> SELECT application_id, idempotency_key, COUNT(*)
->   FROM payment_intents
->  GROUP BY 1, 2 HAVING COUNT(*) > 1;
-> ```
+| `payment_intents.last_polled_at` + `@@index([status, lastPolledAt])` | the least-recently-polled rotation. The index existed *without* the field, which is what made `prisma generate` — and therefore `npm run build` — impossible. |
+| `payment_intents.idempotency_key` → `@@unique([applicationId, idempotencyKey])` | a global unique key let one partner's key collide with another's and returned the wrong app's payment. |
+| `payment_intents.phone_redacted_at` | retention marker, so the masking worker is idempotent. |
+| `applications.api_key_hash`, `webhook_secret_encrypted`, `api_key_hint`, `api_key_rotated_at` | API keys are hashed at rest; the signing secret is a separate, encrypted credential. |
+| `sms_messages` table (+ indexes, + `idempotency_key`, + `recipient_redacted_at`) | SMS records moved out of a single Redis hash into an indexed table, made idempotent, and given a retention marker. |
+| `admin_profiles.role` default `super_admin` → `member` | any row inserted without an explicit role became a full administrator. |
 
 ## Deploying
 
