@@ -7,37 +7,31 @@
 
 import { Prisma } from '@prisma/client'
 import { pickPrimaryCurrency } from './money'
+import {
+  DEFAULT_DASHBOARD_PERIOD,
+  periodDateFilter,
+  resolveDashboardPeriod,
+} from './dashboard-period'
+
+export { DEFAULT_DASHBOARD_PERIOD }
 import { db } from './db'
 
 // ─── DASHBOARD ────────────────────────────────────────────────────────────────
 
-/**
- * Reportable periods → the SQL interval used for the daily chart.
- *
- * A whitelist, not a fallback chain. The previous `else if` ladder left
- * `dateFilter` undefined for any unrecognised value, so `?period=1d` (a
- * plausible thing to try) returned **all-time** totals for the stat cards
- * alongside a 14-day chart, with nothing indicating the mismatch.
- */
-const DASHBOARD_PERIODS: Record<string, { days: number | null; interval: string }> = {
-  '14d': { days: 14, interval: '14 days' },
-  '1m': { days: 30, interval: '30 days' },
-  '3m': { days: 90, interval: '90 days' },
-  '1y': { days: 365, interval: '365 days' },
-  all: { days: null, interval: '100 years' },
-}
-
-export const DEFAULT_DASHBOARD_PERIOD = '14d'
-
 export async function getDashboardData(period: string = DEFAULT_DASHBOARD_PERIOD) {
-  const now = new Date();
-  const requested = String(period ?? '').trim().toLowerCase()
-  const selected = DASHBOARD_PERIODS[requested] ?? DASHBOARD_PERIODS[DEFAULT_DASHBOARD_PERIOD]
-  const resolvedPeriod = DASHBOARD_PERIODS[requested] ? requested : DEFAULT_DASHBOARD_PERIOD
-  const intervalStr = selected.interval
-  const dateFilter = selected.days === null
-    ? undefined
-    : new Date(now.getTime() - selected.days * 24 * 60 * 60 * 1000)
+  // Whitelist resolution (see dashboard-period.ts): an unrecognised value becomes
+  // a known period rather than "no date filter at all".
+  const window = resolveDashboardPeriod(period)
+  const intervalStr = window.interval
+  const resolvedPeriod = window.period
+  const dateFilter = periodDateFilter(window)
+
+  if (window.fellBack) {
+    console.warn(
+      `[dashboard] Unsupported period "${String(period).slice(0, 32)}" requested; ` +
+        `reporting ${resolvedPeriod} instead.`
+    )
+  }
 
   const baseWhere = dateFilter ? { createdAt: { gte: dateFilter } } : {};
 
