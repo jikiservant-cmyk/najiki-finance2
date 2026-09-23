@@ -60,7 +60,7 @@ export async function middleware(request: NextRequest) {
   const isProduction = process.env.NODE_ENV === 'production'
 
   try {
-    const supabase = createServerClient(supabaseUrl, supabaseKey, {
+    const supabase = createServerClient(supabaseUrl!, supabaseKey!, {
       cookies: {
         get(name: string) {
           return request.cookies.get(name)?.value

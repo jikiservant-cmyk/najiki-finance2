@@ -68,9 +68,9 @@ async function checkConnectivity() {
 
     if (prisma) {
       try {
-        const pingResult = await prisma.$queryRawUnsafe<Array<{ db: string; usr: string; ver: string }>>(
+        const pingResult = (await (prisma.$queryRawUnsafe as any)(
           'SELECT current_database() as db, current_user as usr, version() as ver'
-        )
+        )) as Array<{ db: string; usr: string; ver: string }>
         console.log('   ✅ Prisma connected to PostgreSQL successfully!')
         if (pingResult && pingResult[0]) {
           console.log(`      Database: ${pingResult[0].db}`)
@@ -79,9 +79,9 @@ async function checkConnectivity() {
         }
 
         // Check for core tables
-        const tables = await prisma.$queryRawUnsafe<Array<{ tablename: string }>>(
+        const tables = (await (prisma.$queryRawUnsafe as any)(
           "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
-        )
+        )) as Array<{ tablename: string }>
         console.log(`      Tables in public schema: ${tables.length}`)
         const required = ['applications', 'providers', 'tenants', 'payment_intents', 'admin_profiles']
         const existing = new Set(tables.map((t) => t.tablename))
