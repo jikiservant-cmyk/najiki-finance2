@@ -101,8 +101,24 @@ https://<your-domain>/api/webhooks/africastalking?key=<AFRICASTALKING_CALLBACK_S
 
 The `x-callback-secret` header is still accepted for setups that proxy the
 callback. A secret in a query string is written to access logs, so treat the URL
-as a credential — and set `AFRICASTALKING_ALLOWED_IPS` so a leaked URL alone is
-not sufficient. The endpoint fails closed in production when the secret is unset.
+as a credential. The endpoint fails closed in production when the secret is unset.
+
+**The IP allow-list is not a substitute for the secret.** Client IPs are read
+from `x-forwarded-for`, which the caller populates; a request failing the secret
+check is rejected even when its IP matches, because otherwise an attacker who
+knows AT's published ranges could authorise by claiming one of them. Operators
+behind a proxy they control can require both with
+`AFRICASTALKING_REQUIRE_ALLOWED_IP=true`.
+
+### Client IP derivation
+
+`x-forwarded-for` is a list proxies append to, so trustworthy entries are at the
+**right** and the leftmost entry is caller-supplied. Both the rate limiter and
+the AT callback previously read the first entry, which let a caller rotate their
+own rate-limit bucket per request and satisfy the callback allow-list by
+assertion. `src/lib/client-ip.ts` reads the entry `TRUSTED_PROXY_HOPS` from the
+right (default 1) and ignores `x-real-ip` unless `TRUST_X_REAL_IP=true`, since
+that header has no defined provenance.
 
 ## Data
 
@@ -136,7 +152,12 @@ not sufficient. The endpoint fails closed in production when the secret is unset
 Documented so they are not mistaken for working code:
 
 - Only LivePay has a real adapter. MTN, Airtel and Pesapal are stubs.
-- Settlement **payout** is not implemented. The ledger records what is owed.
+- Settlement **payout** is not implemented, and `WalletAccount.balanceMinor` can
+  only ever increase: there is no debit path, no payout model or route, and the
+  single `entryType` written is `payment_in`. Balances are therefore a record of
+  what is owed, not money that can be sent. Settling requires implementing
+  disbursement (a debit path, a `payout` ledger entry, and provider B2C calls
+  with their own idempotency), which is a feature rather than a defect fix.
 - No Africa's Talking status-poll fallback: if a DLR is lost, the payment stays
   pending until manual reconciliation.
 - The CSP still allows `unsafe-inline` for scripts; nonces would be the next step.

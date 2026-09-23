@@ -24,9 +24,20 @@
  *   2. `?key=` / `?secret=` query param — the AT-compatible path
  *   3. a body field (`key` / `secret`)  — last resort for form posts
  *
- * None configured → fall back to the IP allow-list. This is deliberately
- * *either/or* rather than *and*: AT cannot present a header, and an operator who
- * has not got a URL secret yet should not be locked out of delivery reports.
+ * When **no** secret is configured, the IP allow-list is used on its own — an
+ * operator who has not set a URL secret yet should not be locked out of
+ * delivery reports.
+ *
+ * When a secret IS configured, it is the credential, and a request that fails
+ * it is rejected even if its IP matches the allow-list. That ordering is not
+ * stylistic: the client IP comes from `x-forwarded-for`, which the caller
+ * populates (see client-ip.ts), so an allow-list that can authorise on its own
+ * is an allow-list an attacker satisfies by naming one of Africa's Talking's
+ * published addresses. Previously the code fell through to the IP check after a
+ * secret mismatch, which is exactly that bypass.
+ *
+ * Operators who front this endpoint with a proxy that overwrites the forwarded
+ * header can opt into requiring BOTH by setting `requireAllowedIp`.
  *
  * TRADE-OFF, STATED PLAINLY
  * ------------------------
@@ -108,11 +119,18 @@ export interface CallbackAuthInput {
   body?: Record<string, unknown> | null
   /** The client's IP, for the allow-list fallback. */
   clientIp?: string | null
+  /**
+   * Require the client IP to match the allow-list *in addition to* the secret.
+   * Only meaningful when an allow-list is configured. Set this when the app sits
+   * behind a proxy that overwrites `x-forwarded-for`, so the header can be
+   * trusted; otherwise it turns a leaked URL back into a full compromise.
+   */
+  requireAllowedIp?: boolean
 }
 
 export type CallbackAuthResult =
   | { ok: true; via: 'header' | 'query' | 'body' | 'ip' }
-  | { ok: false; reason: 'no-method-configured' | 'mismatch' }
+  | { ok: false; reason: 'no-method-configured' | 'mismatch' | 'ip-not-allowed' }
 
 /**
  * Decide whether an inbound provider callback is authentic.
@@ -124,45 +142,70 @@ export type CallbackAuthResult =
 export function authorizeCallback(input: CallbackAuthInput): CallbackAuthResult {
   const configuredSecret = String(input.configuredSecret ?? '')
   const configuredIps = String(input.configuredIps ?? '')
+  const ipMatches =
+    configuredIps.length > 0 && !!input.clientIp && ipAllowed(configuredIps, input.clientIp)
 
   if (configuredSecret.length > 0) {
-    if (input.headerSecret && secretMatches(configuredSecret, [input.headerSecret])) {
-      return { ok: true, via: 'header' }
+    const via = matchSecret(configuredSecret, input)
+
+    // The secret is configured, so it is the credential. A mismatch is a denial
+    // even when the IP matches — the IP is read from a caller-populated header
+    // and cannot stand in for a secret.
+    if (!via) {
+      return { ok: false, reason: 'mismatch' }
     }
 
-    let queryCandidates: Array<string | null> = []
-    if (input.requestUrl) {
-      try {
-        const url = new URL(input.requestUrl)
-        queryCandidates = CALLBACK_SECRET_PARAM_NAMES.map((name) => url.searchParams.get(name))
-      } catch {
-        // A URL we cannot parse simply yields no query candidates.
-        queryCandidates = []
-      }
-    }
-    if (secretMatches(configuredSecret, queryCandidates)) {
-      return { ok: true, via: 'query' }
+    // Opt-in hardening for deployments behind a proxy they control.
+    if (input.requireAllowedIp && configuredIps.length > 0 && !ipMatches) {
+      return { ok: false, reason: 'ip-not-allowed' }
     }
 
-    const body = input.body ?? {}
-    const bodyCandidates = CALLBACK_SECRET_PARAM_NAMES.map((name) => {
-      const value = (body as Record<string, unknown>)[name]
-      return value === undefined || value === null ? null : String(value)
-    })
-    if (secretMatches(configuredSecret, bodyCandidates)) {
-      return { ok: true, via: 'body' }
-    }
+    return { ok: true, via }
   }
 
-  // Only reached when no secret matched (or none is configured). An IP match is
-  // a standalone credential: it is what makes a leaked callback URL useless.
-  if (configuredIps.length > 0 && input.clientIp && ipAllowed(configuredIps, input.clientIp)) {
+  // No secret configured: the allow-list is the only configured method.
+  if (ipMatches) {
     return { ok: true, via: 'ip' }
   }
 
-  if (configuredSecret.length === 0 && configuredIps.length === 0) {
+  if (configuredIps.length === 0) {
     return { ok: false, reason: 'no-method-configured' }
   }
 
   return { ok: false, reason: 'mismatch' }
+}
+
+/** Which of the accepted channels carried a matching secret, if any. */
+function matchSecret(
+  configuredSecret: string,
+  input: CallbackAuthInput
+): 'header' | 'query' | 'body' | null {
+  if (input.headerSecret && secretMatches(configuredSecret, [input.headerSecret])) {
+    return 'header'
+  }
+
+  let queryCandidates: Array<string | null> = []
+  if (input.requestUrl) {
+    try {
+      const url = new URL(input.requestUrl)
+      queryCandidates = CALLBACK_SECRET_PARAM_NAMES.map((name) => url.searchParams.get(name))
+    } catch {
+      // A URL we cannot parse simply yields no query candidates.
+      queryCandidates = []
+    }
+  }
+  if (secretMatches(configuredSecret, queryCandidates)) {
+    return 'query'
+  }
+
+  const body = input.body ?? {}
+  const bodyCandidates = CALLBACK_SECRET_PARAM_NAMES.map((name) => {
+    const value = (body as Record<string, unknown>)[name]
+    return value === undefined || value === null ? null : String(value)
+  })
+  if (secretMatches(configuredSecret, bodyCandidates)) {
+    return 'body'
+  }
+
+  return null
 }

@@ -13,6 +13,7 @@
 
 import { Ratelimit } from '@upstash/ratelimit'
 import { Redis } from '@upstash/redis'
+import { resolveClientIp } from './client-ip'
 
 export type Duration = `${number} ${'s' | 'm' | 'h' | 'd'}`
 
@@ -104,11 +105,25 @@ export async function checkRateLimit(
   }
 }
 
-/** Best-effort client identifier for limiter fallbacks (never trusted for auth). */
+/**
+ * Client identifier used to key IP-based limiter buckets.
+ *
+ * Takes the trustworthy end of `x-forwarded-for` — see src/lib/client-ip.ts for
+ * why reading the first entry let a caller rotate their own bucket per request
+ * and escape the limit entirely. Still never trusted for authentication.
+ *
+ * When no address is recoverable every such request shares one bucket, which
+ * denies rather than allows. The reverse (a per-request unique key) would mean
+ * no limit at all.
+ */
 export function clientIdentifier(request: Request): string {
-  const forwarded = request.headers.get('x-forwarded-for')
-  if (forwarded) return forwarded.split(',')[0].trim()
-  return request.headers.get('x-real-ip') || 'unknown'
+  const resolved = resolveClientIp({
+    forwardedFor: request.headers.get('x-forwarded-for'),
+    realIp: request.headers.get('x-real-ip'),
+    trustedProxyHops: process.env.TRUSTED_PROXY_HOPS,
+    trustRealIp: process.env.TRUST_X_REAL_IP,
+  })
+  return resolved || 'unknown'
 }
 
 /** Constant-time string comparison, used for shared-secret style checks. */

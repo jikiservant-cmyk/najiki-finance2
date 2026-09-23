@@ -23,19 +23,23 @@ import { NextResponse } from 'next/server'
 import { smsStore } from '@/lib/sms-store'
 import { maskPhoneNumber } from '@/lib/redact'
 import { authorizeCallback } from '@/lib/callback-auth'
+import { resolveClientIp } from '@/lib/client-ip'
 
 /**
  * Client IP as seen through the platform proxy.
  *
- * `x-forwarded-for` is a list, and only the FIRST entry is the client; the rest
- * are proxies. It is caller-supplied in principle, which is exactly why the IP
- * allow-list is a secondary control behind the shared secret rather than a
- * replacement for it.
+ * Uses the shared resolver: the trusted entries are at the RIGHT of
+ * `x-forwarded-for`, because our own proxy appends to it last. Reading the first
+ * entry (which this used to do) reads a value the caller chose, so an attacker
+ * could name any address they liked. See src/lib/client-ip.ts.
  */
 function clientIpFrom(request: Request): string {
-  const forwarded = request.headers.get('x-forwarded-for') || ''
-  const first = forwarded.split(',')[0]?.trim()
-  return first || request.headers.get('x-real-ip')?.trim() || ''
+  return resolveClientIp({
+    forwardedFor: request.headers.get('x-forwarded-for'),
+    realIp: request.headers.get('x-real-ip'),
+    trustedProxyHops: process.env.TRUSTED_PROXY_HOPS,
+    trustRealIp: process.env.TRUST_X_REAL_IP,
+  })
 }
 
 /** Parse either a JSON or an `application/x-www-form-urlencoded` body. */
@@ -88,13 +92,14 @@ export async function POST(request: Request) {
       requestUrl: request.url,
       body: payload,
       clientIp: clientIpFrom(request),
+      requireAllowedIp: process.env.AFRICASTALKING_REQUIRE_ALLOWED_IP === 'true',
     })
 
     if (!auth.ok) {
       console.warn(
         `[Africa's Talking DLR] Rejected callback (${auth.reason}). ` +
-          'Configure the callback URL with ?key=<AFRICASTALKING_CALLBACK_SECRET>, ' +
-          'or set AFRICASTALKING_ALLOWED_IPS.'
+          'Configure the callback URL with ?key=<AFRICASTALKING_CALLBACK_SECRET>. ' +
+          'AFRICASTALKING_ALLOWED_IPS cannot authorise on its own while a secret is set.'
       )
       return new NextResponse('Unauthorized', { status: 401 })
     }
