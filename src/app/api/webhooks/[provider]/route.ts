@@ -6,6 +6,8 @@
 //   2. resolve provider / tenant creds   ← read-only
 //   3. VERIFY THE SIGNATURE              ← nothing is written before this
 //   4. idempotency (event hash)          ← dedupe on the provider's event identity
+//                                          (an UNFINISHED row is resumed, not
+//                                          acknowledged — see webhook-dedupe.ts)
 //   5. load intent → provider must match this route → amount/currency gates
 //      → completePayment()
 //
@@ -28,6 +30,7 @@ import { redactPhoneNumbersInText } from '@/lib/redact'
 import { buildSignatureUrlCandidates } from '@/lib/webhook-url'
 import { readTextWithLimit } from '@/lib/request-body'
 import { safeJsonObject } from '@/lib/json'
+import { decideWebhookLogAction } from '@/lib/webhook-dedupe'
 
 /** Providers retry with at-least-once semantics; 64 KB is far above any real payload. */
 const MAX_WEBHOOK_BYTES = 64 * 1024
@@ -149,30 +152,49 @@ export async function POST(
 
     // ── 4. Idempotency ─────────────────────────────────────────────────────
     const existingLog = await db.webhookLog.findUnique({ where: { signatureHash } })
-    if (existingLog?.processed) {
-      // Already handled — acknowledge so the provider stops retrying.
+    if (decideWebhookLogAction(existingLog) === 'duplicate') {
+      // Genuinely finished — acknowledge so the provider stops retrying.
       return NextResponse.json({ success: true, duplicate: true })
     }
 
     const sanitizedPayload = redactPhoneNumbersInText(rawBody)
 
-    let webhookLog: { id: string }
-    try {
-      webhookLog = await createWebhookLog({
-        provider: normalizedProvider,
-        eventType: 'WEBHOOK_RECEIVED',
-        payload: sanitizedPayload,
-        signature,
-        signatureHash,
-        verified: true,
-        processed: false,
-      })
-    } catch (logError: any) {
-      if (logError?.code === 'P2002') {
-        // Concurrent duplicate delivery for the same event.
-        return NextResponse.json({ success: true, duplicate: true })
+    // An existing-but-unfinished row is RESUMED, not duplicated.
+    //
+    // The row is written with `processed: false` before any work happens, so if
+    // a previous delivery died part-way (DB blip, timeout, a lost race on the
+    // wallet balance) that row is still here. Attempting a fresh insert would
+    // hit the unique key, and the old code answered 200 {duplicate: true} — the
+    // provider stopped retrying and the payment never settled, silently. Reusing
+    // the row lets the delivery complete; every step below is idempotent, so
+    // running it twice is harmless.
+    let webhookLog: { id: string } | null = existingLog
+
+    if (!webhookLog) {
+      try {
+        webhookLog = await createWebhookLog({
+          provider: normalizedProvider,
+          eventType: 'WEBHOOK_RECEIVED',
+          payload: sanitizedPayload,
+          signature,
+          signatureHash,
+          verified: true,
+          processed: false,
+        })
+      } catch (logError: any) {
+        if (logError?.code !== 'P2002') throw logError
+
+        // Another delivery of this event inserted the row between our read and
+        // this insert. Re-read to find out whether it *finished* or is still in
+        // flight / died: only a finished row is a duplicate.
+        const concurrent = await db.webhookLog.findUnique({ where: { signatureHash } })
+        if (!concurrent) throw logError
+
+        if (decideWebhookLogAction(concurrent) === 'duplicate') {
+          return NextResponse.json({ success: true, duplicate: true })
+        }
+        webhookLog = concurrent
       }
-      throw logError
     }
 
     if (!parsedBody) {
