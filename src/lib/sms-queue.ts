@@ -2,18 +2,36 @@ import { redis } from './redis'
 import { smsStore, SmsRequest } from './sms-store'
 import { sendSmsViaProvider } from './sms'
 import { db } from './db'
-import { createHmac } from 'crypto'
 import { safeFetch, isPlaceholderUrl } from './safe-fetch'
+import { computeNextRetryAt, isExhausted } from './backoff'
+import { maskPhoneNumber } from './redact'
+import { webhookSecretFromRow } from './application-auth'
+import { buildNotificationHeaders } from './notification-signature'
+import { parseProviderCost } from './provider-cost'
 
 const SMS_QUEUE_KEY = 'sms:queue'
+/** Set of ids currently in the queue — makes enqueue idempotent. */
+const SMS_QUEUE_SEEN_KEY = 'sms:queue:seen'
+
+const SMS_MAX_ATTEMPTS = 3
 
 export const smsQueue = {
   /**
    * Pushes a new SMS job to the Redis queue.
+   *
+   * Idempotent: the same id is never queued twice (a retried HTTP request used
+   * to enqueue a duplicate and send the message twice).
    */
   enqueue: async (smsId: string) => {
-    // We only push the ID to the queue
+    const added = await redis.sadd(SMS_QUEUE_SEEN_KEY, smsId)
+    if (Number(added) === 0) {
+      console.log(`[smsQueue] SMS ${smsId} is already queued — skipping duplicate enqueue`)
+      return
+    }
+
     await redis.lpush(SMS_QUEUE_KEY, smsId)
+    await smsStore.setNextAttemptAt(smsId, new Date())
+
     // Guarantee background execution so messages are processed immediately without depending solely on external cron
     const timer = setTimeout(() => {
       smsQueue.processBatch(5).catch(err => {
@@ -36,29 +54,52 @@ export const smsQueue = {
     for (let i = 0; i < batchSize; i++) {
       // Pop an item from the right side of the list
       const smsId = await redis.rpop<string>(SMS_QUEUE_KEY)
-      console.log(`[smsQueue] popped smsId=${smsId}`);
-      
       if (!smsId) {
-        // Queue is empty
         console.log(`[smsQueue] Queue empty, stopping batch`);
         break
       }
+
+      // Claim the id. A second worker (or a retry that re-queued without
+      // clearing the marker) must not send the same message twice.
+      const claimed = await redis.srem(SMS_QUEUE_SEEN_KEY, smsId)
+      if (Number(claimed) === 0) {
+        console.log(`[smsQueue] Skipping ${smsId}: already claimed by another worker`)
+        continue
+      }
+      console.log(`[smsQueue] processing smsId=${smsId}`)
 
       let application: any = null
       let sms: SmsRequest | undefined | null
 
       try {
         sms = await smsStore.get(smsId)
-        
+
         if (!sms) {
           console.error(`SMS not found in store: ${smsId}`)
           continue
         }
 
-        console.log(`[smsQueue] Processing SMS ${smsId} for ${sms.recipient} (attempt ${(sms.attemptCount || 0) + 1})`);
+        // Honour the retry schedule: a message that failed a moment ago waits
+        // out its backoff instead of being re-sent on the very next tick.
+        //
+        // The id was popped and un-marked above, so it MUST be put back before
+        // stopping — otherwise the message would be dropped from the queue and
+        // never sent. The batch then ends: everything behind this message is
+        // no more due than it is, and the next tick is a minute away.
+        if (sms.nextAttemptAt && new Date(sms.nextAttemptAt).getTime() > Date.now()) {
+          await redis.lpush(SMS_QUEUE_KEY, smsId)
+          await redis.sadd(SMS_QUEUE_SEEN_KEY, smsId)
+          console.log(
+            `[smsQueue] Deferring ${smsId} until ${new Date(sms.nextAttemptAt).toISOString()} — ending batch`
+          )
+          break
+        }
+
+        console.log(`[smsQueue] Processing SMS ${smsId} for ${maskPhoneNumber(sms.recipient)} (attempt ${(sms.attemptCount || 0) + 1})`);
         
         // Update status to pending
         await smsStore.updateStatus(smsId, 'pending')
+        await smsStore.setNextAttemptAt(smsId, null)
 
         // Safely resolve application for post-delivery webhook without blocking provider delivery
         try {
@@ -73,7 +114,7 @@ export const smsQueue = {
 
         // Send SMS via Provider
         console.log(`[smsQueue] Sending via provider...`);
-        const result = await sendSmsViaProvider(sms.recipient, sms.message, sms.senderId)
+        const result = await sendSmsViaProvider(sms.recipient, sms.message, sms.senderId ?? undefined)
         console.log(`[smsQueue] Send result:`, result);
         
         if (!result.success) {
@@ -81,8 +122,28 @@ export const smsQueue = {
         }
 
         // Update status to delivered and attach provider tracking message ID
-        await smsStore.updateStatus(smsId, 'delivered', undefined, undefined, result.providerId)
-        
+        await smsStore.updateStatus(
+          smsId,
+          'delivered',
+          undefined,
+          (sms.attemptCount || 0) + 1,
+          result.providerId
+        )
+        await smsStore.setNextAttemptAt(smsId, null)
+
+        // Replace the placeholder cost with what the provider charged. Real cost
+        // varies by destination, sender ID and message length (long messages are
+        // billed per part); the dashboard sums this column as "Total Cost".
+        const parsedCost = parseProviderCost(result.cost)
+        if (parsedCost) {
+          const updated = await smsStore.updateProviderCost(smsId, parsedCost.amountMinor)
+          if (!updated) {
+            console.warn(
+              `[smsQueue] Provider cost for ${smsId} not applied (already recorded or row missing)`
+            )
+          }
+        }
+
         results.push({ smsId, success: true, providerId: result.providerId })
 
         // Fire webhook to connected app
@@ -104,15 +165,16 @@ export const smsQueue = {
               applicationCode: application.code
             })
             
-            const headers: Record<string, string> = {
-              'Content-Type': 'application/json',
-              'X-Najiki-Notification': 'true'
-            }
-
-            if (application.apiKey) {
-              headers['X-Najiki-Signature'] = createHmac('sha256', application.apiKey).update(payload).digest('hex')
-              headers['Authorization'] = `Bearer ${application.apiKey}`
-            }
+            // Same signer as the payment-notification path. This used to build
+            // its own bare HMAC and *also* send `Authorization: Bearer <secret>`,
+            // which meant a partner had to implement two verification schemes,
+            // the SMS one had no timestamp (so a captured body stayed valid
+            // forever), and the signing secret itself was copied into a header a
+            // partner's proxy or log aggregator would record.
+            const headers = buildNotificationHeaders(
+              webhookSecretFromRow(application),
+              payload
+            )
 
             try {
               await safeFetch(webhookUrl, {
@@ -128,28 +190,30 @@ export const smsQueue = {
         }
       } catch (error: any) {
         console.error(`Failed to process SMS ${smsId}:`, error)
-        
-        const maxRetries = 3;
+
         const currentAttempts = sms?.attemptCount ?? 0;
         const nextAttempt = currentAttempts + 1;
 
-        if (sms && nextAttempt < maxRetries) {
-          console.log(`[smsQueue] Re-queueing SMS ${smsId} (attempt ${nextAttempt}/${maxRetries})`);
-          // Update attempt count and failure note in store
+        if (sms && !isExhausted(nextAttempt, SMS_MAX_ATTEMPTS)) {
+          console.log(`[smsQueue] Re-queueing SMS ${smsId} (attempt ${nextAttempt}/${SMS_MAX_ATTEMPTS})`);
+          // Keep the row in "queued" while it is still retryable so the
+          // dashboard does not report a retrying message as permanently failed.
           await smsStore.updateStatus(
             smsId,
-            'failed',
-            `Retry ${nextAttempt}/${maxRetries}: ${error.message || 'Unknown error'}`,
+            'queued',
+            `Retry ${nextAttempt}/${SMS_MAX_ATTEMPTS}: ${error.message || 'Unknown error'}`,
             nextAttempt
           )
-          
+          await smsStore.setNextAttemptAt(smsId, computeNextRetryAt(nextAttempt, { baseDelayMs: 15_000 }))
+
           // Requeue it to the left side so it gets retried
           await redis.lpush(SMS_QUEUE_KEY, smsId);
-          
+          await redis.sadd(SMS_QUEUE_SEEN_KEY, smsId);
+
           results.push({ smsId, success: false, error: error.message, retried: true });
           continue;
         }
-        
+
         // Terminal failure: reached max retries or unrecoverable
         console.log(`[smsQueue] Terminal failure for SMS ${smsId} after ${nextAttempt} attempts`);
         await smsStore.updateStatus(
@@ -158,6 +222,7 @@ export const smsQueue = {
           `Permanent failure after ${nextAttempt} attempts: ${error.message || 'Unknown error'}`,
           nextAttempt
         )
+        await smsStore.setNextAttemptAt(smsId, null)
         
         results.push({ smsId, success: false, error: error.message, retried: false })
 
@@ -180,15 +245,10 @@ export const smsQueue = {
               applicationCode: application.code
             })
             
-            const headers: Record<string, string> = {
-              'Content-Type': 'application/json',
-              'X-Najiki-Notification': 'true'
-            }
-
-            if (application.apiKey) {
-              headers['X-Najiki-Signature'] = createHmac('sha256', application.apiKey).update(payload).digest('hex')
-              headers['Authorization'] = `Bearer ${application.apiKey}`
-            }
+            const headers = buildNotificationHeaders(
+              webhookSecretFromRow(application),
+              payload
+            )
 
             try {
               await safeFetch(webhookUrl, { method: 'POST', headers, body: payload })

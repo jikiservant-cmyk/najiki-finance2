@@ -5,34 +5,57 @@
 //  FIX 3: getPaymentByReference uses findUnique (not findFirst) to hit @unique index
 //  FIX 4: getPendingNotifications adds nextRetryAt filter so only due rows are loaded
 
+import { Prisma } from '@prisma/client'
+import { pickPrimaryCurrency } from './money'
+import {
+  DEFAULT_DASHBOARD_PERIOD,
+  periodDateFilter,
+  resolveDashboardPeriod,
+} from './dashboard-period'
+
+export { DEFAULT_DASHBOARD_PERIOD }
 import { db } from './db'
 
 // ─── DASHBOARD ────────────────────────────────────────────────────────────────
 
-export async function getDashboardData(period: string = '14d') {
-  let dateFilter: Date | undefined = undefined;
-  const now = new Date();
-  let intervalStr = "14 days";
-  
-  if (period === '14d') {
-    dateFilter = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
-    intervalStr = "14 days";
-  } else if (period === '1m') {
-    dateFilter = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-    intervalStr = "30 days";
-  } else if (period === '3m') {
-    dateFilter = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
-    intervalStr = "90 days";
-  } else if (period === '1y') {
-    dateFilter = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
-    intervalStr = "365 days";
-  } else if (period === 'all') {
-    dateFilter = undefined;
-    intervalStr = "100 years";
+export async function getDashboardData(period: string = DEFAULT_DASHBOARD_PERIOD) {
+  // Whitelist resolution (see dashboard-period.ts): an unrecognised value becomes
+  // a known period rather than "no date filter at all".
+  const window = resolveDashboardPeriod(period)
+  const intervalStr = window.interval
+  const resolvedPeriod = window.period
+  const dateFilter = periodDateFilter(window)
+
+  if (window.fellBack) {
+    console.warn(
+      `[dashboard] Unsupported period "${String(period).slice(0, 32)}" requested; ` +
+        `reporting ${resolvedPeriod} instead.`
+    )
   }
 
   const baseWhere = dateFilter ? { createdAt: { gte: dateFilter } } : {};
-  const successWhere = { status: 'success', ...baseWhere };
+
+  // ── Currency: every money aggregate below is scoped to ONE currency ────────
+  // `_sum: { amount: true }` adds up the raw `amount` column, and `amount` is in
+  // major units of whatever currency the intent used. Summing a UGX intent and a
+  // USD intent produces a number that means nothing — and the dashboard then
+  // labelled it "UGX". So the platform's primary currency (the one most
+  // successful payments were taken in for this period) is chosen first, every
+  // revenue query is filtered to it, and the per-currency totals are returned
+  // separately so nothing is hidden.
+  const currencyRows = await db.paymentIntent.groupBy({
+    by: ['currency'],
+    where: { status: 'success', ...baseWhere },
+    _count: { _all: true },
+  })
+
+  const currencyBreakdown = currencyRows
+    .map((row) => ({ currency: String(row.currency).toUpperCase(), count: row._count._all }))
+    .sort((a, b) => b.count - a.count || a.currency.localeCompare(b.currency))
+
+  const revenueCurrency = pickPrimaryCurrency(currencyBreakdown)
+
+  const successWhere = { status: 'success', currency: revenueCurrency, ...baseWhere };
 
   const [
     totalPayments,
@@ -105,15 +128,21 @@ export async function getDashboardData(period: string = '14d') {
       _count: true,
     }),
 
-    // FIX 1: single raw SQL query — DB does the date bucketing and summing
-    db.$queryRawUnsafe<{ date: string; revenue: number; count: bigint; failed: bigint }[]>(`
+    // FIX 1: single raw SQL query — DB does the date bucketing and summing.
+    //
+    // The currency is bound as a parameter rather than interpolated, and scoped
+    // to the same one the stat cards use, so the chart and the totals cannot
+    // disagree. The interval stays a whitelisted literal (see
+    // DASHBOARD_PERIODS) because a parameter cannot stand in for an INTERVAL.
+    db.$queryRaw<{ date: string; revenue: number; count: bigint; failed: bigint }[]>(Prisma.sql`
       SELECT
         TO_CHAR(DATE_TRUNC('day', COALESCE(completed_at, created_at)), 'YYYY-MM-DD') AS date,
         COALESCE(SUM(CASE WHEN status = 'success' THEN amount ELSE 0 END), 0)         AS revenue,
         COUNT(CASE WHEN status = 'success' THEN 1 END)                                AS count,
         COUNT(CASE WHEN status = 'failed'  THEN 1 END)                                AS failed
       FROM payment_intents
-      WHERE created_at >= NOW() - INTERVAL '${intervalStr}'
+      WHERE created_at >= NOW() - INTERVAL '${Prisma.raw(intervalStr)}'
+        AND currency = ${revenueCurrency}
       GROUP BY DATE_TRUNC('day', COALESCE(completed_at, created_at))
       ORDER BY date ASC
     `),
@@ -232,10 +261,13 @@ export async function getDashboardData(period: string = '14d') {
   }))
 
   // Notification stats
-  const notifStats = { total: 0, delivered: 0, pending: 0, retrying: 0, exhausted: 0 }
+  const notifStats = { total: 0, delivered: 0, dispatched: 0, pending: 0, retrying: 0, exhausted: 0 }
   for (const item of notificationsData) {
     notifStats.total += item._count
     if (item.status === 'delivered') notifStats.delivered = item._count
+    // Handed to QStash, which owns delivery + retries from that point on. Kept
+    // separate from "delivered" because we have no delivery receipt for it.
+    if (item.status === 'dispatched') notifStats.dispatched = item._count
     if (item.status === 'pending') notifStats.pending = item._count
     if (item.status === 'failed_retrying') notifStats.retrying = item._count
     if (item.status === 'failed_exhausted') notifStats.exhausted = item._count
@@ -243,6 +275,13 @@ export async function getDashboardData(period: string = '14d') {
 
   return {
     totalRevenue,
+    // The currency every money figure in this payload is denominated in. The UI
+    // must label with this rather than assuming UGX.
+    revenueCurrency,
+    // Per-currency payment counts, so a deployment taking more than one currency
+    // can see that the headline figure covers only one of them.
+    currencyBreakdown,
+    period: resolvedPeriod,
     statusCounts,
     successRate,
     appRevenue,
@@ -329,6 +368,19 @@ export async function getPaymentByReference(reference: string) {
   })
 }
 
+/**
+ * @deprecated Do not use this to settle a payment.
+ *
+ * It writes `paymentIntent.status` directly, which means no wallet credit, no
+ * immutable `LedgerEntry`, no `PaymentTransaction` audit row and no
+ * `InternalNotification` to the partner — the four things `completePayment()`
+ * does inside one transaction. A payment "completed" through here is a status
+ * with no money behind it.
+ *
+ * It currently has no callers; it is kept only because removing an exported
+ * function is a breaking change for anything importing it. Route everything
+ * through `completePayment()` in `src/lib/payments.ts`.
+ */
 export async function updatePaymentStatus(
   reference: string,
   status: string,
@@ -358,10 +410,12 @@ export async function createWebhookLog(data: {
   verified: boolean
   processed: boolean
 }) {
-  let provider = await db.provider.findFirst({ where: { code: data.provider.toLowerCase() } })
-  if (!provider) {
-    provider = await db.provider.findFirst({ where: { isActive: true } })
-  }
+  // Must match the provider that actually sent the webhook. This used to fall
+  // back to "any active provider", which silently attached webhook audit rows
+  // to an unrelated provider and corrupted the audit trail.
+  const provider = await db.provider.findFirst({
+    where: { code: data.provider.toLowerCase() },
+  })
   if (!provider) {
     throw new Error(`No provider found for webhook: ${data.provider}`)
   }
@@ -401,11 +455,18 @@ export async function updateWebhookLog(
   })
 }
 
+/**
+ * Append an audit row for a payment.
+ *
+ * `amount` was accepted and never written anywhere — the column does not exist —
+ * so a caller passing one could reasonably believe the figure was recorded.
+ * Removed rather than left as a silent no-op; the amount lives on
+ * `PaymentIntent.amount` and on `LedgerEntry.amountMinor`.
+ */
 export async function createPaymentTransaction(data: {
   paymentId: string
   type: string
   status: string
-  amount: number
   metadata: string
 }) {
   return db.paymentTransaction.create({

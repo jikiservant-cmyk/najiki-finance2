@@ -1,12 +1,111 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import crypto from 'crypto'
+import { z } from 'zod'
 import { requireSuperAdmin } from '@/lib/auth'
 import { validateSafeUrl } from '@/lib/safe-fetch'
-import { encrypt } from '@/lib/encryption'
+import {
+  getAvailableProviders,
+  isProviderImplemented,
+  providerDisplayName,
+} from '@/lib/providers'
+import { encrypt, decrypt } from '@/lib/encryption'
+import { generateApiKey, hashApiKey, apiKeyHint } from '@/lib/api-keys'
+import { summarizeProviderConfig, shouldPreserveStoredSecret } from '@/lib/provider-config-summary'
 
-function generateApiKey(): string {
-  return `nk_${crypto.randomBytes(24).toString('hex')}`
+// Every write path is validated. These payloads previously went straight from
+// `request.json()` into Prisma, so a typo in the dashboard (or a crafted
+// request) could persist an application with an empty code or a non-http base
+// URL that the SSRF guard would only reject much later, at delivery time.
+const Id = z.string().min(1).max(64)
+const Code = z.string().min(2).max(64).regex(/^[a-zA-Z0-9._-]+$/, 'code may only contain letters, numbers, dot, dash or underscore')
+
+const ApplicationSchema = z.object({
+  code: Code,
+  name: z.string().min(1).max(200),
+  baseUrl: z.string().url().max(500),
+  webhookPath: z.string().min(1).max(300).default('/api/internal/payment-completed'),
+  internalSecretRef: z.string().max(200).optional().default(''),
+  isActive: z.boolean().optional().default(true),
+})
+
+const UpdateApplicationSchema = ApplicationSchema.partial({ code: true }).extend({ id: Id })
+
+/**
+ * Rotate an application's credentials.
+ *
+ * `rotateWebhookSecret` defaults to **false** deliberately: the webhook secret
+ * is what a partner verifies our outbound notifications with, so rotating it
+ * silently would make every delivery fail signature verification on their side
+ * until they are told the new one. Rotating the API key alone is the common case
+ * (a leaked or lost key) and has no partner-side effect.
+ */
+const RotateApplicationSchema = z.object({
+  id: Id,
+  rotateWebhookSecret: z.boolean().optional().default(false),
+})
+
+const ProviderSchema = z.object({
+  code: Code,
+  name: z.string().min(1).max(200),
+  credentialsRef: z.string().max(200).optional().default(''),
+  isActive: z.boolean().optional().default(true),
+})
+
+const TenantSchema = z.object({
+  applicationId: Id,
+  code: Code,
+  name: z.string().min(1).max(200),
+  defaultProviderId: z.string().max(64).optional().nullable(),
+  isActive: z.boolean().optional().default(true),
+})
+
+const PaymentTypeSchema = z.object({
+  applicationId: Id,
+  code: z.string().min(1).max(64),
+  description: z.string().max(300).optional(),
+})
+
+const TenantProviderConfigSchema = z.object({
+  id: Id.optional(),
+  tenantId: Id,
+  providerId: Id,
+  apiKey: z.string().max(500).optional().default(''),
+  accountNo: z.string().max(200).optional().default(''),
+  webhookSecret: z.string().max(500).optional().default(''),
+  baseUrl: z.string().url().max(500).optional().default('https://livepay.me'),
+  credentialsRef: z.string().max(200).optional().nullable(),
+  isActive: z.boolean().optional().default(true),
+})
+
+const DeleteConfigSchema = z.object({ id: Id })
+const ToggleConfigSchema = z.object({ id: Id, isActive: z.boolean() })
+
+function validationError(error: z.ZodError) {
+  const details = error.issues.map((issue) => `${issue.path.join('.') || 'body'}: ${issue.message}`)
+  return NextResponse.json({ error: 'Validation failed', details }, { status: 400 })
+}
+
+/**
+ * Mint an application key pair.
+ *
+ * The API key is returned to the operator exactly once and only its hash is
+ * stored. The webhook secret is a separate credential, kept encrypted because
+ * HMAC signing needs the plaintext back.
+ */
+function newApplicationCredentials() {
+  const apiKey = generateApiKey()
+  const webhookSecret = `njk_whsec_${crypto.randomBytes(32).toString('base64url')}`
+  return {
+    plaintextApiKey: apiKey,
+    webhookSecret,
+    data: {
+      apiKeyHash: hashApiKey(apiKey),
+      apiKeyHint: apiKeyHint(apiKey),
+      webhookSecretEncrypted: encrypt(webhookSecret),
+      apiKeyRotatedAt: new Date(),
+    },
+  }
 }
 
 export async function GET() {
@@ -15,6 +114,16 @@ export async function GET() {
 
     const [applications, providers, tenantProviderConfigs, tenants] = await Promise.all([
       db.application.findMany({
+        // `omit` is load-bearing, not tidiness. Selecting a whole Application
+        // would ship `apiKeyHash` and `webhookSecretEncrypted` to the browser,
+        // and an offline attack on a stored hash is the one thing hashing
+        // cannot defend against. The plaintext `apiKey` is omitted for the same
+        // reason — it is only ever returned once, from the create branch below.
+        omit: {
+          apiKey: true,
+          apiKeyHash: true,
+          webhookSecretEncrypted: true,
+        },
         include: {
           tenants: true,
           paymentTypes: true,
@@ -24,27 +133,46 @@ export async function GET() {
       db.provider.findMany({
         orderBy: { createdAt: 'desc' },
       }),
-      db.tenantProviderConfig.findMany({
-        include: {
-          tenant: true,
-          provider: true,
-        },
-        orderBy: { createdAt: 'desc' },
-      }),
+      // `configJson` holds this tenant's provider credentials. It is NOT
+      // returned: the dashboard only needs to know whether credentials exist and
+      // what the non-secret fields are. Rows written before encryption was added
+      // still hold { apiKey, webhookSecret } in the clear, and shipping those to
+      // a browser is exactly what the Application `omit` above exists to prevent.
+      db.tenantProviderConfig
+        .findMany({
+          include: {
+            tenant: true,
+            provider: true,
+          },
+          orderBy: { createdAt: 'desc' },
+        })
+        .then((configs) =>
+          configs.map(({ configJson, ...rest }) => ({
+            ...rest,
+            configSummary: summarizeProviderConfig(configJson),
+          }))
+        ),
       db.tenant.findMany({
         include: {
-          application: true,
+          application: {
+            omit: { apiKey: true, apiKeyHash: true, webhookSecretEncrypted: true },
+          },
         },
         orderBy: { createdAt: 'desc' },
       }),
     ])
 
-    return NextResponse.json({
-      applications,
-      providers,
-      tenantProviderConfigs,
-      tenants,
-    })
+    // This payload contains application API keys and provider credential
+    // references — never let it be cached by a browser or intermediary.
+    return NextResponse.json(
+      {
+        applications,
+        providers,
+        tenantProviderConfigs,
+        tenants,
+      },
+      { headers: { 'Cache-Control': 'no-store, max-age=0' } }
+    )
   } catch (error: any) {
     console.error('Setup GET error:', error)
     if (error.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
@@ -60,10 +188,12 @@ export async function POST(request: Request) {
   try {
     await requireSuperAdmin()
 
-    const { type, data } = await request.json()
+    const body = await request.json()
+    const type = body?.type
+    const data = body?.data
 
     if (type === 'application' || type === 'updateApplication') {
-      if (data?.baseUrl) {
+      if (typeof data?.baseUrl === 'string' && data.baseUrl) {
         try {
           await validateSafeUrl(data.baseUrl)
         } catch (urlErr: any) {
@@ -77,95 +207,254 @@ export async function POST(request: Request) {
 
     let result
     switch (type) {
-      case 'application':
+      case 'application': {
+        const parsed = ApplicationSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
+        const credentials = newApplicationCredentials()
         result = await db.application.create({
           data: {
-            code: data.code,
-            name: data.name,
-            baseUrl: data.baseUrl,
-            webhookPath: data.webhookPath,
-            internalSecretRef: data.internalSecretRef,
-            apiKey: generateApiKey(),
-            isActive: data.isActive,
+            code: parsed.data.code,
+            name: parsed.data.name,
+            baseUrl: parsed.data.baseUrl,
+            webhookPath: parsed.data.webhookPath,
+            internalSecretRef: parsed.data.internalSecretRef,
+            ...credentials.data,
+            isActive: parsed.data.isActive,
           },
         })
+        // Shown once. It is not stored in plaintext and cannot be shown again.
+        result = { ...result, apiKey: credentials.plaintextApiKey, webhookSecret: credentials.webhookSecret }
         break
+      }
 
-      case 'updateApplication':
+      case 'updateApplication': {
+        const parsed = UpdateApplicationSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
         result = await db.application.update({
-          where: { id: data.id },
+          where: { id: parsed.data.id },
           data: {
-            name: data.name,
-            baseUrl: data.baseUrl,
-            webhookPath: data.webhookPath,
-            internalSecretRef: data.internalSecretRef,
-            isActive: data.isActive,
+            name: parsed.data.name,
+            baseUrl: parsed.data.baseUrl,
+            webhookPath: parsed.data.webhookPath,
+            internalSecretRef: parsed.data.internalSecretRef,
+            isActive: parsed.data.isActive,
           },
         })
         break
+      }
 
-      case 'provider':
+      case 'rotateApplication': {
+        // There was no rotation path at all, while the dashboard told operators
+        // to "rotate it" when a key was lost. The only recovery from a leaked
+        // partner key was deleting the application — which cannot be done once
+        // it has payment history, and is not what you want during an incident.
+        const parsed = RotateApplicationSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
+
+        const credentials = newApplicationCredentials()
+        const rotateWebhookSecret = parsed.data.rotateWebhookSecret === true
+
+        const updated = await db.application.update({
+          where: { id: parsed.data.id },
+          data: {
+            apiKeyHash: credentials.data.apiKeyHash,
+            apiKeyHint: credentials.data.apiKeyHint,
+            apiKeyRotatedAt: credentials.data.apiKeyRotatedAt,
+            // Destroying the old cleartext is what makes this a real
+            // revocation rather than a second working key. `findApplicationByApiKey`
+            // consults the cleartext column only for rows with no hash, so once
+            // this row has the new hash the superseded key is dead.
+            apiKey: null,
+            ...(rotateWebhookSecret
+              ? { webhookSecretEncrypted: credentials.data.webhookSecretEncrypted }
+              : {}),
+          },
+          omit: { apiKey: true, apiKeyHash: true, webhookSecretEncrypted: true },
+        })
+
+        // Returned exactly once. Neither value is recoverable afterwards.
+        result = {
+          ...updated,
+          apiKey: credentials.plaintextApiKey,
+          webhookSecretRotated: rotateWebhookSecret,
+          ...(rotateWebhookSecret ? { webhookSecret: credentials.webhookSecret } : {}),
+        }
+        break
+      }
+
+      case 'provider': {
+        const parsed = ProviderSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
+
+        // Activating a provider with no adapter is the other half of the same
+        // landmine: it becomes eligible for "first active provider" selection
+        // and then throws on the first payment.
+        if (parsed.data.isActive && !isProviderImplemented(parsed.data.code)) {
+          return NextResponse.json(
+            {
+              error:
+                `${providerDisplayName(parsed.data.code)} has no working payment adapter yet. ` +
+                'Create it inactive, or leave it out until the adapter ships.',
+              availableProviders: getAvailableProviders(),
+            },
+            { status: 400 }
+          )
+        }
+
         result = await db.provider.create({
           data: {
-            code: data.code,
-            name: data.name,
-            credentialsRef: data.credentialsRef,
-            isActive: data.isActive,
+            code: parsed.data.code,
+            name: parsed.data.name,
+            credentialsRef: parsed.data.credentialsRef,
+            isActive: parsed.data.isActive,
           },
         })
         break
+      }
 
-      case 'tenant':
+      case 'tenant': {
+        const parsed = TenantSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
+
+        // A tenant pointed at a provider with no working adapter means every
+        // payment for that tenant fails. Refuse the configuration rather than
+        // storing a landmine — /api/payments also refuses at request time, but
+        // catching it here tells the operator which dropdown value is wrong.
+        if (parsed.data.defaultProviderId) {
+          const selected = await db.provider.findUnique({
+            where: { id: parsed.data.defaultProviderId },
+            select: { code: true, isActive: true },
+          })
+          if (!selected) {
+            return NextResponse.json({ error: 'Selected provider does not exist' }, { status: 400 })
+          }
+          if (!isProviderImplemented(selected.code)) {
+            return NextResponse.json(
+              {
+                error:
+                  `${providerDisplayName(selected.code)} has no working payment adapter yet, so it ` +
+                  'cannot be a tenant default. Leave the default empty to use the platform default.',
+                availableProviders: getAvailableProviders(),
+              },
+              { status: 400 }
+            )
+          }
+          if (!selected.isActive) {
+            return NextResponse.json(
+              { error: `${providerDisplayName(selected.code)} is inactive. Activate it first.` },
+              { status: 400 }
+            )
+          }
+        }
+
         result = await db.tenant.create({
           data: {
-            applicationId: data.applicationId,
-            code: data.code,
-            name: data.name,
-            defaultProviderId: data.defaultProviderId || null,
-            isActive: data.isActive,
+            applicationId: parsed.data.applicationId,
+            code: parsed.data.code,
+            name: parsed.data.name,
+            defaultProviderId: parsed.data.defaultProviderId || null,
+            isActive: parsed.data.isActive,
           },
         })
         break
+      }
 
-      case 'paymentType':
+      case 'paymentType': {
+        const parsed = PaymentTypeSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
         result = await db.paymentType.create({
           data: {
-            applicationId: data.applicationId,
-            code: data.code,
-            description: data.description,
+            applicationId: parsed.data.applicationId,
+            code: parsed.data.code,
+            description: parsed.data.description,
           },
         })
         break
+      }
 
       case 'tenantProviderConfig': {
-        const rawCreds = {
-          apiKey: data.apiKey?.trim() || '',
-          accountNo: data.accountNo?.trim() || '',
-          webhookSecret: data.webhookSecret?.trim() || '',
-          baseUrl: data.baseUrl?.trim() || 'https://livepay.me',
+        const parsed = TenantProviderConfigSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
+        const config = parsed.data
+
+        // The per-tenant provider endpoint is an outbound target too — run the
+        // same SSRF checks as the application base URL before storing it.
+        try {
+          await validateSafeUrl(config.baseUrl)
+        } catch (urlErr: any) {
+          return NextResponse.json(
+            { error: `Invalid provider base URL: ${urlErr.message}` },
+            { status: 400 }
+          )
         }
-        
+
+        // Editing must not erase a credential it was never shown. The form
+        // cannot prefill the API key (the server will not send it), so a blank
+        // value here means "unchanged", not "delete" — read the stored blob and
+        // carry the existing secret forward.
+        let preserved: Record<string, string> = {}
+        if (config.id) {
+          const current = await db.tenantProviderConfig.findUnique({ where: { id: config.id } })
+          const stored = current?.configJson as Record<string, unknown> | undefined
+          if (stored && typeof stored === 'object') {
+            if (typeof stored._encrypted === 'string') {
+              try {
+                const decoded = JSON.parse(decrypt(stored._encrypted))
+                if (decoded && typeof decoded === 'object') preserved = decoded
+              } catch (decryptErr) {
+                console.error(
+                  `[setup] Could not decrypt the stored provider config for ${config.id}; ` +
+                    'refusing to guess at its credentials.',
+                  decryptErr
+                )
+                return NextResponse.json(
+                  {
+                    error:
+                      'The stored credentials for this configuration could not be read, so ' +
+                      'saving would have overwritten them. Re-enter the API key to replace them.',
+                  },
+                  { status: 409 }
+                )
+              }
+            } else {
+              // Legacy plaintext blob.
+              preserved = stored as Record<string, string>
+            }
+          }
+        }
+
+        const rawCreds = {
+          apiKey: shouldPreserveStoredSecret(config.apiKey)
+            ? String(preserved.apiKey ?? '')
+            : config.apiKey!.trim(),
+          accountNo: config.accountNo?.trim() || String(preserved.accountNo ?? ''),
+          webhookSecret: shouldPreserveStoredSecret(config.webhookSecret)
+            ? String(preserved.webhookSecret ?? '')
+            : config.webhookSecret!.trim(),
+          baseUrl: config.baseUrl?.trim() || String(preserved.baseUrl ?? 'https://livepay.me'),
+        }
+
         const configJson = {
           _encrypted: encrypt(JSON.stringify(rawCreds))
         }
 
-        if (data.id) {
+        if (config.id) {
           result = await db.tenantProviderConfig.update({
-            where: { id: data.id },
+            where: { id: config.id },
             data: {
-              tenantId: data.tenantId,
-              providerId: data.providerId,
+              tenantId: config.tenantId,
+              providerId: config.providerId,
               configJson,
-              credentialsRef: data.credentialsRef || null,
-              isActive: data.isActive ?? true,
+              credentialsRef: config.credentialsRef || null,
+              isActive: config.isActive ?? true,
             },
           })
         } else {
           // Check if an existing configuration exists for this tenant & provider
           const existing = await db.tenantProviderConfig.findFirst({
             where: {
-              tenantId: data.tenantId,
-              providerId: data.providerId,
+              tenantId: config.tenantId,
+              providerId: config.providerId,
             },
           })
 
@@ -174,18 +463,18 @@ export async function POST(request: Request) {
               where: { id: existing.id },
               data: {
                 configJson,
-                credentialsRef: data.credentialsRef || null,
-                isActive: data.isActive ?? true,
+                credentialsRef: config.credentialsRef || null,
+                isActive: config.isActive ?? true,
               },
             })
           } else {
             result = await db.tenantProviderConfig.create({
               data: {
-                tenantId: data.tenantId,
-                providerId: data.providerId,
+                tenantId: config.tenantId,
+                providerId: config.providerId,
                 configJson,
-                credentialsRef: data.credentialsRef || null,
-                isActive: data.isActive ?? true,
+                credentialsRef: config.credentialsRef || null,
+                isActive: config.isActive ?? true,
               },
             })
           }
@@ -194,16 +483,20 @@ export async function POST(request: Request) {
       }
 
       case 'deleteTenantProviderConfig': {
+        const parsed = DeleteConfigSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
         result = await db.tenantProviderConfig.delete({
-          where: { id: data.id },
+          where: { id: parsed.data.id },
         })
         break
       }
 
       case 'toggleTenantProviderConfig': {
+        const parsed = ToggleConfigSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
         result = await db.tenantProviderConfig.update({
-          where: { id: data.id },
-          data: { isActive: data.isActive },
+          where: { id: parsed.data.id },
+          data: { isActive: parsed.data.isActive },
         })
         break
       }

@@ -6,6 +6,7 @@ import { Navigation } from '@/components/app/navigation'
 import { FloatingGeometry } from '@/components/app/floating-geometry'
 import { CursorTrail } from '@/components/app/cursor-trail'
 import { useToast } from '@/hooks/use-toast'
+import { Button } from '@/components/ui/button'
 import { Zap, RefreshCw, CheckCircle2, AlertTriangle, Play, HelpCircle } from 'lucide-react'
 
 interface WebhookLog {
@@ -53,39 +54,41 @@ export default function WebhooksPage() {
   const [simResult, setSimResult] = useState<any | null>(null)
   const { toast } = useToast()
 
+  // A single request returns both the delivery log and the pending payments the
+  // simulator can target. It used to be two calls to endpoints that did not
+  // exist (GET /api/webhooks 404'd) and the failure was swallowed into an empty
+  // list, so this page silently showed "nothing here" forever.
+  const [loadError, setLoadError] = useState<string | null>(null)
+
   const fetchLogs = () => {
     setLoading(true)
     fetch('/api/webhooks')
-      .then(r => r.json())
-      .then(d => { 
-        setLogs(Array.isArray(d) ? d : []); 
-        setLoading(false) 
-      })
-      .catch(() => { 
-        setLogs([]); 
-        setLoading(false) 
-      })
-  }
-
-  const fetchActivePayments = () => {
-    fetch('/api/dashboard')
-      .then(r => r.json())
-      .then(d => {
-        if (d && Array.isArray(d.recentIntents)) {
-          // Filter to show pending or processing payment intents
-          const pending = d.recentIntents.filter((p: any) => p.status === 'processing' || p.status === 'pending')
-          setActivePayments(pending)
-          if (pending.length > 0) {
-            setSelectedRef(pending[0].reference)
-          }
+      .then(async (r) => {
+        if (!r.ok) {
+          const body = await r.json().catch(() => ({}))
+          throw new Error(body.error || `Request failed (${r.status})`)
         }
+        return r.json()
       })
-      .catch(err => console.error('Failed to load active payments:', err))
+      .then((d) => {
+        setLogs(Array.isArray(d?.logs) ? d.logs : [])
+        const pending = Array.isArray(d?.activePayments) ? d.activePayments : []
+        setActivePayments(pending)
+        setSelectedRef((current) => current || pending[0]?.reference || '')
+        setLoadError(null)
+      })
+      .catch((err) => {
+        // Surface the failure. An audit view that renders an empty list when it
+        // cannot reach the server is worse than one that shows an error.
+        setLogs([])
+        setActivePayments([])
+        setLoadError(err instanceof Error ? err.message : 'Failed to load webhook logs')
+      })
+      .finally(() => setLoading(false))
   }
 
   useEffect(() => {
     fetchLogs()
-    fetchActivePayments()
   }, [])
 
   const handleSimulate = async () => {
@@ -123,13 +126,12 @@ export default function WebhooksPage() {
         setSimResult({
           success: true,
           status: result.status,
-          payload: result.simulatedPayload,
-          signatureHeader: result.signatureHeader,
-          response: result.data,
+          payload: null,
+          signatureHeader: null,
+          response: result,
         })
-        // Refresh logs and payments
+        // Refresh logs and the pending-payment list together
         fetchLogs()
-        fetchActivePayments()
       } else {
         toast({
           title: "Simulation Failed",
@@ -343,6 +345,24 @@ export default function WebhooksPage() {
         </div>
 
         <div className="px-6 md:px-16 lg:px-24 py-4 pb-8">
+          {/*
+            A failed load must look like a failure. This block used to be absent,
+            so a 404 from the (then non-existent) API rendered as a clean empty
+            state and the page looked healthy while showing nothing at all.
+          */}
+          {loadError && !loading && (
+            <div className="mb-4 flex items-start gap-3 border border-red-500/30 bg-red-500/5 rounded-sm p-4">
+              <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+              <div>
+                <p className="text-sm font-medium text-red-400">Could not load webhook logs</p>
+                <p className="text-xs text-foreground/60 mt-1">{loadError}</p>
+                <Button onClick={fetchLogs} variant="outline" size="sm" className="mt-2 gap-1">
+                  <RefreshCw className="w-3.5 h-3.5" /> Retry
+                </Button>
+              </div>
+            </div>
+          )}
+
           {loading ? (
             <div className="space-y-3">{Array.from({ length: 5 }).map((_, i) => <div key={i} className="h-16 bg-card border border-foreground/5 animate-pulse" />)}</div>
           ) : (

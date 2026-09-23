@@ -15,6 +15,8 @@ node_modules
 
 # next.js
 /.next/
+# dev-mode build output (next.config.ts sets distDir=.next-dev for development)
+/.next-dev/
 /out/
 
 # production
@@ -61,3 +63,13 @@ server.log
 /skills/
 # Debug scripts
 scripts/debug
+
+# Generated / tooling output that must never be committed
+/tool-results/
+/build-log*.txt
+/download/
+.zscripts/*.pid
+.zscripts/*.log
+
+# Local database files (the app runs on Postgres/Supabase)
+/db/

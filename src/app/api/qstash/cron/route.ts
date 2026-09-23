@@ -5,8 +5,10 @@ import { completePayment, enqueueWebhookNotification } from '@/lib/payments'
 import { verifyCronRequest } from '@/lib/qstash-verify'
 import { decrypt } from '@/lib/encryption'
 import { PLATFORM_FEE_TYPES } from '@/lib/constants'
+import { webhookSecretFromRow } from '@/lib/application-auth'
+import { safeJsonObject } from '@/lib/json'
 
-export async function POST(request: Request) {
+async function handleCron(request: Request) {
   try {
     const isAuthorized = await verifyCronRequest(request)
     if (!isAuthorized) {
@@ -19,11 +21,17 @@ export async function POST(request: Request) {
     
     // 1. Find all pending or processing payments older than 30 seconds
     const thirtySecondsAgo = new Date(Date.now() - 30_000)
-    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000)
+    // 24h was too narrow: a payment the provider never resolved silently fell
+    // out of the poller and was never reconciled again. It is now polled for a
+    // week and anything older surfaces through /api/cron/alerts.
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+    const pollCutoff = new Date(Date.now() - 30_000)
     const pendingPayments = await db.paymentIntent.findMany({
       where: {
         status: { in: ['pending', 'processing'] },
-        createdAt: { lte: thirtySecondsAgo, gte: twentyFourHoursAgo },
+        createdAt: { lte: thirtySecondsAgo, gte: sevenDaysAgo },
+        // Skip rows another worker polled in the last 30 seconds.
+        OR: [{ lastPolledAt: null }, { lastPolledAt: { lte: pollCutoff } }],
         ...(appCode ? { application: { code: appCode } } : {}),
       },
       include: {
@@ -32,6 +40,9 @@ export async function POST(request: Request) {
         tenant: true,
         paymentType: true,
       },
+      // Least-recently-polled first (never-polled rows first) so a backlog
+      // cannot monopolise every batch.
+      orderBy: [{ lastPolledAt: { sort: 'asc', nulls: 'first' } }, { createdAt: 'asc' }],
       take: 50,
     })
 
@@ -90,9 +101,9 @@ export async function POST(request: Request) {
                 failureReason: result.failureReason,
                 applicationId: payment.applicationId,
                 webhookUrl: `${payment.application.baseUrl}${payment.application.webhookPath}`,
-                apiKey: payment.application.apiKey,
+                webhookSecret: webhookSecretFromRow(payment.application),
                 externalEntityId: payment.externalEntityId,
-                metadata: payment.metadata ? JSON.parse(payment.metadata) : {},
+                metadata: safeJsonObject(payment.metadata),
               })
             }
 
@@ -103,6 +114,8 @@ export async function POST(request: Request) {
         }
       } catch (err: any) {
         pollResults.push({ id: payment.id, reference: payment.reference, status: 'error', polledStatus: err.message })
+      } finally {
+        await markPolled(db, payment.id)
       }
     }
 
@@ -115,5 +128,29 @@ export async function POST(request: Request) {
   } catch (error: any) {
     console.error('QStash cron error:', error)
     return NextResponse.json({ error: error.message || 'Internal server error' }, { status: 500 })
+  }
+}
+
+// Vercel Cron issues GET requests; QStash and manual triggers use POST.
+export async function GET(request: Request) {
+  return handleCron(request)
+}
+
+export async function POST(request: Request) {
+  return handleCron(request)
+}
+
+/**
+ * Stamp the poll attempt so the next batch rotates to other payments.
+ * Best effort: a failure here must not fail the whole cron run.
+ */
+async function markPolled(client: typeof db, paymentIntentId: string): Promise<void> {
+  try {
+    await client.paymentIntent.update({
+      where: { id: paymentIntentId },
+      data: { lastPolledAt: new Date() },
+    })
+  } catch (error) {
+    console.error(`[poll] failed to record poll attempt for ${paymentIntentId}:`, error)
   }
 }

@@ -1,15 +1,31 @@
 import { NextResponse, after } from 'next/server'
 import { db } from '@/lib/db'
-import { smsStore } from '@/lib/sms-store'
+import { smsStore, SMS_COST_PLACEHOLDER } from '@/lib/sms-store'
 import { smsQueue } from '@/lib/sms-queue'
-import { requireAuth } from '@/lib/auth'
+import { requireSuperAdmin } from '@/lib/auth'
+import { checkRateLimit } from '@/lib/rate-limit'
+import { z } from 'zod'
+
+const QuickSendSchema = z.object({
+  to: z.string().min(9).max(20),
+  message: z.string().min(1).max(918),
+  applicationCode: z.string().min(1).max(64).optional(),
+})
 
 export async function POST(request: Request) {
   try {
-    // 1. Enforce dashboard session authentication
+    // 1. Enforce dashboard session authentication.
+    //
+    // SECURITY: this previously used requireAuth(), so ANY authenticated
+    // Supabase user (including tenant end-users) could send SMS billed to the
+    // platform. Sending from the dashboard is now super-admin only.
     try {
-      await requireAuth()
-    } catch {
+      await requireSuperAdmin()
+    } catch (authErr) {
+      const message = authErr instanceof Error ? authErr.message : 'Unauthorized'
+      if (message.includes('Forbidden')) {
+        return NextResponse.json({ error: 'Forbidden: Super Admin required' }, { status: 403 })
+      }
       return NextResponse.json({ error: 'Unauthorized: Log in to use dashboard quick send' }, { status: 401 })
     }
 
@@ -18,11 +34,21 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Unsupported media type' }, { status: 415 })
     }
 
-    const { to, message, applicationCode } = await request.json()
-
-    if (!to || !message) {
-      return NextResponse.json({ error: 'Recipient (to) and message content are required' }, { status: 400 })
+    // Dashboard quick-send spends platform SMS credit on one click — cap it.
+    const decision = await checkRateLimit('quick-send', 'dashboard', { tokens: 30, window: '1 m' })
+    if (!decision.ok) {
+      return NextResponse.json(
+        { error: decision.message },
+        { status: decision.status, headers: decision.retryAfter ? { 'Retry-After': decision.retryAfter } : {} }
+      )
     }
+
+    const parsed = QuickSendSchema.safeParse(await request.json())
+    if (!parsed.success) {
+      const details = parsed.error.issues.map((issue) => `${issue.path.join('.') || 'body'}: ${issue.message}`)
+      return NextResponse.json({ error: 'Validation failed', details }, { status: 400 })
+    }
+    const { to, message, applicationCode } = parsed.data
 
     // 2. Resolve target application
     const appCode = applicationCode || 'church'
@@ -41,7 +67,9 @@ export async function POST(request: Request) {
       message,
       applicationCode: application?.code || appCode,
       providerCode: 'africastalking',
-      cost: 50,
+      // Placeholder until the provider reports the real charge; overwritten
+      // by smsQueue via smsStore.updateProviderCost(). See SMS_COST_PLACEHOLDER.
+      cost: SMS_COST_PLACEHOLDER,
       applicationId: application?.id,
     })
 

@@ -1,0 +1,73 @@
+name: CI
+
+# Until this existed, "the build is green" meant someone had run three commands
+# by hand. Everything below runs on every push and pull request.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Typecheck, lint, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Prisma needs a URL to *generate* a client but does not connect while
+    # generating, so a placeholder is enough. The build gets the full set of
+    # production variables as placeholders so that boot-time validation can
+    # never make a build depend on which phase hooks happen to run.
+    env:
+      DATABASE_URL: postgresql://user:pass@localhost:5432/ci
+      DIRECT_URL: postgresql://user:pass@localhost:5432/ci
+      NEXT_PUBLIC_SUPABASE_URL: https://placeholder.supabase.co
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ci-placeholder-anon-key
+      SUPABASE_SERVICE_ROLE_KEY: ci-placeholder-service-role-key
+      APP_ENCRYPTION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+      SUPER_ADMIN_EMAILS: ci@example.com
+      NEXTAUTH_URL: https://ci.example.com
+      LIVEPAY_API_KEY: ci-placeholder
+      LIVEPAY_ACCOUNT_NO: ci-placeholder
+      LIVEPAY_WEBHOOK_SECRET: ci-placeholder-webhook-secret
+      AFRICASTALKING_API_KEY: ci-placeholder
+      AFRICASTALKING_USERNAME: sandbox
+      AFRICASTALKING_CALLBACK_SECRET: ci-placeholder-callback-secret
+      UPSTASH_REDIS_REST_URL: https://placeholder.upstash.io
+      UPSTASH_REDIS_REST_TOKEN: ci-placeholder-token
+      CRON_SECRET: ci-placeholder-cron-secret-16chars
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Must be >= 22.6: `npm test` runs the suites with
+          # `node --experimental-strip-types`, which does not exist on Node 20
+          # ("node: bad option: --experimental-strip-types"). The app itself
+          # still builds and runs on Node 20 — only the test tooling needs 22+,
+          # which is where the suites were verified.
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Prisma schema is valid
+        run: npx prisma validate
+
+      - name: Build
+        run: npm run build

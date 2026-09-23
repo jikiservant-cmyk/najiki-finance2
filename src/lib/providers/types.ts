@@ -19,8 +19,23 @@ export interface PaymentProvider {
   // Check payment status (optional, but some providers require it)
   checkPaymentStatus?(reference: string, currency?: string, providerPaymentId?: string): Promise<PaymentStatusResponse>
 
-  // Validate webhook signature
-  validateWebhookSignature(payload: string, signature: string, headers?: Record<string, string>, requestUrl?: string): Promise<boolean>
+  /**
+   * Validate an inbound webhook signature.
+   *
+   * @param payload        exact raw request body (never a re-serialized copy)
+   * @param signature      signature header value
+   * @param headers        all request headers, lower-cased keys
+   * @param requestUrl     canonical public URL the webhook was delivered to
+   * @param additionalUrls other acceptable base URLs (env-configured origins),
+   *                       tried only after `requestUrl`
+   */
+  validateWebhookSignature(
+    payload: string,
+    signature: string,
+    headers?: Record<string, string>,
+    requestUrl?: string,
+    additionalUrls?: string[]
+  ): Promise<boolean>
 
   // Parse webhook payload into standard format
   parseWebhookPayload(payload: any): Promise<ParsedWebhook>

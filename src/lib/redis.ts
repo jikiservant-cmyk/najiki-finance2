@@ -4,6 +4,33 @@ import { Redis } from '@upstash/redis'
 class MockRedis {
   private store: Record<string, string[]> = {}
   private hashStore: Record<string, Record<string, string>> = {}
+  private setStore: Record<string, Set<string>> = {}
+
+  async sadd(key: string, ...members: string[]): Promise<number> {
+    if (!this.setStore[key]) this.setStore[key] = new Set()
+    let added = 0
+    for (const member of members) {
+      if (!this.setStore[key].has(member)) {
+        this.setStore[key].add(member)
+        added++
+      }
+    }
+    return added
+  }
+
+  async srem(key: string, ...members: string[]): Promise<number> {
+    const set = this.setStore[key]
+    if (!set) return 0
+    let removed = 0
+    for (const member of members) {
+      if (set.delete(member)) removed++
+    }
+    return removed
+  }
+
+  async scard(key: string): Promise<number> {
+    return this.setStore[key]?.size ?? 0
+  }
 
   async lpush(key: string, ...elements: string[]): Promise<number> {
     if (!this.store[key]) {
@@ -56,11 +83,23 @@ export function getRedis(): Redis {
     return _redisInstance
   }
 
+  // FAIL CLOSED in production.
+  //
+  // The in-memory MockRedis is per-process and is wiped on every cold start /
+  // redeploy. Running production on it silently loses the SMS queue and any
+  // other queued state, and behaves differently on every serverless instance.
+  // Previously this only logged a warning and carried on.
   if (process.env.NODE_ENV === 'production' && process.env.NEXT_PHASE !== 'phase-production-build') {
-    console.warn('WARN: UPSTASH_REDIS_REST_URL not configured in production, falling back to mock.')
-  } else {
-    console.warn('WARN: Using in-memory MockRedis. This should only be used in local development.')
+    console.error(
+      'FATAL: UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN are not configured. ' +
+        'The in-memory fallback is not safe in production (state is lost on every cold start).'
+    )
+    throw new Error(
+      'Redis is not configured: set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN in production.'
+    )
   }
+
+  console.warn('WARN: Using in-memory MockRedis. This should only be used in local development.')
 
   _redisInstance = new MockRedis() as any as Redis
   return _redisInstance

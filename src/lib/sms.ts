@@ -7,7 +7,19 @@ export async function sendSmsViaProvider(to: string, message: string, fromSender
   const senderId = fromSenderId || process.env.AFRICASTALKING_SENDER_ID || undefined
 
   if (!apiKey) {
-    console.log(`[SMS Simulation] Sending to ${to}: "${message}"`)
+    // FAIL CLOSED in production.
+    //
+    // Previously this branch "simulated" a successful delivery (and returned a
+    // fake providerId) whenever AFRICASTALKING_API_KEY was missing. In
+    // production that meant every SMS was recorded as delivered while nothing
+    // was ever sent — silent data corruption plus wasted billing records.
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'SMS provider is not configured: AFRICASTALKING_API_KEY is missing. Refusing to simulate delivery in production.'
+      )
+    }
+
+    console.log(`[SMS Simulation] (development only) Sending to ${to}: "${message}"`)
     // Mock delivery delay for demonstration
     await new Promise((resolve) => setTimeout(resolve, 500))
     return { success: true, providerId: 'sim_' + Math.random().toString(36).substring(2, 11) }
@@ -35,11 +47,20 @@ export async function sendSmsViaProvider(to: string, message: string, fromSender
     let recipientData = result.SMSMessageData?.Recipients?.[0]
     let status = recipientData?.status || ''
 
-    // If an explicitly configured senderId failed due to InvalidSenderId, retry without 'from' so delivery succeeds
-    if (
-      sendOptions.from &&
-      (!recipientData || result.SMSMessageData?.Message === 'InvalidSenderId' || status.toLowerCase() === 'invalidsenderid')
-    ) {
+    // If an explicitly configured senderId was rejected as InvalidSenderId,
+    // retry without 'from' so delivery can succeed via the default route.
+    //
+    // The condition used to include `!recipientData`, meaning ANY response
+    // without a Recipients array triggered a second real send. If the first
+    // send had actually succeeded and simply returned an empty array, the
+    // message went out twice and was billed twice. Only an explicit
+    // sender-ID rejection justifies a retry now.
+    const senderIdRejected =
+      result.SMSMessageData?.Message === 'InvalidSenderId' ||
+      String(status || '').toLowerCase() === 'invalidsenderid' ||
+      String(recipientData?.status || '').toLowerCase().includes('invalidsenderid')
+
+    if (sendOptions.from && senderIdRejected) {
       console.warn(`[Africa's Talking] Sender ID "${sendOptions.from}" rejected as InvalidSenderId by telco. Retrying via default route...`)
       delete sendOptions.from
       result = await atClient.SMS.send(sendOptions)

@@ -7,9 +7,28 @@
 
 import { db } from '../src/lib/db'
 import crypto from 'crypto'
+import { encrypt } from '../src/lib/encryption'
+import { generateApiKey, hashApiKey, apiKeyHint } from '../src/lib/api-keys'
 
-function generateApiKey(): string {
-  return `nk_${crypto.randomBytes(24).toString('hex')}`
+/**
+ * Credentials for a seeded application.
+ *
+ * The API key is hashed for authentication and the webhook secret is encrypted
+ * for signing — the cleartext key is printed once and never stored, exactly as
+ * the setup API does it. Seeding a plaintext `apiKey` would put cleartext
+ * credentials back in the database this migration exists to clean up.
+ */
+function credentials() {
+  const apiKey = generateApiKey()
+  return {
+    plaintextApiKey: apiKey,
+    data: {
+      apiKeyHash: hashApiKey(apiKey),
+      apiKeyHint: apiKeyHint(apiKey),
+      apiKeyRotatedAt: new Date(),
+      webhookSecretEncrypted: encrypt(`njk_whsec_${crypto.randomBytes(32).toString('base64url')}`),
+    },
+  }
 }
 
 async function seed() {
@@ -18,35 +37,47 @@ async function seed() {
     data: { code: 'livepay', name: 'LivePay', credentialsRef: 'LIVEPAY_', isActive: true },
   })
   const mtn = await db.provider.create({
-    data: { code: 'mtn', name: 'MTN MoMo', credentialsRef: 'MTN_', isActive: true },
+    // Seeded INACTIVE on purpose: there is no adapter for this provider, and
+    // an active row with no implementation is a payment failure waiting to
+    // happen (see IMPLEMENTED_PROVIDER_CODES in src/lib/providers/index.ts).
+    // Flip isActive only when the adapter ships.
+    data: { code: 'mtn', name: 'MTN MoMo', credentialsRef: 'MTN_', isActive: false },
   })
   const airtel = await db.provider.create({
-    data: { code: 'airtel', name: 'Airtel Money', credentialsRef: 'AIRTEL_', isActive: true },
+    // Seeded INACTIVE on purpose: there is no adapter for this provider, and
+    // an active row with no implementation is a payment failure waiting to
+    // happen (see IMPLEMENTED_PROVIDER_CODES in src/lib/providers/index.ts).
+    // Flip isActive only when the adapter ships.
+    data: { code: 'airtel', name: 'Airtel Money', credentialsRef: 'AIRTEL_', isActive: false },
   })
   const pesapal = await db.provider.create({
-    data: { code: 'pesapal', name: 'Pesapal', credentialsRef: 'PESAPAL_', isActive: true },
+    // Seeded INACTIVE on purpose: there is no adapter for this provider, and
+    // an active row with no implementation is a payment failure waiting to
+    // happen (see IMPLEMENTED_PROVIDER_CODES in src/lib/providers/index.ts).
+    // Flip isActive only when the adapter ships.
+    data: { code: 'pesapal', name: 'Pesapal', credentialsRef: 'PESAPAL_', isActive: false },
   })
 
   // === APPLICATIONS ===
-  const saccoApiKey = generateApiKey()
+  const saccoApiKey = credentials()
   const sacco = await db.application.create({
-    data: { code: 'sacco', name: 'SACCO Platform', baseUrl: 'https://sacco.yourdomain.com', webhookPath: '/api/internal/payment-completed', internalSecretRef: 'SACCO_INTERNAL_SECRET', apiKey: saccoApiKey, isActive: true },
+    data: { code: 'sacco', name: 'SACCO Platform', baseUrl: 'https://sacco.yourdomain.com', webhookPath: '/api/internal/payment-completed', internalSecretRef: 'SACCO_INTERNAL_SECRET', ...saccoApiKey.data, isActive: true },
   })
   
-  const churchApiKey = generateApiKey()
+  const churchApiKey = credentials()
   const church = await db.application.create({
-    data: { code: 'church', name: 'Church App', baseUrl: 'https://church.yourdomain.com', webhookPath: '/api/internal/payment-completed', internalSecretRef: 'CHURCH_INTERNAL_SECRET', apiKey: churchApiKey, isActive: true },
+    data: { code: 'church', name: 'Church App', baseUrl: 'https://church.yourdomain.com', webhookPath: '/api/internal/payment-completed', internalSecretRef: 'CHURCH_INTERNAL_SECRET', ...churchApiKey.data, isActive: true },
   })
   
-  const schoolApiKey = generateApiKey()
+  const schoolApiKey = credentials()
   const school = await db.application.create({
-    data: { code: 'school', name: 'School Platform', baseUrl: 'https://school.yourdomain.com', webhookPath: '/api/internal/payment-completed', internalSecretRef: 'SCHOOL_INTERNAL_SECRET', apiKey: schoolApiKey, isActive: true },
+    data: { code: 'school', name: 'School Platform', baseUrl: 'https://school.yourdomain.com', webhookPath: '/api/internal/payment-completed', internalSecretRef: 'SCHOOL_INTERNAL_SECRET', ...schoolApiKey.data, isActive: true },
   })
   
   console.log('Generated API keys:')
-  console.log('- SACCO:', saccoApiKey)
-  console.log('- Church:', churchApiKey)
-  console.log('- School:', schoolApiKey)
+  console.log('- SACCO:', saccoApiKey.plaintextApiKey)
+  console.log('- Church:', churchApiKey.plaintextApiKey)
+  console.log('- School:', schoolApiKey.plaintextApiKey)
 
   // === TENANTS ===
   const abcSacco = await db.tenant.create({

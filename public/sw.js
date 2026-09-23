@@ -1,25 +1,37 @@
 // Service Worker for Na'jiki PWA
-const CACHE_NAME = 'najiki-cache-v5';
+const CACHE_NAME = 'najiki-cache-v7';
 const OFFLINE_URL = '/offline';
 
+// NOTE: every entry here must actually exist, otherwise the request 404s.
+// The list previously included '/favicon.ico', which this app does not serve
+// (Next.js only emits /favicon.ico when src/app/favicon.ico exists) — so
+// cache.addAll() rejected and the ENTIRE precache silently failed, leaving the
+// offline page and all icons uncached.
 const PRECACHE_ASSETS = [
-  '/offline',
-  '/manifest.json',
+  OFFLINE_URL,
+  '/manifest.webmanifest',
   '/logo.svg',
   '/icons/icon-192x192.png',
   '/icons/icon-512x512.png',
   '/icons/icon-maskable-192x192.png',
+  '/icons/icon-maskable-512x512.png',
   '/icons/apple-touch-icon.png',
-  '/favicon.ico',
+  '/icons/favicon-32x32.png',
 ];
 
-// Install Event - Precache only true static assets (NEVER HTML pages)
+// Install Event - Precache static assets.
+// Each asset is cached independently so a single missing file can no longer
+// abort caching for everything else.
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
-      return cache.addAll(PRECACHE_ASSETS).catch((err) => {
-        console.warn('[SW] Precache error, continuing anyway:', err);
-      });
+      return Promise.all(
+        PRECACHE_ASSETS.map((asset) =>
+          cache.add(new Request(asset, { cache: 'reload' })).catch((err) => {
+            console.warn('[SW] Failed to precache', asset, err);
+          })
+        )
+      );
     }).then(() => self.skipWaiting())
   );
 });

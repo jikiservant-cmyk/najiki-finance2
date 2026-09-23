@@ -5,7 +5,7 @@ import { verifyCronRequest } from '@/lib/qstash-verify'
 // Optional: allow function to run longer on Vercel
 export const maxDuration = 60
 
-export async function POST(request: Request) {
+async function handleSmsCron(request: Request) {
   try {
     const isAuthorized = await verifyCronRequest(request)
     if (!isAuthorized) {
@@ -25,4 +25,13 @@ export async function POST(request: Request) {
     console.error('SMS cron error:', error)
     return NextResponse.json({ error: error.message || 'Internal server error' }, { status: 500 })
   }
+}
+
+// Vercel Cron issues GET requests; QStash and manual triggers use POST.
+export async function GET(request: Request) {
+  return handleSmsCron(request)
+}
+
+export async function POST(request: Request) {
+  return handleSmsCron(request)
 }

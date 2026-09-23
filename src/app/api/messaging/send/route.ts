@@ -1,25 +1,10 @@
 import { NextResponse } from 'next/server'
 import { after } from 'next/server'
 import { db } from '@/lib/db'
-import { smsStore } from '@/lib/sms-store'
+import { smsStore, SMS_COST_PLACEHOLDER } from '@/lib/sms-store'
 import { smsQueue } from '@/lib/sms-queue'
-import { Ratelimit } from '@upstash/ratelimit'
-import { Redis } from '@upstash/redis'
-
-// Use Upstash Redis for distributed rate limiting if configured
-let ratelimit: Ratelimit | null = null;
-try {
-  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
-    const redis = Redis.fromEnv()
-    ratelimit = new Ratelimit({
-      redis,
-      limiter: Ratelimit.slidingWindow(60, '1 m'), // 60 SMS requests per minute per application
-      analytics: true,
-    })
-  }
-} catch (e) {
-  console.warn('Failed to initialize rate limiter:', e)
-}
+import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
+import { findApplicationByApiKey } from '@/lib/application-auth'
 
 export function OPTIONS(request: Request) {
   const origin = request.headers.get('origin') || '*'
@@ -27,22 +12,43 @@ export function OPTIONS(request: Request) {
   if (process.env.NODE_ENV === 'production' && allowedOrigins.length === 0) {
     return new NextResponse(null, { status: 403, headers: { 'Access-Control-Allow-Origin': 'null' } })
   }
-  const allowedOrigin = allowedOrigins.length > 0 && allowedOrigins.includes(origin) ? origin : (allowedOrigins.length > 0 ? allowedOrigins[0] : '*')
+  const headers: Record<string, string> = {
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key',
+    'Vary': 'Origin',
+  }
 
-  return new NextResponse(null, {
-    status: 204,
-    headers: {
-      'Access-Control-Allow-Origin': allowedOrigin,
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key',
-    },
-  })
+  // Only echo back an origin we actually allow (see /api/payments for details).
+  if (allowedOrigins.length === 0) {
+    headers['Access-Control-Allow-Origin'] = '*'
+  } else if (allowedOrigins.includes(origin)) {
+    headers['Access-Control-Allow-Origin'] = origin
+  }
+
+  return new NextResponse(null, { status: 204, headers })
 }
 
 export async function POST(request: Request) {
   try {
+    const ipDecision = await checkRateLimit('sms-ip', clientIdentifier(request), { tokens: 120, window: '1 m' })
+    if (!ipDecision.ok) {
+      return NextResponse.json(
+        { error: ipDecision.message },
+        { status: ipDecision.status, headers: ipDecision.retryAfter ? { 'Retry-After': ipDecision.retryAfter } : {} }
+      )
+    }
+
     const rawBody = await request.json()
     const { to, message, applicationCode, from, senderId, apiKey: bodyApiKey } = rawBody
+
+    // Standard `Idempotency-Key` header, with the body field as a fallback for
+    // clients that cannot set headers.
+    const idempotencyKey = (
+      request.headers.get('Idempotency-Key') ||
+      request.headers.get('idempotency-key') ||
+      rawBody.idempotencyKey ||
+      ''
+    ).toString().trim().slice(0, 255) || null
 
     if (!to || !message) {
       return NextResponse.json({ error: 'Recipient (to) and message content are required' }, { status: 400 })
@@ -65,14 +71,15 @@ export async function POST(request: Request) {
 
     let application: any = null
 
-    // 2. Authenticate against the registered applications
+    // 2. Authenticate against the registered applications.
+    // Hash-first, with a fallback to the legacy cleartext column — see
+    // src/lib/application-auth.ts.
     if (apiKey) {
       try {
-        application = await db.application.findFirst({
-          where: { apiKey, isActive: true },
-        })
+        const auth = await findApplicationByApiKey(apiKey)
+        application = auth?.application ?? null
       } catch (dbErr) {
-        console.warn('[Messaging API] DB lookup by apiKey failed:', dbErr)
+        console.warn('[Messaging API] DB lookup by API key failed:', dbErr)
       }
     }
 
@@ -84,61 +91,64 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Application code mismatch' }, { status: 403 })
     }
 
-    if (ratelimit) {
-      try {
-        const ratelimitPromise = ratelimit.limit(`sms_${apiKey}`)
-        const timeoutPromise = new Promise<{success: boolean}>((_, reject) => 
-          setTimeout(() => reject(new Error('Rate limit timeout')), 1000)
-        )
-        const { success } = await Promise.race([ratelimitPromise, timeoutPromise])
-        if (!success) {
-          return NextResponse.json(
-            { error: 'Too many requests' },
-            { status: 429, headers: { 'Retry-After': '60' } }
-          )
-        }
-      } catch (ratelimitError) {
-        console.warn('Rate limiter failed or timed out:', ratelimitError)
-        if (process.env.NODE_ENV === 'production') {
-          return NextResponse.json({ error: 'Service temporarily unavailable' }, { status: 503 })
-        }
-      }
+    const keyDecision = await checkRateLimit('sms-key', apiKey, { tokens: 60, window: '1 m' })
+    if (!keyDecision.ok) {
+      return NextResponse.json(
+        { error: keyDecision.message },
+        { status: keyDecision.status, headers: keyDecision.retryAfter ? { 'Retry-After': keyDecision.retryAfter } : {} }
+      )
     }
 
     const appCode = application.code
     const appId = application.id
     const customSender = from || senderId || undefined
 
-    // 5. Create the SMS request in our Redis store (no schema change!)
-    const smsRequest = await smsStore.create({
+    // 5. Create the message record, deduplicated on the caller's key if given.
+    // A partner whose request times out cannot tell whether the SMS was sent,
+    // so the sane retry is the same request again. Without this, every retry
+    // is a second SMS and a second charge.
+    const { sms: smsRequest, created } = await smsStore.createOrGet({
       recipient: to,
       message,
       applicationCode: appCode,
       providerCode: 'africastalking', // default provider
-      cost: 50, // standard rate in UGX
+      // Placeholder until the provider reports the real charge; overwritten
+      // by smsQueue via smsStore.updateProviderCost(). See SMS_COST_PLACEHOLDER.
+      cost: SMS_COST_PLACEHOLDER,
       applicationId: appId,
       senderId: customSender,
+      idempotencyKey,
     })
 
-    // 6. Push to Redis queue for background execution
-    await smsQueue.enqueue(smsRequest.id)
+    // A reused record has already been queued and is on its way. Re-enqueuing
+    // it would send the message a second time, which is the exact bug this
+    // guards against.
+    if (created) {
+      // 6. Push to the queue for background execution
+      await smsQueue.enqueue(smsRequest.id)
 
-    // Trigger the worker asynchronously using Next.js 15 'after' API if available in request context
-    try {
-      after(() => {
-        smsQueue.processBatch(5).catch(err => console.error('Background worker error:', err))
-      })
-    } catch {
-      // Fallback: smsQueue.enqueue already triggered detached background batch processing
+      // Trigger the worker asynchronously using Next.js 15 'after' API if available in request context
+      try {
+        after(() => {
+          smsQueue.processBatch(5).catch(err => console.error('Background worker error:', err))
+        })
+      } catch {
+        // Fallback: smsQueue.enqueue already triggered detached background batch processing
+      }
     }
 
     // 7. Return 202 Accepted fast-path
     return NextResponse.json({
       success: true,
-      message: 'SMS send job queued successfully',
+      message: created
+        ? 'SMS send job queued successfully'
+        : 'Duplicate request — the original SMS job was returned',
       smsId: smsRequest.id,
       reference: smsRequest.reference,
       status: smsRequest.status,
+      deduplicated: !created,
+      // Relative to when the ORIGINAL request was accepted, not this one.
+      createdAt: smsRequest.createdAt,
     }, { status: 202 })
 
   } catch (error) {

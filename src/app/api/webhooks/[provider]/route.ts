@@ -1,61 +1,99 @@
-// FIX 1: Add SHA-256 signatureHash idempotency — LivePay retries a webhook,
-//         same hash → we skip processing, return 200. No duplicate notifications.
-// FIX 2: Move webhookLog "mark processed" update INSIDE the db.$transaction()
-//         Previously it ran after the tx committed. If it failed, LivePay would
-//         retry → duplicate transaction log + duplicate notification.
-// FIX 3: Add wallet updates based on application type!
+// Inbound provider webhooks (LivePay etc).
+//
+// Ordering and trust rules enforced here:
+//
+//   1. rate limit + body size cap        ← cheap guards before any DB work
+//   2. resolve provider / tenant creds   ← read-only
+//   3. VERIFY THE SIGNATURE              ← nothing is written before this
+//   4. idempotency (event hash)          ← dedupe on the provider's event identity
+//                                          (an UNFINISHED row is resumed, not
+//                                          acknowledged — see webhook-dedupe.ts)
+//   5. load intent → provider must match this route → amount/currency gates
+//      → completePayment()
+//
+// Previously the audit row was inserted *before* verification and the
+// invalid-signature path marked it `processed: true`. Because the dedupe check
+// short-circuits on `processed`, an attacker who knew a payment's provider-side
+// identifier could pre-seed the hash and cause the genuine webhook to be
+// acknowledged as a duplicate and never processed.
 
 import { NextResponse } from 'next/server'
-import { createHash } from 'crypto'
 import { db } from '@/lib/db'
-import { getPaymentProvider, getAvailableProviders } from '@/lib/providers'
+import { getAvailableProviders, getPaymentProvider } from '@/lib/providers'
 import { createWebhookLog, getPaymentByReference } from '@/lib/data'
-import { PrismaClient } from '@prisma/client'
 import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
 import { decrypt } from '@/lib/encryption'
+import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
+import { computeWebhookEventHash } from '@/lib/webhook-hash'
+import { webhookSecretFromRow } from '@/lib/application-auth'
+import { redactPhoneNumbersInText } from '@/lib/redact'
+import { buildSignatureUrlCandidates } from '@/lib/webhook-url'
+import { readTextWithLimit } from '@/lib/request-body'
+import { safeJsonObject } from '@/lib/json'
+import { decideWebhookLogAction } from '@/lib/webhook-dedupe'
+
+/** Providers retry with at-least-once semantics; 64 KB is far above any real payload. */
+const MAX_WEBHOOK_BYTES = 64 * 1024
 
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ provider: string }> }
 ) {
+  const { provider: providerCode } = await params
+  const normalizedProvider = String(providerCode || '').toLowerCase()
+
   try {
-    const { provider: providerCode } = await params
-    const rawBody = await request.text()
+    // ── 1. Unauthenticated-endpoint guards ─────────────────────────────────
+    const ipDecision = await checkRateLimit('webhook-inbound', clientIdentifier(request), {
+      tokens: 120,
+      window: '1 m',
+    })
+    if (!ipDecision.ok) {
+      return NextResponse.json(
+        { error: ipDecision.message },
+        { status: ipDecision.status, headers: ipDecision.retryAfter ? { 'Retry-After': ipDecision.retryAfter } : {} }
+      )
+    }
+
+    // Read with the cap applied DURING the read. The previous version checked
+    // `content-length` and then called `request.text()`, which buffers the whole
+    // body first — a chunked request omits content-length, so nothing bounded
+    // the allocation on an endpoint that is reachable without credentials.
+    let rawBody: string
+    try {
+      rawBody = await readTextWithLimit(request, MAX_WEBHOOK_BYTES)
+    } catch (readError: any) {
+      if (readError?.name === 'PayloadTooLargeError' || readError?.limitBytes) {
+        return NextResponse.json({ error: 'Payload too large' }, { status: 413 })
+      }
+      throw readError
+    }
+
     const signature =
       request.headers.get('x-webhook-signature') ||
       request.headers.get('signature') ||
       ''
 
-    if (!getAvailableProviders().includes(providerCode.toLowerCase())) {
+    if (!getAvailableProviders().includes(normalizedProvider)) {
       return NextResponse.json({ error: 'Invalid provider' }, { status: 400 })
     }
 
-    // P0-6: Build idempotency hash based on event identity (not ephemeral timestamped signature)
-    let providerEventId: string | null = null
-    let tentativeStatus: string | null = null
-    let tentativeReference: string | null = null
+    // ── 2. Resolve provider + tenant credentials (read-only) ────────────────
+    let parsedBody: Record<string, unknown> | null = null
     try {
-      const parsedBody = JSON.parse(rawBody)
-      providerEventId = parsedBody.internal_reference || parsedBody.transactionId || null
-      tentativeStatus = parsedBody.status || null
-      tentativeReference = parsedBody.customer_reference || parsedBody.reference || null
-    } catch {}
-
-    const signatureHash = providerEventId
-      ? createHash('sha256').update(`ev:${providerCode}:${providerEventId}:${tentativeStatus}`).digest('hex')
-      : createHash('sha256').update(`bd:${providerCode}:${rawBody}`).digest('hex')
-
-    // FIX 1: Check for duplicate delivery
-    const existingLog = await db.webhookLog.findUnique({ where: { signatureHash } })
-    if (existingLog?.processed) {
-      // Already handled — tell LivePay we got it so it stops retrying
-      return NextResponse.json({ success: true, duplicate: true })
+      const parsed = JSON.parse(rawBody)
+      parsedBody = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null
+    } catch {
+      parsedBody = null
     }
 
+    const tentativeReference =
+      (parsedBody?.customer_reference as string) || (parsedBody?.reference as string) || null
+
     const provider = await db.provider.findFirst({
-      where: { code: providerCode.toLowerCase(), isActive: true },
+      where: { code: normalizedProvider, isActive: true },
     })
-    
+
     if (!provider) {
       return NextResponse.json({ error: 'Provider not active' }, { status: 404 })
     }
@@ -79,47 +117,110 @@ export async function POST(
       }
     }
 
-    const providerClient = getPaymentProvider(providerCode, customCredentials)
+    const providerClient = getPaymentProvider(normalizedProvider, customCredentials)
 
-    const host = request.headers.get('x-forwarded-host') || request.headers.get('host') || 'localhost:3000'
-    const protocol = request.headers.get('x-forwarded-proto') || 'https'
-    const pathname = new URL(request.url).pathname
-    const publicUrl = `${protocol}://${host}${pathname}`
+    // Canonical public URL. The signature string embeds the webhook URL, so it
+    // is derived from configured origins rather than from a caller-supplied
+    // `x-forwarded-host`. The forwarded host is only used as a last resort in
+    // development (see buildSignatureUrlCandidates).
+    const publicUrl = buildSignatureUrlCandidates(request)
 
     const isValidSignature = await providerClient.validateWebhookSignature(
       rawBody,
       signature,
       Object.fromEntries(request.headers.entries()),
-      publicUrl
+      publicUrl[0],
+      publicUrl.slice(1)
     )
 
-    // P1-7: Mask customer phone numbers in stored payload for Uganda Data Protection Act compliance
-    const sanitizedPayload = rawBody.replace(
-      /(\+?[0-9]{3})[0-9]{3,6}([0-9]{3})/g,
-      '$1****$2'
-    )
-
-    // Log receipt even for invalid signatures (audit trail)
-    const webhookLog = await createWebhookLog({
-      provider: providerCode,
-      eventType: 'WEBHOOK_RECEIVED',
-      payload: sanitizedPayload,
-      signature,
-      signatureHash,
-      verified: isValidSignature,
-      processed: false,
-    })
-
+    // ── 3. Verify BEFORE writing anything ──────────────────────────────────
     if (!isValidSignature) {
-      await db.webhookLog.update({
-        where: { id: webhookLog.id },
-        data: { processingError: 'Invalid signature', processed: true },
-      })
+      console.warn(
+        `[Webhook] Rejected ${normalizedProvider} delivery: signature verification failed (bodyHash=${rawBody.length}b)`
+      )
+      // Intentionally NOT persisted: a caller who can write `processed` rows
+      // pre-verification can suppress the genuine delivery that follows.
+      // Rejected attempts are visible in logs and counted by the alerts worker.
       return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
     }
 
-    const body = JSON.parse(rawBody)
-    const parsedWebhook = await providerClient.parseWebhookPayload(body)
+    const { hash: signatureHash, strategy } = computeWebhookEventHash({
+      providerCode: normalizedProvider,
+      rawBody,
+      parsedBody,
+    })
+
+    // ── 4. Idempotency ─────────────────────────────────────────────────────
+    const existingLog = await db.webhookLog.findUnique({ where: { signatureHash } })
+    if (decideWebhookLogAction(existingLog) === 'duplicate') {
+      // Genuinely finished — acknowledge so the provider stops retrying.
+      return NextResponse.json({ success: true, duplicate: true })
+    }
+
+    const sanitizedPayload = redactPhoneNumbersInText(rawBody)
+
+    // An existing-but-unfinished row is RESUMED, not duplicated.
+    //
+    // The row is written with `processed: false` before any work happens, so if
+    // a previous delivery died part-way (DB blip, timeout, a lost race on the
+    // wallet balance) that row is still here. Attempting a fresh insert would
+    // hit the unique key, and the old code answered 200 {duplicate: true} — the
+    // provider stopped retrying and the payment never settled, silently. Reusing
+    // the row lets the delivery complete; every step below is idempotent, so
+    // running it twice is harmless.
+    let resolvedLog: { id: string } | null = existingLog
+
+    if (!resolvedLog) {
+      try {
+        resolvedLog = await createWebhookLog({
+          provider: normalizedProvider,
+          eventType: 'WEBHOOK_RECEIVED',
+          payload: sanitizedPayload,
+          signature,
+          signatureHash,
+          verified: true,
+          processed: false,
+        })
+      } catch (logError: any) {
+        if (logError?.code !== 'P2002') throw logError
+
+        // Another delivery of this event inserted the row between our read and
+        // this insert. Re-read to find out whether it *finished* or is still in
+        // flight / died: only a finished row is a duplicate.
+        const concurrent = await db.webhookLog.findUnique({ where: { signatureHash } })
+        if (!concurrent) throw logError
+
+        if (decideWebhookLogAction(concurrent) === 'duplicate') {
+          return NextResponse.json({ success: true, duplicate: true })
+        }
+        resolvedLog = concurrent
+      }
+    }
+
+    // Narrowed once, explicitly: the compiler cannot see that every branch above
+    // either assigns or returns, and the rest of the handler needs a non-null id.
+    if (!resolvedLog) {
+      throw new Error('webhook log row missing after dedupe resolution')
+    }
+    const webhookLog: { id: string } = resolvedLog
+
+    if (!parsedBody) {
+      await db.webhookLog.update({
+        where: { id: webhookLog.id },
+        data: { processed: true, processingError: 'Malformed JSON body' },
+      })
+      return NextResponse.json({ error: 'Malformed JSON body' }, { status: 400 })
+    }
+
+    const parsedWebhook = await providerClient.parseWebhookPayload(parsedBody)
+
+    if (!parsedWebhook.reference) {
+      await db.webhookLog.update({
+        where: { id: webhookLog.id },
+        data: { processed: true, processingError: 'Missing payment reference' },
+      })
+      return NextResponse.json({ error: 'Missing payment reference' }, { status: 400 })
+    }
 
     // O(1) lookup on @unique index — replaces old full-table scan
     const paymentIntent = await getPaymentByReference(parsedWebhook.reference)
@@ -132,10 +233,9 @@ export async function POST(
       return NextResponse.json({ error: 'Payment not found' }, { status: 404 })
     }
 
-    // Fetch the full application to know which type we're dealing with
     const fullPaymentIntent = await db.paymentIntent.findUnique({
       where: { id: paymentIntent.id },
-      include: { application: true, tenant: true },
+      include: { application: true, tenant: true, provider: { select: { code: true } } },
     })
 
     if (!fullPaymentIntent) {
@@ -146,15 +246,41 @@ export async function POST(
       return NextResponse.json({ error: 'Payment not found' }, { status: 404 })
     }
 
-    const normalizedStatus = parsedWebhook.status.toLowerCase()
+    // ── The intent must belong to the provider that signed this request ─────
+    // Otherwise a callback signed by provider A can settle a payment created
+    // through provider B: the signature verifies against A's secret, the
+    // reference is a B reference, and the amount/currency gates below compare
+    // against the stored intent — so a *correctly sized* A-signed body would
+    // flip a B payment to success. Harmless while exactly one provider is
+    // implemented, which is precisely why it must be enforced before a second
+    // adapter is added (see IMPLEMENTED_PROVIDER_CODES).
+    if (String(fullPaymentIntent.provider?.code || '').toLowerCase() !== normalizedProvider) {
+      await db.webhookLog.update({
+        where: { id: webhookLog.id },
+        data: {
+          paymentIntentId: paymentIntent.id,
+          processed: true,
+          processingError:
+            `PROVIDER_MISMATCH intent=${fullPaymentIntent.provider?.code} route=${normalizedProvider}`,
+        },
+      })
+      console.error(
+        `[Webhook] Rejected ${normalizedProvider} callback for ${paymentIntent.reference}: ` +
+          `payment belongs to provider "${fullPaymentIntent.provider?.code}".`
+      )
+      return NextResponse.json({ error: 'Provider mismatch' }, { status: 409 })
+    }
 
-    // P0-2: HARD GATE — Verify reported amount and currency against stored intent
+    const normalizedStatus = String(parsedWebhook.status || '').toLowerCase()
+
+    // ── 5. Amount / currency gates against the stored intent ───────────────
     const expectedAmount = Number(paymentIntent.amount)
-    const reportedAmount = parsedWebhook.amount !== undefined && parsedWebhook.amount !== null
-      ? Number(parsedWebhook.amount)
-      : expectedAmount
+    const reportedAmount =
+      parsedWebhook.amount !== undefined && parsedWebhook.amount !== null
+        ? Number(parsedWebhook.amount)
+        : expectedAmount
 
-    if (Math.abs(expectedAmount - reportedAmount) > 0.001) {
+    if (!Number.isFinite(reportedAmount) || Math.abs(expectedAmount - reportedAmount) > 0.001) {
       await db.webhookLog.update({
         where: { id: webhookLog.id },
         data: {
@@ -167,15 +293,20 @@ export async function POST(
         data: {
           paymentIntentId: paymentIntent.id,
           status: 'disputed',
-          rawProviderResponse: rawBody,
+          rawProviderResponse: sanitizedPayload,
           note: `AMOUNT_MISMATCH | expected ${expectedAmount} ${paymentIntent.currency}, got ${reportedAmount} ${parsedWebhook.currency || ''}`,
         },
       })
-      console.error(`[Webhook] Amount mismatch on ${paymentIntent.reference}: expected ${expectedAmount}, reported ${reportedAmount}`)
+      console.error(
+        `[Webhook] Amount mismatch on ${paymentIntent.reference}: expected ${expectedAmount}, reported ${reportedAmount}`
+      )
       return NextResponse.json({ error: 'Amount mismatch' }, { status: 422 })
     }
 
-    if (parsedWebhook.currency && parsedWebhook.currency.toUpperCase() !== paymentIntent.currency.toUpperCase()) {
+    if (
+      parsedWebhook.currency &&
+      String(parsedWebhook.currency).toUpperCase() !== String(paymentIntent.currency).toUpperCase()
+    ) {
       await db.webhookLog.update({
         where: { id: webhookLog.id },
         data: {
@@ -188,20 +319,18 @@ export async function POST(
         data: {
           paymentIntentId: paymentIntent.id,
           status: 'disputed',
-          rawProviderResponse: rawBody,
+          rawProviderResponse: sanitizedPayload,
           note: `CURRENCY_MISMATCH | expected ${paymentIntent.currency}, got ${parsedWebhook.currency}`,
         },
       })
-      console.error(`[Webhook] Currency mismatch on ${paymentIntent.reference}: expected ${paymentIntent.currency}, got ${parsedWebhook.currency}`)
+      console.error(
+        `[Webhook] Currency mismatch on ${paymentIntent.reference}: expected ${paymentIntent.currency}, got ${parsedWebhook.currency}`
+      )
       return NextResponse.json({ error: 'Currency mismatch' }, { status: 422 })
     }
 
-    // FIX: Guard against double-crediting if a retry comes with a different signature
-    if (
-      fullPaymentIntent.status === 'success' || 
-      fullPaymentIntent.status === 'failed'
-    ) {
-      // Mark this webhook log as processed since we already handled this terminal state
+    // Guard against double-crediting if a retry arrives with a different signature
+    if (fullPaymentIntent.status === 'success' || fullPaymentIntent.status === 'failed') {
       await db.webhookLog.update({
         where: { id: webhookLog.id },
         data: { paymentIntentId: paymentIntent.id, processed: true },
@@ -209,8 +338,8 @@ export async function POST(
       return NextResponse.json({ success: true, duplicate: true })
     }
 
-    // FIX 2 & 3: Delegate to completePayment for wallet crediting and status sync
-    // Always use the AUTHORITATIVE stored amount and currency, never the provider's unverified value
+    // Always use the AUTHORITATIVE stored amount and currency, never the
+    // provider's (already gated) value.
     const { wasAlreadyProcessed } = await completePayment({
       paymentIntentId: paymentIntent.id,
       status: normalizedStatus,
@@ -218,11 +347,10 @@ export async function POST(
       failureReason: parsedWebhook.failureReason,
       amount: expectedAmount,
       currency: paymentIntent.currency,
-      rawProviderResponse: rawBody,
-      note: 'WEBHOOK_UPDATE',
+      rawProviderResponse: sanitizedPayload,
+      note: `WEBHOOK_UPDATE (${strategy})`,
     })
 
-    // FIX 2: mark log processed. If this fails, the retry will be caught by the success guard above.
     await db.webhookLog.update({
       where: { id: webhookLog.id },
       data: { paymentIntentId: paymentIntent.id, processed: true },
@@ -240,18 +368,22 @@ export async function POST(
         failureReason: parsedWebhook.failureReason,
         applicationId: fullPaymentIntent.applicationId,
         webhookUrl: `${fullPaymentIntent.application.baseUrl}${fullPaymentIntent.application.webhookPath}`,
-        apiKey: fullPaymentIntent.application.apiKey,
+        webhookSecret: webhookSecretFromRow(fullPaymentIntent.application),
         externalEntityId: fullPaymentIntent.externalEntityId,
-        metadata: (() => { try { return fullPaymentIntent.metadata ? JSON.parse(fullPaymentIntent.metadata) : {}; } catch(e) { return {}; } })(),
+        metadata: (() => {
+          try {
+            return safeJsonObject(fullPaymentIntent.metadata)
+          } catch {
+            return {}
+          }
+        })(),
       })
     }
 
     return NextResponse.json({ success: true })
-  } catch (error) {
-    console.error('Webhook error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 }
-    )
+  } catch (error: any) {
+    // Never echo internal error text to an unauthenticated caller.
+    console.error(`Webhook error (${normalizedProvider}):`, error)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

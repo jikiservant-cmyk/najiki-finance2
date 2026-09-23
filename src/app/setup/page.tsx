@@ -31,7 +31,9 @@ interface Application {
   baseUrl: string
   webhookPath: string
   internalSecretRef: string
-  apiKey: string | null
+  // Not returned by the API any more — only the hash is stored. See
+  // scripts/migrate-api-keys.ts and src/lib/api-keys.ts.
+  apiKeyHint: string | null
   isActive: boolean
   createdAt: string
   updatedAt: string
@@ -69,6 +71,15 @@ interface Provider {
   updatedAt: string
 }
 
+/**
+ * Providers that can actually take a payment.
+ *
+ * Kept in sync with IMPLEMENTED_PROVIDER_CODES in src/lib/providers/index.ts.
+ * The Setup API rejects anything not on this list, so offering it in the
+ * dropdown would only produce a failed setup.
+ */
+const IMPLEMENTED_PROVIDER_CODES = ['livepay']
+
 interface TenantProviderConfig {
   id: string
   tenantId: string
@@ -85,17 +96,16 @@ interface TenantProviderConfig {
     code: string
   }
   credentialsRef: string | null
-  configJson: {
-    apiKey?: string
-    api_key?: string
-    accountNo?: string
-    account_number?: string
-    accountNumber?: string
-    webhookSecret?: string
-    webhook_secret?: string
-    baseUrl?: string
-    base_url?: string
-    [key: string]: any
+  /**
+   * Non-secret summary only. The server never sends the credential blob, so the
+   * form cannot prefill the API key — leaving it blank means "unchanged".
+   */
+  configSummary?: {
+    hasApiKey: boolean
+    hasWebhookSecret: boolean
+    accountNo: string
+    baseUrl: string
+    encrypted: boolean
   }
   isActive: boolean
   createdAt: string
@@ -105,6 +115,10 @@ interface TenantProviderConfig {
 export default function SetupPage() {
   const [applications, setApplications] = useState<Application[]>([])
   const [providers, setProviders] = useState<Provider[]>([])
+  const usableProviders = providers.filter(
+    (p) => IMPLEMENTED_PROVIDER_CODES.includes(p.code.toLowerCase()) && p.isActive
+  )
+
   const [tenantConfigs, setTenantConfigs] = useState<TenantProviderConfig[]>([])
   const [tenantsList, setTenantsList] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
@@ -139,16 +153,10 @@ export default function SetupPage() {
         setProviders(data.providers || [])
         setTenantConfigs(data.tenantProviderConfigs || [])
         setTenantsList(data.tenants || [])
-      } else {
-        // Fallback to debug-apps if needed
-        const fbRes = await fetch('/api/debug-apps')
-        if (fbRes.ok) {
-          const fbData = await fbRes.json()
-          setApplications(fbData.applications || [])
-          setProviders(fbData.providers || [])
-          setTenantConfigs(fbData.tenantProviderConfigs || [])
-          setTenantsList(fbData.tenants || [])
-        }
+      } else if (res.status === 401) {
+        setStatusMessage({ type: 'error', text: 'Your session has expired. Please sign in again.' })
+      } else if (res.status === 403) {
+        setStatusMessage({ type: 'error', text: 'Super admin access is required to view this page.' })
       }
     } catch (error) {
       console.error('Failed to fetch setup data:', error)
@@ -197,6 +205,45 @@ export default function SetupPage() {
     } else {
       const err = await res.json()
       setStatusMessage({ type: 'error', text: err.error || 'Failed to create application' })
+    }
+  }
+
+  /**
+   * Rotate an application's API key.
+   *
+   * Confirmed first, because it is irreversible and immediately breaks any
+   * integration still using the old key. The new key is shown once, in the same
+   * banner a newly created application uses.
+   */
+  async function handleRotateApplication(appId: string, appName: string) {
+    if (!window.confirm(
+      `Rotate the API key for "${appName}"?\n\n` +
+      'The current key stops working immediately. Any integration still using ' +
+      'it will start getting 401s until it is updated.'
+    )) return
+
+    try {
+      const res = await fetch('/api/setup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'rotateApplication', data: { id: appId } }),
+      })
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        setStatusMessage({ type: 'error', text: err.error || 'Failed to rotate API key' })
+        return
+      }
+
+      const rotated = await res.json()
+      setNewApiKey(rotated.apiKey)
+      setStatusMessage({
+        type: 'success',
+        text: `New API key issued for "${appName}". Copy it now — it is not stored and cannot be shown again.`,
+      })
+      fetchData()
+    } catch {
+      setStatusMessage({ type: 'error', text: 'Failed to rotate API key' })
     }
   }
 
@@ -284,8 +331,15 @@ export default function SetupPage() {
       setStatusMessage({ type: 'error', text: 'Please select a Provider' })
       return
     }
-    if (!configApiKey || !configAccountNo) {
-      setStatusMessage({ type: 'error', text: 'Both Provider API Key and Account Number are required' })
+    // When editing, a blank key means "keep the stored one" — the server carries
+    // the existing credential forward. Requiring it again would force an operator
+    // to re-paste a secret just to change a base URL.
+    if (!configAccountNo) {
+      setStatusMessage({ type: 'error', text: 'Account Number is required' })
+      return
+    }
+    if (!editingConfigId && !configApiKey) {
+      setStatusMessage({ type: 'error', text: 'Provider API Key is required when adding a new configuration' })
       return
     }
 
@@ -336,11 +390,13 @@ export default function SetupPage() {
     setEditingConfigId(cfg.id)
     setConfigTenantId(cfg.tenantId)
     setConfigProviderId(cfg.providerId)
-    const json = cfg.configJson || {}
-    setConfigApiKey(json.apiKey || json.api_key || '')
-    setConfigAccountNo(json.accountNo || json.account_number || json.accountNumber || '')
-    setConfigWebhookSecret(json.webhookSecret || json.webhook_secret || '')
-    setConfigBaseUrl(json.baseUrl || json.base_url || 'https://livepay.me')
+    const summary = cfg.configSummary
+    // Deliberately blank: the server does not send secrets, so the operator
+    // re-enters the key only when they want to change it.
+    setConfigApiKey('')
+    setConfigWebhookSecret('')
+    setConfigAccountNo(summary?.accountNo || '')
+    setConfigBaseUrl(summary?.baseUrl || 'https://livepay.me')
     setConfigCredentialsRef(cfg.credentialsRef || '')
     setConfigIsActive(cfg.isActive)
     setActiveTab('tenant-providers')
@@ -574,17 +630,29 @@ export default function SetupPage() {
                         <span>Payment Types: <strong>{app.paymentTypes?.length || 0}</strong></span>
                       </div>
 
-                      {app.apiKey && (
+                      {app.apiKeyHint && (
                         <div className="pt-2">
-                          <Label className="text-xs text-muted-foreground">Client API Key:</Label>
+                          <Label className="text-xs text-muted-foreground">
+                            Client API Key:
+                          </Label>
                           <div className="flex items-center gap-2 mt-1">
-                            <p className="text-xs font-mono bg-muted p-2 rounded flex-1 overflow-x-auto select-all">
-                              {app.apiKey}
+                            <p className="text-xs font-mono bg-muted p-2 rounded flex-1 overflow-x-auto">
+                              njk_••••••••{app.apiKeyHint}
                             </p>
-                            <Button onClick={() => copyToClipboard(app.apiKey!)} variant="outline" size="sm">
-                              <Copy className="w-3.5 h-3.5" />
-                            </Button>
                           </div>
+                          <p className="text-[11px] text-muted-foreground mt-1">
+                            Only a hash is stored, so the key cannot be shown again. If it
+                            is lost or leaked, rotate it — the old one stops working immediately.
+                          </p>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="mt-2"
+                            onClick={() => handleRotateApplication(app.id, app.name)}
+                          >
+                            Rotate API Key
+                          </Button>
                         </div>
                       )}
                     </CardContent>
@@ -688,14 +756,30 @@ export default function SetupPage() {
                   </div>
                   <div>
                     <Label>Default Provider</Label>
+                    {/*
+                      Only providers with a working adapter and an active row are
+                      selectable. Listing every provider row let an operator point a
+                      tenant at MTN/Airtel/Pesapal, which have no implementation and
+                      throw on the first payment (the API now refuses this too).
+                    */}
                     <select name="defaultProviderId" className="w-full p-2 border rounded bg-background text-sm">
                       <option value="">None (Global default)</option>
-                      {providers.map((provider) => (
+                      {usableProviders.map((provider) => (
                         <option key={provider.id} value={provider.id}>
                           {provider.name} ({provider.code})
                         </option>
                       ))}
                     </select>
+                    {providers.length > usableProviders.length && (
+                      <p className="text-[11px] text-muted-foreground mt-1">
+                        {providers
+                          .filter((p) => !usableProviders.some((u) => u.id === p.id))
+                          .map((p) => p.name)
+                          .join(', ')}{' '}
+                        {providers.length - usableProviders.length === 1 ? 'is' : 'are'} not selectable —
+                        no working adapter yet.
+                      </p>
+                    )}
                   </div>
                   <div className="flex items-center gap-2">
                     <Label>Active</Label>
@@ -979,10 +1063,9 @@ export default function SetupPage() {
               ) : (
                 <div className="space-y-3">
                   {tenantConfigs.map((cfg) => {
-                    const json = cfg.configJson || {}
-                    const apiKey = json.apiKey || json.api_key
-                    const accountNo = json.accountNo || json.account_number || json.accountNumber
-                    const baseUrl = json.baseUrl || json.base_url || 'https://livepay.me'
+                    const summary = cfg.configSummary
+                    const accountNo = summary?.accountNo
+                    const baseUrl = summary?.baseUrl || 'https://livepay.me'
 
                     return (
                       <Card
@@ -1038,7 +1121,15 @@ export default function SetupPage() {
                                 API Key:
                               </span>
                               <span className="text-foreground">
-                                {maskKey(apiKey)}
+                                {summary?.hasApiKey ? (
+                                  <span className="text-emerald-600 dark:text-emerald-400">
+                                    •••• configured
+                                  </span>
+                                ) : (
+                                  <span className="text-amber-600 dark:text-amber-400">
+                                    not set — using platform fallback
+                                  </span>
+                                )}
                               </span>
                             </div>
                             <div>
