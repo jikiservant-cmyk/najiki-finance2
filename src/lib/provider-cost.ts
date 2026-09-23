@@ -13,8 +13,29 @@
  * Zero imports — reachable from the type-stripped test runner.
  */
 
-/** Currencies with no minor unit. Mirrors src/lib/money.ts for the ones seen here. */
-const ZERO_DECIMAL = new Set(['UGX', 'RWF', 'JPY', 'KRW', 'BIF', 'GNF', 'KMF', 'VND', 'XAF', 'XOF', 'XPF', 'CLP', 'ISK', 'PYG', 'DJF', 'VUV'])
+/**
+ * Currencies with no minor unit.
+ *
+ * A hand-maintained mirror of `ZERO_DECIMAL_CURRENCIES` in src/lib/money.ts —
+ * duplicated rather than imported because this module must stay import-free to
+ * remain reachable from the type-stripped test runner, and Node's type stripping
+ * resolves relative specifiers literally. It had already drifted (UYI was
+ * present in money.ts and missing here), which is silent: the cost of a UYI
+ * message would have been recorded 100x too large. `tests/currency-exponents.test.ts`
+ * asserts the two definitions agree, so the mirror cannot drift again.
+ */
+export const ZERO_DECIMAL_CURRENCIES = [
+  'BIF', 'CLP', 'DJF', 'GNF', 'ISK', 'JPY', 'KMF', 'KRW', 'PYG', 'RWF',
+  'UGX', 'UYI', 'VND', 'VUV', 'XAF', 'XOF', 'XPF',
+] as const
+
+/** Currencies whose minor unit is a thousandth. Mirrors money.ts likewise. */
+export const THREE_DECIMAL_CURRENCIES = [
+  'BHD', 'IQD', 'JOD', 'KWD', 'LYD', 'OMR', 'TND',
+] as const
+
+const ZERO_DECIMAL = new Set<string>(ZERO_DECIMAL_CURRENCIES)
+const THREE_DECIMAL = new Set<string>(THREE_DECIMAL_CURRENCIES)
 
 export interface ParsedProviderCost {
   /** Amount in the currency's minor units. */
@@ -27,6 +48,7 @@ export interface ParsedProviderCost {
  *
  *   parseProviderCost('UGX 50.0000')  → { amountMinor: 50,   currency: 'UGX' }
  *   parseProviderCost('KES 0.8000')   → { amountMinor: 80,   currency: 'KES' }
+ *   parseProviderCost('KWD 1.500')    → { amountMinor: 1500, currency: 'KWD' }
  *   parseProviderCost(50)             → { amountMinor: 50,   currency: null }
  *   parseProviderCost('')             → null
  *
@@ -52,7 +74,10 @@ export function parseProviderCost(raw: unknown): ParsedProviderCost | null {
   const numeric = Number(match[2])
   if (!Number.isFinite(numeric) || numeric < 0) return null
 
-  const exponent = currency && ZERO_DECIMAL.has(currency) ? 0 : 2
+  // Three-decimal currencies exist (KWD, BHD, ...). Treating them as
+  // two-decimal understates their cost by 10x, so they are handled explicitly
+  // rather than falling into the default.
+  const exponent = !currency ? 2 : ZERO_DECIMAL.has(currency) ? 0 : THREE_DECIMAL.has(currency) ? 3 : 2
   const scale = 10 ** exponent
 
   // Half-up on the minor unit, matching src/lib/money.ts.

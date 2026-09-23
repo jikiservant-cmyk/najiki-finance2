@@ -32,13 +32,13 @@ export type MoneyInput = number | string | { toString(): string }
  * Sourced from the ISO 4217 "minor unit" column; the Ugandan shilling (UGX) is
  * the one that matters here, but the rest cost nothing to carry.
  */
-const ZERO_DECIMAL_CURRENCIES = new Set([
+export const ZERO_DECIMAL_CURRENCIES = new Set([
   'BIF', 'CLP', 'DJF', 'GNF', 'ISK', 'JPY', 'KMF', 'KRW', 'PYG', 'RWF',
   'UGX', 'UYI', 'VND', 'VUV', 'XAF', 'XOF', 'XPF',
 ])
 
 /** ISO 4217 currencies with a thousandth (exponent 3). */
-const THREE_DECIMAL_CURRENCIES = new Set([
+export const THREE_DECIMAL_CURRENCIES = new Set([
   'BHD', 'IQD', 'JOD', 'KWD', 'LYD', 'OMR', 'TND',
 ])
 
