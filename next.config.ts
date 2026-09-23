@@ -9,7 +9,11 @@ const nextConfig: NextConfig = {
   },
   // Don't advertise the framework/version in responses.
   poweredByHeader: false,
-  reactStrictMode: false,
+  // Enabled. Disabling StrictMode opts out of React's double-invoke checks,
+  // which exist to surface exactly the kind of stale-closure and
+  // double-effect bugs this dashboard's polling hooks are prone to. It affects
+  // development only — production builds are unchanged.
+  reactStrictMode: true,
   async headers() {
     return [
       {
@@ -46,6 +50,37 @@ const nextConfig: NextConfig = {
           {
             key: "X-Permitted-Cross-Domain-Policies",
             value: "none",
+          },
+          {
+            // Content-Security-Policy was missing entirely. Eight other headers
+            // were set, but CSP is the one that actually constrains injected
+            // script — and with X-Frame-Options deliberately left at SAMEORIGIN
+            // (partner embedding), frame-ancestors is the clickjacking control.
+            //
+            // `script-src` needs 'unsafe-inline': Next.js ships inline bootstrap
+            // and hydration scripts, and removing it requires per-request nonces
+            // threaded through the middleware. That is worth doing later; it is
+            // not worth shipping no CSP until then. Everything an injected
+            // script would want is still blocked — external hosts, eval, plugins,
+            // base-tag hijacking, and form posts to another origin.
+            key: "Content-Security-Policy",
+            value: [
+              "default-src 'self'",
+              "script-src 'self' 'unsafe-inline'",
+              // Tailwind and framer-motion set inline styles at runtime.
+              "style-src 'self' 'unsafe-inline'",
+              "img-src 'self' data: blob:",
+              "font-src 'self' data:",
+              // The dashboard talks to its own routes only. Supabase is reached
+              // server-side, so no external connect-src is needed.
+              "connect-src 'self'",
+              "object-src 'none'",
+              "base-uri 'self'",
+              "form-action 'self'",
+              "frame-ancestors 'self'",
+              "worker-src 'self' blob:",
+              'upgrade-insecure-requests',
+            ].join('; '),
           },
         ],
       },

@@ -2,6 +2,9 @@ import { db } from './db'
 import { getPaymentProvider } from './providers'
 import { decrypt } from './encryption'
 import { PLATFORM_FEE_TYPES } from './constants'
+import { toMinorUnits } from './money'
+import { webhookSecretFromRow } from './application-auth'
+import { safeJsonObject } from './json'
 
 export async function processPayment(data: {
   paymentIntentId: string,
@@ -88,9 +91,9 @@ export async function processPayment(data: {
           failureReason: providerResponse.failureReason,
           applicationId: payment.applicationId,
           webhookUrl: `${payment.application.baseUrl}${payment.application.webhookPath}`,
-          apiKey: payment.application.apiKey,
+          webhookSecret: webhookSecretFromRow(payment.application),
           externalEntityId: payment.externalEntityId,
-          metadata: payment.metadata ? JSON.parse(payment.metadata) : {},
+          metadata: safeJsonObject(payment.metadata),
         })
       }
     }
@@ -180,7 +183,9 @@ export async function completePayment(data: {
     if (status === 'success' && fullPaymentIntent.tenant && !isPlatformPayment) {
       const appCode = fullPaymentIntent.application.code.toLowerCase()
       const tenantId = fullPaymentIntent.tenant.id
-      const amountMinor = BigInt(Math.round(amount * 100))
+      // Currency-aware: UGX has no minor unit, so this is not a x100. See
+      // src/lib/money.ts for why a flat x100 credited 100x the real money.
+      const amountMinor = toMinorUnits(amount, currency)
 
       const existingWallet = await tx.walletAccount.findUnique({
         where: {
@@ -249,7 +254,7 @@ export async function completePayment(data: {
         providerPaymentId: providerPaymentId || '',
         failureReason: failureReason || null,
         externalEntityId: fullPaymentIntent.externalEntityId,
-        metadata: (() => { try { return fullPaymentIntent.metadata ? JSON.parse(fullPaymentIntent.metadata) : {}; } catch { return {}; } })(),
+        metadata: safeJsonObject(fullPaymentIntent.metadata),
       }
 
       await tx.internalNotification.create({
@@ -285,8 +290,8 @@ export async function completePayment(data: {
 }
 
 import { Client } from '@upstash/qstash'
-import { createHmac } from 'crypto'
 import { safeFetch, validateSafeUrl } from './safe-fetch'
+import { buildNotificationHeaders } from './notification-signature'
 import {
   NOTIFICATION_MAX_ATTEMPTS as MAX_ATTEMPTS,
   computeNextRetryAt,
@@ -311,30 +316,9 @@ export {
   isExhausted as isNotificationExhausted,
 } from './backoff'
 
-/**
- * Build the outbound webhook headers, including the timestamped HMAC signature
- * used for replay protection on the receiving application.
- */
-export function buildNotificationHeaders(
-  apiKey: string | null,
-  payloadString: string
-): Record<string, string> {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    'X-Najiki-Notification': 'true',
-  }
-
-  if (apiKey) {
-    const timestamp = Date.now()
-    const signature = createHmac('sha256', apiKey)
-      .update(`${timestamp}.${payloadString}`)
-      .digest('hex')
-    headers['X-Najiki-Timestamp'] = String(timestamp)
-    headers['X-Najiki-Signature'] = `t=${timestamp},v=${signature}`
-  }
-
-  return headers
-}
+// The signer lives in ./notification-signature so it can be unit-tested; this
+// re-export keeps the existing import path working.
+export { buildNotificationHeaders }
 
 /**
  * Mark all in-flight notifications for a payment intent as delivered.
@@ -422,7 +406,7 @@ export async function deliverQueuedNotification(row: {
 }): Promise<{ success: boolean; error?: string; statusCode?: number }> {
   const application = await db.application.findUnique({
     where: { id: row.applicationId },
-    select: { apiKey: true },
+    select: { apiKey: true, webhookSecretEncrypted: true },
   })
 
   try {
@@ -431,7 +415,9 @@ export async function deliverQueuedNotification(row: {
     return { success: false, error: `Unsafe webhook URL: ${urlErr?.message}`, statusCode: 0 }
   }
 
-  const headers = buildNotificationHeaders(application?.apiKey ?? null, row.payload)
+  // The signing secret, not the API key: they are separate credentials, so
+  // recovering one does not compromise the other.
+  const headers = buildNotificationHeaders(application ? webhookSecretFromRow(application) : null, row.payload)
 
   try {
     const res = await safeFetch(row.url, {
@@ -471,7 +457,8 @@ export async function enqueueWebhookNotification(data: {
   failureReason?: string | null
   applicationId: string
   webhookUrl: string
-  apiKey: string | null
+  /** Outbound signing secret — see `webhookSecretFromRow`. */
+  webhookSecret: string | null
   externalEntityId?: string | null
   metadata: any
 }) {
@@ -501,20 +488,10 @@ export async function enqueueWebhookNotification(data: {
 
   const payloadString = JSON.stringify(payloadObject)
 
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    'X-Najiki-Notification': 'true',
-  }
-
-  // P1-5: Replay protection with timestamped signature
-  if (data.apiKey) {
-    const timestamp = Date.now()
-    const signature = createHmac('sha256', data.apiKey)
-      .update(`${timestamp}.${payloadString}`)
-      .digest('hex')
-    headers['X-Najiki-Timestamp'] = String(timestamp)
-    headers['X-Najiki-Signature'] = `t=${timestamp},v=${signature}`
-  }
+  // P1-5: Replay protection with timestamped signature. Built by the shared
+  // helper rather than inline — the two copies had already drifted apart, and
+  // a signature only one of them could produce is a partner-side outage.
+  const headers = buildNotificationHeaders(data.webhookSecret, payloadString)
 
   // 1. Primary path: Use Upstash QStash with 5 automatic retries and exponential backoff
   try {

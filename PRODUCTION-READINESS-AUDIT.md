@@ -227,3 +227,42 @@ Caveat: history was rewritten at some point — an earlier commit added `scripts
 6. Add settlement/payout + reconciliation and settle on minor units (**B10**); then work through the medium list (key hashing/rotation is the next security item).
 
 **Bottom line:** PR #1 takes this from "actively dangerous" to "solid beta". It is not yet a system I would let hold other people's money without B1, B2, B4, B5, B6, B7, B8 and B9 closed.
+
+---
+
+# Addendum — status after the fix PRs (branch `arena/01a0ca5d-najiki-finance2`)
+
+*Everything above is the audit as originally written and is left unedited, because
+an audit is a snapshot. This section records what has since been fixed, so the
+document does not read as though work done after it was never done.*
+
+The audit's own verdict was that the branch was not mergeable. That was correct, and
+for a reason it did not catch: the schema declared `@@index([status, lastPolledAt])`
+on a field that does not exist, so `prisma generate` — and therefore
+`npm run build` — could never run at all. The 10 `src/lib/data.ts` type errors were
+a symptom of that, not the pre-existing condition the PR description claimed. Two
+further blockers followed it: an invalid Next Route export, and a CI workflow pinned
+to Node 20 while `npm test` uses `--experimental-strip-types`, which needs 22.6+.
+
+## Resolved since
+
+| Item | Was | Now |
+| --- | --- | --- |
+| **B10** mixed units | ❌ `BigInt(Math.round(amount * 100))` — a **100×** overcredit for UGX, whose wallets are the main ones | ✅ `src/lib/money.ts` knows ISO 4217 exponents; exact `bigint` arithmetic |
+| **B10** reconciliation | ❌ "nothing maps back to provider statements" | ✅ `npm run ledger:reconcile` recomputes every balance from its immutable entries, names a clean 100× as a unit error, exits non-zero on drift; `/api/cron/alerts` raises a critical alert |
+| **B10** settlement *execution* | ❌ no payout side | ❌ still open — the ledger is now correct and verifiable, but there is no disbursement call to a provider (`providers/livepay.ts` has no client for one) |
+| API key hashing/rotation | ❌ cleartext in `applications.api_key` — the exact column B2's hardening protects | ✅ `apiKeyHash` (SHA-256) for auth, separate `webhookSecretEncrypted` (AES-256-GCM) for signing; `npm run db:migrate-api-keys` then `--clear-plaintext` |
+| SMS idempotency (medium list item 1) | ❌ a retried send is billed twice with no way to tell whether the first went out | ✅ `Idempotency-Key`, scoped per application; the unique constraint is the guard |
+| PII retention (medium list) | ❌ `payment_intents.phone_number` and `sms_messages.recipient` in clear, no retention | ✅ 90-day window masks (or purges) both; `/api/cron/retention` + `npm run data:retention`; `PHONE_RETENTION_DAYS=0` is the only way to disable it |
+| Tests (B8) | ❌ zero test files | ✅ 66 tests on Node's runner, and CI runs typecheck / lint / test / `prisma validate` / build |
+| Deployability (B6/B7) | 🔴 Hobby-incompatible `vercel.json`; no migrations | ✅ `vercel.json` reduced to two daily jobs with QStash carrying the sub-daily ones; migration baseline still outstanding (below) |
+
+## Still open
+
+- **B2** — `npm run db:harden` still has to be run against the real database. No code change substitutes for that.
+- **B7** — the Prisma migration baseline still has to be generated where the engines can download. The schema now needs four more changes on top of the original three (`lastPolledAt`, the API-key columns, SMS `idempotencyKey` + its unique constraint, and the two retention markers).
+- **Settlement execution** — the reconciliation is in place and the units are right, but paying tenants out needs a disbursement integration that does not exist.
+- Inbound SMS signatures; `StubProvider` still reachable from the setup UI.
+- **Historical data** — fixing the 100× arithmetic does not fix rows already written. `npm run ledger:reconcile` reports them; run it before settling anything.
+
+**Revised bottom line:** the blockers that made this branch unbuildable are gone and CI is green. It is still not a system to hold other people's money until B2 is run for real, the migration baseline exists, and a payout path is built and reconciled — but the money is now accounted for in the right units, partner credentials are no longer stored in a form that can be replayed, and customer numbers expire.

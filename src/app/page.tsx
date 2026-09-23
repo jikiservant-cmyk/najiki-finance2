@@ -28,13 +28,36 @@ interface DashboardData {
   }[]
   totalPayments: number
   notifStats: { total: number; delivered: number; pending: number; retrying: number; exhausted: number }
+  /** The currency `totalRevenue`, the per-app/provider/tenant figures and the
+   *  daily chart are all denominated in. Never assume UGX. */
+  revenueCurrency: string
+  /** Per-currency payment counts — non-empty with more than one in play. */
+  currencyBreakdown: { currency: string; count: number }[]
+  /** The period actually applied (a whitelist member, not what was requested). */
+  period: string
 }
 
-const fmt = (n: number | undefined | null) => {
-  if (typeof n !== 'number' || isNaN(n)) return 'UGX 0'
-  if (n >= 1000000) return `UGX ${(n / 1000000).toFixed(1)}M`
-  if (n >= 1000) return `UGX ${(n / 1000).toFixed(0)}K`
-  return `UGX ${n.toLocaleString()}`
+/**
+ * Format a money figure.
+ *
+ * The currency must be supplied. This used to hardcode "UGX", so a USD payment
+ * was rendered as though it were shillings — and the totals it was drawn from
+ * had already added the two currencies together.
+ */
+const fmt = (n: number | undefined | null, currency: string = 'UGX') => {
+  const code = String(currency || 'UGX').toUpperCase()
+  if (typeof n !== 'number' || isNaN(n)) return `${code} 0`
+  if (n >= 1000000) return `${code} ${(n / 1000000).toFixed(1)}M`
+  if (n >= 1000) return `${code} ${(n / 1000).toFixed(0)}K`
+  return `${code} ${n.toLocaleString()}`
+}
+
+/** Chart-axis labels stay bare so the bars keep their widths. */
+const fmtCompact = (n: number | undefined | null) => {
+  if (typeof n !== 'number' || isNaN(n)) return '0'
+  if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`
+  if (n >= 1000) return `${(n / 1000).toFixed(0)}K`
+  return n.toLocaleString()
 }
 
 const fmtDate = (d: string | Date | undefined | null) => {
@@ -103,7 +126,7 @@ function BarChart({ data, maxVal, color, failData }: { data: number[]; maxVal: n
                 animate={{ opacity: 1, y: 0 }}
                 className="relative -top-8 left-1/2 -translate-x-1/2 bg-card border border-border px-2 py-1 rounded text-[9px] font-mono text-foreground whitespace-nowrap z-10"
               >
-                {fmt(v)}
+                {fmtCompact(v)}
               </motion.div>
             )}
           </motion.div>
@@ -160,12 +183,18 @@ export default function HomePage() {
     funnel: [],
     recentIntents: [],
     totalPayments: 0,
-    notifStats: { total: 0, delivered: 0, pending: 0, retrying: 0, exhausted: 0 }
+    notifStats: { total: 0, delivered: 0, pending: 0, retrying: 0, exhausted: 0 },
+    revenueCurrency: 'UGX',
+    currencyBreakdown: [],
+    period: '14d',
   }
 
   // Extra safety checks
   const safeStatusCounts = safeData.statusCounts || { success: 0, pending: 0, processing: 0, failed: 0, expired: 0, cancelled: 0 }
   const safeNotifStats = safeData.notifStats || { total: 0, delivered: 0, pending: 0, retrying: 0, exhausted: 0 }
+  // Every money figure on this page is denominated in this currency.
+  const revenueCurrency = safeData.revenueCurrency || 'UGX'
+  const otherCurrencies = (safeData.currencyBreakdown || []).filter((c) => c.currency !== revenueCurrency)
 
   const maxDaily = Array.isArray(safeData.dailyRevenue) && safeData.dailyRevenue.length > 0 
     ? Math.max(...safeData.dailyRevenue.map(d => d.revenue), 1) 
@@ -251,7 +280,11 @@ export default function HomePage() {
             {/* Top stats — 3D tilt cards */}
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 scene-3d">
               {[
-                { label: 'Total Revenue', value: fmt(safeData.totalRevenue), sub: `${safeData.totalPayments} intents`, accent: '#4ade80', delay: 1.6 },
+                { label: 'Total Revenue', value: fmt(safeData.totalRevenue, revenueCurrency),
+            // Disclose the scope rather than implying the figure covers everything.
+            sub: otherCurrencies.length > 0
+              ? `${safeData.totalPayments} intents — ${revenueCurrency} only`
+              : `${safeData.totalPayments} intents`, accent: '#4ade80', delay: 1.6 },
                 { label: 'Success Rate', value: `${safeData.successRate}%`, sub: `${safeStatusCounts.success} successful`, accent: '#34d399', delay: 1.7 },
                 { label: 'Processing', value: String(safeStatusCounts.processing), sub: 'Awaiting customer', delay: 1.8 },
                 { label: 'Pending', value: String(safeStatusCounts.pending), sub: 'Not yet sent', delay: 1.9 },
@@ -299,7 +332,7 @@ export default function HomePage() {
                         <div className="flex justify-between items-start">
                           <div>
                             <h4 className="text-xs font-bold text-muted-foreground">{app.name}</h4>
-                            <span className="text-2xl font-black" style={{ color: appColors[app.code] }}>{fmt(app.revenue)}</span>
+                            <span className="text-2xl font-black" style={{ color: appColors[app.code] }}>{fmt(app.revenue, revenueCurrency)}</span>
                           </div>
                           <span className="text-[10px] font-mono text-muted-foreground">{app.successCount}/{app.count}</span>
                         </div>
@@ -405,7 +438,7 @@ export default function HomePage() {
                       <motion.div key={p.code} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 3.4 + i * 0.08 }}>
                         <div className="flex justify-between mb-1">
                           <span className="text-sm font-mono font-medium">{p.name}</span>
-                          <span className="text-sm font-mono text-muted-foreground">{fmt(p.revenue)}</span>
+                          <span className="text-sm font-mono text-muted-foreground">{fmt(p.revenue, revenueCurrency)}</span>
                         </div>
                         <div className="h-2 bg-foreground/5 rounded-full overflow-hidden">
                           <motion.div
@@ -437,7 +470,7 @@ export default function HomePage() {
                         <span className="text-[10px] font-mono text-muted-foreground ml-2">({t.application})</span>
                       </div>
                       <div className="text-right">
-                        <span className="text-sm font-mono font-bold" style={{ color: appColors[t.application] }}>{fmt(t.revenue)}</span>
+                        <span className="text-sm font-mono font-bold" style={{ color: appColors[t.application] }}>{fmt(t.revenue, revenueCurrency)}</span>
                         <span className="text-[10px] font-mono text-muted-foreground ml-2">{t.count}</span>
                       </div>
                     </motion.div>
@@ -499,7 +532,7 @@ export default function HomePage() {
                         <td className="text-xs font-mono py-2.5 pr-4 font-medium" style={{ color: appColors[p.applicationCode] }}>{p.applicationCode}</td>
                         <td className="text-xs font-mono text-muted-foreground py-2.5 pr-4">{p.tenantName || '—'}</td>
                         <td className="text-xs font-mono text-muted-foreground py-2.5 pr-4">{(p.paymentType || '').replace(/_/g, ' ')}</td>
-                        <td className="text-xs font-mono py-2.5 pr-4 font-medium">{fmt(p.amount)}</td>
+                        <td className="text-xs font-mono py-2.5 pr-4 font-medium">{fmt(p.amount, p.currency)}</td>
                         <td className="text-xs font-mono text-muted-foreground py-2.5 pr-4">{p.providerCode}</td>
                         <td className="text-xs font-mono text-muted-foreground py-2.5 pr-4">{fmtDate(p.createdAt)}</td>
                         <td className="py-2.5"><span className={`text-[10px] font-mono tracking-wider px-2.5 py-1 rounded-md ${statusColors[p.status] || ''}`}>{p.status}</span></td>

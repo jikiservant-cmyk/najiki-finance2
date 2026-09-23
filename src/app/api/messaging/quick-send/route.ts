@@ -1,6 +1,6 @@
 import { NextResponse, after } from 'next/server'
 import { db } from '@/lib/db'
-import { smsStore } from '@/lib/sms-store'
+import { smsStore, SMS_COST_PLACEHOLDER } from '@/lib/sms-store'
 import { smsQueue } from '@/lib/sms-queue'
 import { requireSuperAdmin } from '@/lib/auth'
 import { checkRateLimit } from '@/lib/rate-limit'
@@ -67,7 +67,9 @@ export async function POST(request: Request) {
       message,
       applicationCode: application?.code || appCode,
       providerCode: 'africastalking',
-      cost: 50,
+      // Placeholder until the provider reports the real charge; overwritten
+      // by smsQueue via smsStore.updateProviderCost(). See SMS_COST_PLACEHOLDER.
+      cost: SMS_COST_PLACEHOLDER,
       applicationId: application?.id,
     })
 

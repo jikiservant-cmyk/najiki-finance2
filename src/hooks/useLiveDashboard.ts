@@ -110,9 +110,17 @@ export function useLiveDashboard(refresh: () => void | Promise<void>, snapshotKe
       }, interval)
     }
 
-    runRefresh().finally(() => {
-      if (!cancelled) schedule()
-    })
+    // `.finally()` does not handle a rejection — it forwards it, so a throwing
+    // runRefresh produced an unhandled promise rejection. runRefresh swallows
+    // its own fetch errors today, but relying on that is what makes this class
+    // of bug reappear when the function is edited.
+    runRefresh()
+      .catch((error) => {
+        console.error('[useLiveDashboard] initial refresh failed:', error)
+      })
+      .finally(() => {
+        if (!cancelled) schedule()
+      })
 
     const onVisibility = () => {
       if (document.visibilityState === 'visible' && !cancelled) {

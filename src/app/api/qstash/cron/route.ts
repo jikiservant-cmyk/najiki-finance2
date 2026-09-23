@@ -5,6 +5,8 @@ import { completePayment, enqueueWebhookNotification } from '@/lib/payments'
 import { verifyCronRequest } from '@/lib/qstash-verify'
 import { decrypt } from '@/lib/encryption'
 import { PLATFORM_FEE_TYPES } from '@/lib/constants'
+import { webhookSecretFromRow } from '@/lib/application-auth'
+import { safeJsonObject } from '@/lib/json'
 
 async function handleCron(request: Request) {
   try {
@@ -99,9 +101,9 @@ async function handleCron(request: Request) {
                 failureReason: result.failureReason,
                 applicationId: payment.applicationId,
                 webhookUrl: `${payment.application.baseUrl}${payment.application.webhookPath}`,
-                apiKey: payment.application.apiKey,
+                webhookSecret: webhookSecretFromRow(payment.application),
                 externalEntityId: payment.externalEntityId,
-                metadata: payment.metadata ? JSON.parse(payment.metadata) : {},
+                metadata: safeJsonObject(payment.metadata),
               })
             }
 

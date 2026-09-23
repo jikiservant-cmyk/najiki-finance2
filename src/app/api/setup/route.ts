@@ -4,7 +4,14 @@ import crypto from 'crypto'
 import { z } from 'zod'
 import { requireSuperAdmin } from '@/lib/auth'
 import { validateSafeUrl } from '@/lib/safe-fetch'
-import { encrypt } from '@/lib/encryption'
+import {
+  getAvailableProviders,
+  isProviderImplemented,
+  providerDisplayName,
+} from '@/lib/providers'
+import { encrypt, decrypt } from '@/lib/encryption'
+import { generateApiKey, hashApiKey, apiKeyHint } from '@/lib/api-keys'
+import { summarizeProviderConfig, shouldPreserveStoredSecret } from '@/lib/provider-config-summary'
 
 // Every write path is validated. These payloads previously went straight from
 // `request.json()` into Prisma, so a typo in the dashboard (or a crafted
@@ -23,6 +30,20 @@ const ApplicationSchema = z.object({
 })
 
 const UpdateApplicationSchema = ApplicationSchema.partial({ code: true }).extend({ id: Id })
+
+/**
+ * Rotate an application's credentials.
+ *
+ * `rotateWebhookSecret` defaults to **false** deliberately: the webhook secret
+ * is what a partner verifies our outbound notifications with, so rotating it
+ * silently would make every delivery fail signature verification on their side
+ * until they are told the new one. Rotating the API key alone is the common case
+ * (a leaked or lost key) and has no partner-side effect.
+ */
+const RotateApplicationSchema = z.object({
+  id: Id,
+  rotateWebhookSecret: z.boolean().optional().default(false),
+})
 
 const ProviderSchema = z.object({
   code: Code,
@@ -65,8 +86,26 @@ function validationError(error: z.ZodError) {
   return NextResponse.json({ error: 'Validation failed', details }, { status: 400 })
 }
 
-function generateApiKey(): string {
-  return `nk_${crypto.randomBytes(24).toString('hex')}`
+/**
+ * Mint an application key pair.
+ *
+ * The API key is returned to the operator exactly once and only its hash is
+ * stored. The webhook secret is a separate credential, kept encrypted because
+ * HMAC signing needs the plaintext back.
+ */
+function newApplicationCredentials() {
+  const apiKey = generateApiKey()
+  const webhookSecret = `njk_whsec_${crypto.randomBytes(32).toString('base64url')}`
+  return {
+    plaintextApiKey: apiKey,
+    webhookSecret,
+    data: {
+      apiKeyHash: hashApiKey(apiKey),
+      apiKeyHint: apiKeyHint(apiKey),
+      webhookSecretEncrypted: encrypt(webhookSecret),
+      apiKeyRotatedAt: new Date(),
+    },
+  }
 }
 
 export async function GET() {
@@ -75,6 +114,16 @@ export async function GET() {
 
     const [applications, providers, tenantProviderConfigs, tenants] = await Promise.all([
       db.application.findMany({
+        // `omit` is load-bearing, not tidiness. Selecting a whole Application
+        // would ship `apiKeyHash` and `webhookSecretEncrypted` to the browser,
+        // and an offline attack on a stored hash is the one thing hashing
+        // cannot defend against. The plaintext `apiKey` is omitted for the same
+        // reason — it is only ever returned once, from the create branch below.
+        omit: {
+          apiKey: true,
+          apiKeyHash: true,
+          webhookSecretEncrypted: true,
+        },
         include: {
           tenants: true,
           paymentTypes: true,
@@ -84,16 +133,30 @@ export async function GET() {
       db.provider.findMany({
         orderBy: { createdAt: 'desc' },
       }),
-      db.tenantProviderConfig.findMany({
-        include: {
-          tenant: true,
-          provider: true,
-        },
-        orderBy: { createdAt: 'desc' },
-      }),
+      // `configJson` holds this tenant's provider credentials. It is NOT
+      // returned: the dashboard only needs to know whether credentials exist and
+      // what the non-secret fields are. Rows written before encryption was added
+      // still hold { apiKey, webhookSecret } in the clear, and shipping those to
+      // a browser is exactly what the Application `omit` above exists to prevent.
+      db.tenantProviderConfig
+        .findMany({
+          include: {
+            tenant: true,
+            provider: true,
+          },
+          orderBy: { createdAt: 'desc' },
+        })
+        .then((configs) =>
+          configs.map(({ configJson, ...rest }) => ({
+            ...rest,
+            configSummary: summarizeProviderConfig(configJson),
+          }))
+        ),
       db.tenant.findMany({
         include: {
-          application: true,
+          application: {
+            omit: { apiKey: true, apiKeyHash: true, webhookSecretEncrypted: true },
+          },
         },
         orderBy: { createdAt: 'desc' },
       }),
@@ -147,6 +210,7 @@ export async function POST(request: Request) {
       case 'application': {
         const parsed = ApplicationSchema.safeParse(data)
         if (!parsed.success) return validationError(parsed.error)
+        const credentials = newApplicationCredentials()
         result = await db.application.create({
           data: {
             code: parsed.data.code,
@@ -154,10 +218,12 @@ export async function POST(request: Request) {
             baseUrl: parsed.data.baseUrl,
             webhookPath: parsed.data.webhookPath,
             internalSecretRef: parsed.data.internalSecretRef,
-            apiKey: generateApiKey(),
+            ...credentials.data,
             isActive: parsed.data.isActive,
           },
         })
+        // Shown once. It is not stored in plaintext and cannot be shown again.
+        result = { ...result, apiKey: credentials.plaintextApiKey, webhookSecret: credentials.webhookSecret }
         break
       }
 
@@ -177,9 +243,64 @@ export async function POST(request: Request) {
         break
       }
 
+      case 'rotateApplication': {
+        // There was no rotation path at all, while the dashboard told operators
+        // to "rotate it" when a key was lost. The only recovery from a leaked
+        // partner key was deleting the application — which cannot be done once
+        // it has payment history, and is not what you want during an incident.
+        const parsed = RotateApplicationSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
+
+        const credentials = newApplicationCredentials()
+        const rotateWebhookSecret = parsed.data.rotateWebhookSecret === true
+
+        const updated = await db.application.update({
+          where: { id: parsed.data.id },
+          data: {
+            apiKeyHash: credentials.data.apiKeyHash,
+            apiKeyHint: credentials.data.apiKeyHint,
+            apiKeyRotatedAt: credentials.data.apiKeyRotatedAt,
+            // Destroying the old cleartext is what makes this a real
+            // revocation rather than a second working key. `findApplicationByApiKey`
+            // consults the cleartext column only for rows with no hash, so once
+            // this row has the new hash the superseded key is dead.
+            apiKey: null,
+            ...(rotateWebhookSecret
+              ? { webhookSecretEncrypted: credentials.data.webhookSecretEncrypted }
+              : {}),
+          },
+          omit: { apiKey: true, apiKeyHash: true, webhookSecretEncrypted: true },
+        })
+
+        // Returned exactly once. Neither value is recoverable afterwards.
+        result = {
+          ...updated,
+          apiKey: credentials.plaintextApiKey,
+          webhookSecretRotated: rotateWebhookSecret,
+          ...(rotateWebhookSecret ? { webhookSecret: credentials.webhookSecret } : {}),
+        }
+        break
+      }
+
       case 'provider': {
         const parsed = ProviderSchema.safeParse(data)
         if (!parsed.success) return validationError(parsed.error)
+
+        // Activating a provider with no adapter is the other half of the same
+        // landmine: it becomes eligible for "first active provider" selection
+        // and then throws on the first payment.
+        if (parsed.data.isActive && !isProviderImplemented(parsed.data.code)) {
+          return NextResponse.json(
+            {
+              error:
+                `${providerDisplayName(parsed.data.code)} has no working payment adapter yet. ` +
+                'Create it inactive, or leave it out until the adapter ships.',
+              availableProviders: getAvailableProviders(),
+            },
+            { status: 400 }
+          )
+        }
+
         result = await db.provider.create({
           data: {
             code: parsed.data.code,
@@ -194,6 +315,38 @@ export async function POST(request: Request) {
       case 'tenant': {
         const parsed = TenantSchema.safeParse(data)
         if (!parsed.success) return validationError(parsed.error)
+
+        // A tenant pointed at a provider with no working adapter means every
+        // payment for that tenant fails. Refuse the configuration rather than
+        // storing a landmine — /api/payments also refuses at request time, but
+        // catching it here tells the operator which dropdown value is wrong.
+        if (parsed.data.defaultProviderId) {
+          const selected = await db.provider.findUnique({
+            where: { id: parsed.data.defaultProviderId },
+            select: { code: true, isActive: true },
+          })
+          if (!selected) {
+            return NextResponse.json({ error: 'Selected provider does not exist' }, { status: 400 })
+          }
+          if (!isProviderImplemented(selected.code)) {
+            return NextResponse.json(
+              {
+                error:
+                  `${providerDisplayName(selected.code)} has no working payment adapter yet, so it ` +
+                  'cannot be a tenant default. Leave the default empty to use the platform default.',
+                availableProviders: getAvailableProviders(),
+              },
+              { status: 400 }
+            )
+          }
+          if (!selected.isActive) {
+            return NextResponse.json(
+              { error: `${providerDisplayName(selected.code)} is inactive. Activate it first.` },
+              { status: 400 }
+            )
+          }
+        }
+
         result = await db.tenant.create({
           data: {
             applicationId: parsed.data.applicationId,
@@ -235,13 +388,52 @@ export async function POST(request: Request) {
           )
         }
 
-        const rawCreds = {
-          apiKey: config.apiKey?.trim() || '',
-          accountNo: config.accountNo?.trim() || '',
-          webhookSecret: config.webhookSecret?.trim() || '',
-          baseUrl: config.baseUrl?.trim() || 'https://livepay.me',
+        // Editing must not erase a credential it was never shown. The form
+        // cannot prefill the API key (the server will not send it), so a blank
+        // value here means "unchanged", not "delete" — read the stored blob and
+        // carry the existing secret forward.
+        let preserved: Record<string, string> = {}
+        if (config.id) {
+          const current = await db.tenantProviderConfig.findUnique({ where: { id: config.id } })
+          const stored = current?.configJson as Record<string, unknown> | undefined
+          if (stored && typeof stored === 'object') {
+            if (typeof stored._encrypted === 'string') {
+              try {
+                const decoded = JSON.parse(decrypt(stored._encrypted))
+                if (decoded && typeof decoded === 'object') preserved = decoded
+              } catch (decryptErr) {
+                console.error(
+                  `[setup] Could not decrypt the stored provider config for ${config.id}; ` +
+                    'refusing to guess at its credentials.',
+                  decryptErr
+                )
+                return NextResponse.json(
+                  {
+                    error:
+                      'The stored credentials for this configuration could not be read, so ' +
+                      'saving would have overwritten them. Re-enter the API key to replace them.',
+                  },
+                  { status: 409 }
+                )
+              }
+            } else {
+              // Legacy plaintext blob.
+              preserved = stored as Record<string, string>
+            }
+          }
         }
-        
+
+        const rawCreds = {
+          apiKey: shouldPreserveStoredSecret(config.apiKey)
+            ? String(preserved.apiKey ?? '')
+            : config.apiKey!.trim(),
+          accountNo: config.accountNo?.trim() || String(preserved.accountNo ?? ''),
+          webhookSecret: shouldPreserveStoredSecret(config.webhookSecret)
+            ? String(preserved.webhookSecret ?? '')
+            : config.webhookSecret!.trim(),
+          baseUrl: config.baseUrl?.trim() || String(preserved.baseUrl ?? 'https://livepay.me'),
+        }
+
         const configJson = {
           _encrypted: encrypt(JSON.stringify(rawCreds))
         }

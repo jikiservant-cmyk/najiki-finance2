@@ -6,7 +6,10 @@
 //   2. resolve provider / tenant creds   ← read-only
 //   3. VERIFY THE SIGNATURE              ← nothing is written before this
 //   4. idempotency (event hash)          ← dedupe on the provider's event identity
-//   5. load intent → amount/currency gates → completePayment()
+//                                          (an UNFINISHED row is resumed, not
+//                                          acknowledged — see webhook-dedupe.ts)
+//   5. load intent → provider must match this route → amount/currency gates
+//      → completePayment()
 //
 // Previously the audit row was inserted *before* verification and the
 // invalid-signature path marked it `processed: true`. Because the dedupe check
@@ -22,7 +25,12 @@ import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
 import { decrypt } from '@/lib/encryption'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
 import { computeWebhookEventHash } from '@/lib/webhook-hash'
+import { webhookSecretFromRow } from '@/lib/application-auth'
 import { redactPhoneNumbersInText } from '@/lib/redact'
+import { buildSignatureUrlCandidates } from '@/lib/webhook-url'
+import { readTextWithLimit } from '@/lib/request-body'
+import { safeJsonObject } from '@/lib/json'
+import { decideWebhookLogAction } from '@/lib/webhook-dedupe'
 
 /** Providers retry with at-least-once semantics; 64 KB is far above any real payload. */
 const MAX_WEBHOOK_BYTES = 64 * 1024
@@ -47,14 +55,18 @@ export async function POST(
       )
     }
 
-    const declaredLength = Number(request.headers.get('content-length') || 0)
-    if (declaredLength && declaredLength > MAX_WEBHOOK_BYTES) {
-      return NextResponse.json({ error: 'Payload too large' }, { status: 413 })
-    }
-
-    const rawBody = await request.text()
-    if (rawBody.length > MAX_WEBHOOK_BYTES) {
-      return NextResponse.json({ error: 'Payload too large' }, { status: 413 })
+    // Read with the cap applied DURING the read. The previous version checked
+    // `content-length` and then called `request.text()`, which buffers the whole
+    // body first — a chunked request omits content-length, so nothing bounded
+    // the allocation on an endpoint that is reachable without credentials.
+    let rawBody: string
+    try {
+      rawBody = await readTextWithLimit(request, MAX_WEBHOOK_BYTES)
+    } catch (readError: any) {
+      if (readError?.name === 'PayloadTooLargeError' || readError?.limitBytes) {
+        return NextResponse.json({ error: 'Payload too large' }, { status: 413 })
+      }
+      throw readError
     }
 
     const signature =
@@ -140,31 +152,57 @@ export async function POST(
 
     // ── 4. Idempotency ─────────────────────────────────────────────────────
     const existingLog = await db.webhookLog.findUnique({ where: { signatureHash } })
-    if (existingLog?.processed) {
-      // Already handled — acknowledge so the provider stops retrying.
+    if (decideWebhookLogAction(existingLog) === 'duplicate') {
+      // Genuinely finished — acknowledge so the provider stops retrying.
       return NextResponse.json({ success: true, duplicate: true })
     }
 
     const sanitizedPayload = redactPhoneNumbersInText(rawBody)
 
-    let webhookLog: { id: string }
-    try {
-      webhookLog = await createWebhookLog({
-        provider: normalizedProvider,
-        eventType: 'WEBHOOK_RECEIVED',
-        payload: sanitizedPayload,
-        signature,
-        signatureHash,
-        verified: true,
-        processed: false,
-      })
-    } catch (logError: any) {
-      if (logError?.code === 'P2002') {
-        // Concurrent duplicate delivery for the same event.
-        return NextResponse.json({ success: true, duplicate: true })
+    // An existing-but-unfinished row is RESUMED, not duplicated.
+    //
+    // The row is written with `processed: false` before any work happens, so if
+    // a previous delivery died part-way (DB blip, timeout, a lost race on the
+    // wallet balance) that row is still here. Attempting a fresh insert would
+    // hit the unique key, and the old code answered 200 {duplicate: true} — the
+    // provider stopped retrying and the payment never settled, silently. Reusing
+    // the row lets the delivery complete; every step below is idempotent, so
+    // running it twice is harmless.
+    let resolvedLog: { id: string } | null = existingLog
+
+    if (!resolvedLog) {
+      try {
+        resolvedLog = await createWebhookLog({
+          provider: normalizedProvider,
+          eventType: 'WEBHOOK_RECEIVED',
+          payload: sanitizedPayload,
+          signature,
+          signatureHash,
+          verified: true,
+          processed: false,
+        })
+      } catch (logError: any) {
+        if (logError?.code !== 'P2002') throw logError
+
+        // Another delivery of this event inserted the row between our read and
+        // this insert. Re-read to find out whether it *finished* or is still in
+        // flight / died: only a finished row is a duplicate.
+        const concurrent = await db.webhookLog.findUnique({ where: { signatureHash } })
+        if (!concurrent) throw logError
+
+        if (decideWebhookLogAction(concurrent) === 'duplicate') {
+          return NextResponse.json({ success: true, duplicate: true })
+        }
+        resolvedLog = concurrent
       }
-      throw logError
     }
+
+    // Narrowed once, explicitly: the compiler cannot see that every branch above
+    // either assigns or returns, and the rest of the handler needs a non-null id.
+    if (!resolvedLog) {
+      throw new Error('webhook log row missing after dedupe resolution')
+    }
+    const webhookLog: { id: string } = resolvedLog
 
     if (!parsedBody) {
       await db.webhookLog.update({
@@ -197,7 +235,7 @@ export async function POST(
 
     const fullPaymentIntent = await db.paymentIntent.findUnique({
       where: { id: paymentIntent.id },
-      include: { application: true, tenant: true },
+      include: { application: true, tenant: true, provider: { select: { code: true } } },
     })
 
     if (!fullPaymentIntent) {
@@ -206,6 +244,31 @@ export async function POST(
         data: { processingError: 'Payment not found', processed: true },
       })
       return NextResponse.json({ error: 'Payment not found' }, { status: 404 })
+    }
+
+    // ── The intent must belong to the provider that signed this request ─────
+    // Otherwise a callback signed by provider A can settle a payment created
+    // through provider B: the signature verifies against A's secret, the
+    // reference is a B reference, and the amount/currency gates below compare
+    // against the stored intent — so a *correctly sized* A-signed body would
+    // flip a B payment to success. Harmless while exactly one provider is
+    // implemented, which is precisely why it must be enforced before a second
+    // adapter is added (see IMPLEMENTED_PROVIDER_CODES).
+    if (String(fullPaymentIntent.provider?.code || '').toLowerCase() !== normalizedProvider) {
+      await db.webhookLog.update({
+        where: { id: webhookLog.id },
+        data: {
+          paymentIntentId: paymentIntent.id,
+          processed: true,
+          processingError:
+            `PROVIDER_MISMATCH intent=${fullPaymentIntent.provider?.code} route=${normalizedProvider}`,
+        },
+      })
+      console.error(
+        `[Webhook] Rejected ${normalizedProvider} callback for ${paymentIntent.reference}: ` +
+          `payment belongs to provider "${fullPaymentIntent.provider?.code}".`
+      )
+      return NextResponse.json({ error: 'Provider mismatch' }, { status: 409 })
     }
 
     const normalizedStatus = String(parsedWebhook.status || '').toLowerCase()
@@ -305,11 +368,11 @@ export async function POST(
         failureReason: parsedWebhook.failureReason,
         applicationId: fullPaymentIntent.applicationId,
         webhookUrl: `${fullPaymentIntent.application.baseUrl}${fullPaymentIntent.application.webhookPath}`,
-        apiKey: fullPaymentIntent.application.apiKey,
+        webhookSecret: webhookSecretFromRow(fullPaymentIntent.application),
         externalEntityId: fullPaymentIntent.externalEntityId,
         metadata: (() => {
           try {
-            return fullPaymentIntent.metadata ? JSON.parse(fullPaymentIntent.metadata) : {}
+            return safeJsonObject(fullPaymentIntent.metadata)
           } catch {
             return {}
           }
@@ -323,37 +386,4 @@ export async function POST(
     console.error(`Webhook error (${normalizedProvider}):`, error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
-}
-
-/**
- * Candidate webhook URLs used as the signature base string, most authoritative
- * first.
- *
- * LivePay signs `<url><timestamp><sorted params>` where `<url>` is the URL it
- * was given at initiation time. We therefore try the configured public origin
- * before anything derived from request headers: trusting `x-forwarded-host`
- * lets a caller control a component of the signed string.
- */
-export function buildSignatureUrlCandidates(request: Request): string[] {
-  const urls: string[] = []
-  const path = new URL(request.url).pathname
-
-  const configured = (process.env.NEXTAUTH_URL || '').replace(/\/+$/, '')
-  if (configured) urls.push(`${configured}${path}`)
-
-  const vercel = (process.env.VERCEL_URL || '').replace(/\/+$/, '')
-  if (vercel) urls.push(`https://${vercel}${path}`)
-
-  if (process.env.NODE_ENV !== 'production') {
-    const host = request.headers.get('x-forwarded-host') || request.headers.get('host')
-    const protocol = request.headers.get('x-forwarded-proto') || 'https'
-    if (host) urls.push(`${protocol}://${host}${path}`)
-    urls.push(`http://localhost:3000${path}`)
-  }
-
-  const unique = Array.from(new Set(urls.map((u) => u.replace(/\/+$/, ''))))
-  if (unique.length === 0) {
-    throw new Error('No webhook base URL configured (set NEXTAUTH_URL)')
-  }
-  return unique
 }

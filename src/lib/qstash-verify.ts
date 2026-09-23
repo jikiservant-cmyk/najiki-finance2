@@ -1,4 +1,5 @@
 import { Receiver } from '@upstash/qstash'
+import { constantTimeEqual } from '@/lib/api-keys'
 
 export async function verifyCronRequest(request: Request): Promise<boolean> {
   const qstashSignature = request.headers.get('upstash-signature')
@@ -28,7 +29,13 @@ export async function verifyCronRequest(request: Request): Promise<boolean> {
   }
 
   // 2. CRON_SECRET Fallback (for Vercel Cron, GitHub Actions, or local manual testing)
-  if (!isAuthorized && cronSecret && authHeader === `Bearer ${cronSecret}`) {
+  //
+  // Compared in constant time. `===` on a secret short-circuits at the first
+  // differing byte, which leaks its prefix to anyone who can time the response.
+  // Remote timing attacks on a 16+ character secret are impractical over the
+  // internet, but this is the same primitive the API-key path already uses and
+  // there is no reason for the cron path to be the weaker one.
+  if (!isAuthorized && cronSecret && constantTimeEqual(authHeader ?? '', `Bearer ${cronSecret}`)) {
     isAuthorized = true
   }
 

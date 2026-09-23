@@ -11,6 +11,7 @@
  *   /api/cron/notifications     every minute   — retry undelivered webhooks
  *   /api/qstash/sms-cron        every minute   — drain the SMS queue
  *   /api/cron/alerts            every 15 min   — stuck payments / exhausted webhooks
+ *   /api/cron/retention         daily at 03:00 — mask phone numbers past retention
  *
  * QStash is already a dependency (it delivers partner webhooks), so scheduling
  * through it works on any hosting plan and keeps everything in one dashboard.
@@ -49,7 +50,13 @@ const JOBS: Job[] = [
     name: 'najiki-alerts',
     path: '/api/cron/alerts',
     cron: '*/15 * * * *',
-    description: 'Operational alerting (stuck payments, exhausted webhooks, SMS backlog)',
+    description: 'Operational alerting (stuck payments, exhausted webhooks, SMS backlog, ledger drift)',
+  },
+  {
+    name: 'najiki-retention',
+    path: '/api/cron/retention',
+    cron: '0 3 * * *',
+    description: 'Mask or purge customer phone numbers past the retention window',
   },
 ]
 

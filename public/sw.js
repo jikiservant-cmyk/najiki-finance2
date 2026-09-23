@@ -1,5 +1,5 @@
 // Service Worker for Na'jiki PWA
-const CACHE_NAME = 'najiki-cache-v6';
+const CACHE_NAME = 'najiki-cache-v7';
 const OFFLINE_URL = '/offline';
 
 // NOTE: every entry here must actually exist, otherwise the request 404s.
@@ -9,7 +9,7 @@ const OFFLINE_URL = '/offline';
 // offline page and all icons uncached.
 const PRECACHE_ASSETS = [
   OFFLINE_URL,
-  '/manifest.json',
+  '/manifest.webmanifest',
   '/logo.svg',
   '/icons/icon-192x192.png',
   '/icons/icon-512x512.png',

@@ -3,7 +3,8 @@
  *
  * Deliberately public (the middleware exempts it) and deliberately boring: it
  * returns only booleans, counters and the deploy commit — never configuration
- * values, keys or customer data.
+ * values, keys, customer data, or raw dependency error text (which can carry the
+ * database host and user).
  *
  *   200 — every dependency answered
  *   503 — at least one dependency is down (load balancers should stop routing)
@@ -31,7 +32,12 @@ async function withTimeout<T>(label: string, work: Promise<T>): Promise<{ ok: bo
     ])
     return { ok: true }
   } catch (error) {
-    return { ok: false, detail: error instanceof Error ? error.message : 'unknown error' }
+    // Log the real error, return a label. This endpoint is unauthenticated and
+    // the message from a Prisma/Postgres connection failure routinely contains
+    // the host, port and user from the connection string, which is exactly the
+    // internal detail a probe should not hand to an anonymous caller.
+    console.error(`[health] ${label} check failed:`, error)
+    return { ok: false, detail: `${label} unavailable` }
   } finally {
     if (timer) clearTimeout(timer)
   }

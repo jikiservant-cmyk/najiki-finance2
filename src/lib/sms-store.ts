@@ -38,6 +38,14 @@ export interface SmsRequest {
   updatedAt: string
 }
 
+/**
+ * Placeholder unit cost, in UGX, until the provider reports the real one.
+ *
+ * UGX has no minor unit, so this is a whole-shilling figure. Exported so the
+ * send routes and the reconciliation logic agree on the sentinel value.
+ */
+export const SMS_COST_PLACEHOLDER = 50
+
 function newId(): string {
   return `sms_${randomBytes(10).toString('hex')}`
 }
@@ -68,6 +76,7 @@ export const smsStore = {
     cost: number
     applicationId?: string | null
     senderId?: string | null
+    idempotencyKey?: string | null
   }): Promise<SmsRequest> => {
     const row = await db.smsMessage.create({
       data: {
@@ -82,9 +91,55 @@ export const smsStore = {
         providerCode: params.providerCode,
         cost: params.cost,
         senderId: params.senderId ?? null,
+        idempotencyKey: params.idempotencyKey ?? null,
       },
     })
     return toSms(row)
+  },
+
+  /**
+   * Create a message, or return the one a previous attempt with the same
+   * idempotency key already created.
+   *
+   * The lookup-then-insert would race under concurrent retries, so the unique
+   * constraint on (applicationId, idempotencyKey) is the real guard: whichever
+   * insert loses gets a P2002 and reads back the winner's row. SMS costs money
+   * per message, so a duplicate here is a duplicate charge.
+   *
+   * Returns `created: false` when an existing message was reused.
+   */
+  createOrGet: async (params: {
+    recipient: string
+    message: string
+    applicationCode: string
+    providerCode: string
+    cost: number
+    applicationId?: string | null
+    senderId?: string | null
+    idempotencyKey?: string | null
+  }): Promise<{ sms: SmsRequest; created: boolean }> => {
+    const key = params.idempotencyKey?.trim() || null
+
+    if (key && params.applicationId) {
+      const existing = await db.smsMessage.findFirst({
+        where: { applicationId: params.applicationId, idempotencyKey: key },
+      })
+      if (existing) return { sms: toSms(existing), created: false }
+    }
+
+    try {
+      const sms = await smsStore.create({ ...params, idempotencyKey: key })
+      return { sms, created: true }
+    } catch (error: any) {
+      // P2002: the unique constraint fired, so a concurrent retry won the race.
+      if (error?.code !== 'P2002' || !key || !params.applicationId) throw error
+
+      const winner = await db.smsMessage.findFirst({
+        where: { applicationId: params.applicationId, idempotencyKey: key },
+      })
+      if (!winner) throw error
+      return { sms: toSms(winner), created: false }
+    }
   },
 
   get: async (id: string): Promise<SmsRequest | null> => {
@@ -153,6 +208,33 @@ export const smsStore = {
     } catch {
       // Row removed or never existed — callers treat null as "not found".
       return null
+    }
+  },
+
+  /**
+   * Replace the placeholder cost with what the provider actually charged.
+   *
+   * `cost` was hardcoded to 50 at creation and the real figure returned by the
+   * provider was discarded, yet the dashboard sums this column and labels it
+   * "Total Cost". Real cost varies by destination, by sender ID and by message
+   * length (a long SMS is billed as multiple parts), so the placeholder was
+   * wrong in every direction.
+   *
+   * Only overwrites a zero/placeholder value: a settled cost is not re-derived
+   * from a later retry, which could double-count parts.
+   */
+  updateProviderCost: async (id: string, cost: number | null | undefined): Promise<boolean> => {
+    if (typeof cost !== 'number' || !Number.isFinite(cost) || cost < 0) return false
+    const rounded = Math.round(cost)
+
+    try {
+      const result = await db.smsMessage.updateMany({
+        where: { id, cost: SMS_COST_PLACEHOLDER },
+        data: { cost: rounded },
+      })
+      return result.count > 0
+    } catch {
+      return false
     }
   },
 

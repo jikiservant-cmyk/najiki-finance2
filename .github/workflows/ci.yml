@@ -46,7 +46,12 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Must be >= 22.6: `npm test` runs the suites with
+          # `node --experimental-strip-types`, which does not exist on Node 20
+          # ("node: bad option: --experimental-strip-types"). The app itself
+          # still builds and runs on Node 20 — only the test tooling needs 22+,
+          # which is where the suites were verified.
+          node-version: 22
           cache: npm
 
       - name: Install dependencies
