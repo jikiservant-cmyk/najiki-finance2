@@ -2,11 +2,11 @@ import { redis } from './redis'
 import { smsStore, SmsRequest } from './sms-store'
 import { sendSmsViaProvider } from './sms'
 import { db } from './db'
-import { createHmac } from 'crypto'
 import { safeFetch, isPlaceholderUrl } from './safe-fetch'
 import { computeNextRetryAt, isExhausted } from './backoff'
 import { maskPhoneNumber } from './redact'
 import { webhookSecretFromRow } from './application-auth'
+import { buildNotificationHeaders } from './notification-signature'
 import { parseProviderCost } from './provider-cost'
 
 const SMS_QUEUE_KEY = 'sms:queue'
@@ -165,16 +165,16 @@ export const smsQueue = {
               applicationCode: application.code
             })
             
-            const headers: Record<string, string> = {
-              'Content-Type': 'application/json',
-              'X-Najiki-Notification': 'true'
-            }
-
-            const webhookSecret = webhookSecretFromRow(application)
-            if (webhookSecret) {
-              headers['X-Najiki-Signature'] = createHmac('sha256', webhookSecret).update(payload).digest('hex')
-              headers['Authorization'] = `Bearer ${webhookSecret}`
-            }
+            // Same signer as the payment-notification path. This used to build
+            // its own bare HMAC and *also* send `Authorization: Bearer <secret>`,
+            // which meant a partner had to implement two verification schemes,
+            // the SMS one had no timestamp (so a captured body stayed valid
+            // forever), and the signing secret itself was copied into a header a
+            // partner's proxy or log aggregator would record.
+            const headers = buildNotificationHeaders(
+              webhookSecretFromRow(application),
+              payload
+            )
 
             try {
               await safeFetch(webhookUrl, {
@@ -245,16 +245,10 @@ export const smsQueue = {
               applicationCode: application.code
             })
             
-            const headers: Record<string, string> = {
-              'Content-Type': 'application/json',
-              'X-Najiki-Notification': 'true'
-            }
-
-            const webhookSecret = webhookSecretFromRow(application)
-            if (webhookSecret) {
-              headers['X-Najiki-Signature'] = createHmac('sha256', webhookSecret).update(payload).digest('hex')
-              headers['Authorization'] = `Bearer ${webhookSecret}`
-            }
+            const headers = buildNotificationHeaders(
+              webhookSecretFromRow(application),
+              payload
+            )
 
             try {
               await safeFetch(webhookUrl, { method: 'POST', headers, body: payload })

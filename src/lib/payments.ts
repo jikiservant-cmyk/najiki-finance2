@@ -290,8 +290,8 @@ export async function completePayment(data: {
 }
 
 import { Client } from '@upstash/qstash'
-import { createHmac } from 'crypto'
 import { safeFetch, validateSafeUrl } from './safe-fetch'
+import { buildNotificationHeaders } from './notification-signature'
 import {
   NOTIFICATION_MAX_ATTEMPTS as MAX_ATTEMPTS,
   computeNextRetryAt,
@@ -316,30 +316,9 @@ export {
   isExhausted as isNotificationExhausted,
 } from './backoff'
 
-/**
- * Build the outbound webhook headers, including the timestamped HMAC signature
- * used for replay protection on the receiving application.
- */
-export function buildNotificationHeaders(
-  secret: string | null,
-  payloadString: string
-): Record<string, string> {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    'X-Najiki-Notification': 'true',
-  }
-
-  if (secret) {
-    const timestamp = Date.now()
-    const signature = createHmac('sha256', secret)
-      .update(`${timestamp}.${payloadString}`)
-      .digest('hex')
-    headers['X-Najiki-Timestamp'] = String(timestamp)
-    headers['X-Najiki-Signature'] = `t=${timestamp},v=${signature}`
-  }
-
-  return headers
-}
+// The signer lives in ./notification-signature so it can be unit-tested; this
+// re-export keeps the existing import path working.
+export { buildNotificationHeaders }
 
 /**
  * Mark all in-flight notifications for a payment intent as delivered.
