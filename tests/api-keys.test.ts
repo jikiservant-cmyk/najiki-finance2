@@ -160,3 +160,51 @@ test('shape checking rejects the obvious junk but keeps legacy keys valid', () =
   assert.equal(looksLikeApiKey(null), false)
   assert.equal(looksLikeApiKey('x'.repeat(501)), false)
 })
+
+// ─── rotation ────────────────────────────────────────────────────────────────
+
+test('rotating to a new key revokes the old one', () => {
+  // Rotation writes a fresh hash and destroys the old cleartext. The old key must
+  // stop verifying against the stored hash — this is the property that makes a
+  // leaked key revocable, and it is why `findApplicationByApiKey` must never
+  // consult the cleartext column for a row that has a hash.
+  const oldKey = generateApiKey('live')
+  const newKey = generateApiKey('live')
+
+  const storedHash = hashApiKey(newKey) // after rotation
+
+  assert.equal(verifyApiKey(newKey, storedHash), true, 'the new key must work')
+  assert.equal(verifyApiKey(oldKey, storedHash), false, 'the superseded key must not')
+})
+
+test('two rotations never collide, and the previous hash never accepts the next key', () => {
+  const first = generateApiKey('live')
+  const second = generateApiKey('live')
+  const third = generateApiKey('live')
+
+  assert.notEqual(hashApiKey(first), hashApiKey(second))
+  assert.notEqual(hashApiKey(second), hashApiKey(third))
+
+  // Verifying against a stale hash (a row that was not actually updated) fails,
+  // so a partial rotation cannot leave two working keys behind.
+  assert.equal(verifyApiKey(second, hashApiKey(first)), false)
+  assert.equal(verifyApiKey(third, hashApiKey(second)), false)
+})
+
+test('the hash of a rotated key is stable, so re-hashing a row is idempotent', () => {
+  // The migration and the rotation path both write `hashApiKey(key)`. If that
+  // were salted per call, re-running the migration would invalidate every key.
+  const key = generateApiKey('live')
+  assert.equal(hashApiKey(key), hashApiKey(key))
+})
+
+test('a truncated or partial key from the dashboard does not verify', () => {
+  // The UI only ever shows the hint. Nothing derived from the displayed value
+  // may authenticate, including a prefix or suffix of the real key.
+  const key = generateApiKey('live')
+  const hash = hashApiKey(key)
+
+  assert.equal(verifyApiKey(key.slice(0, 20), hash), false)
+  assert.equal(verifyApiKey(key.slice(-20), hash), false)
+  assert.equal(verifyApiKey(`njk_••••••••${apiKeyHint(key)}`, hash), false)
+})

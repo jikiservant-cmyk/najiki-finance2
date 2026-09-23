@@ -59,9 +59,16 @@ export interface ApplicationAuthResult {
 /**
  * Find the active application a raw API key belongs to, or null.
  *
- * Prefers the hash. Falls back to the cleartext column only when the hash
- * column is empty for the candidate row — a row that has been migrated cannot
- * authenticate with a stolen cleartext copy, because the plaintext is gone.
+ * The hash is the only authentication path for a row that has one. The
+ * cleartext column is consulted *only* for rows where `apiKeyHash` is null,
+ * i.e. applications provisioned before hashing existed and not yet migrated.
+ *
+ * That condition is load-bearing. This function previously matched the
+ * cleartext column unconditionally, which quietly defeated key rotation: a
+ * rotated row keeps its old cleartext value unless something clears it, so the
+ * superseded key stayed valid — you could not revoke a leaked credential. A row
+ * with a hash cannot authenticate with a stolen cleartext copy, because the
+ * cleartext is not consulted for it.
  */
 export async function findApplicationByApiKey(
   rawApiKey: string,
@@ -86,6 +93,9 @@ export async function findApplicationByApiKey(
   const byPlaintext = await db.application.findFirst({
     where: {
       apiKey,
+      // NOT an optimisation: it restricts the fallback to un-migrated rows, so a
+      // row that has a hash can never be authenticated by its old cleartext.
+      apiKeyHash: null,
       isActive: true,
       ...(filter.code ? { code: filter.code } : {}),
     },

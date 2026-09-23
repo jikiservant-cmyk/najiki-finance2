@@ -30,6 +30,20 @@ const ApplicationSchema = z.object({
 
 const UpdateApplicationSchema = ApplicationSchema.partial({ code: true }).extend({ id: Id })
 
+/**
+ * Rotate an application's credentials.
+ *
+ * `rotateWebhookSecret` defaults to **false** deliberately: the webhook secret
+ * is what a partner verifies our outbound notifications with, so rotating it
+ * silently would make every delivery fail signature verification on their side
+ * until they are told the new one. Rotating the API key alone is the common case
+ * (a leaked or lost key) and has no partner-side effect.
+ */
+const RotateApplicationSchema = z.object({
+  id: Id,
+  rotateWebhookSecret: z.boolean().optional().default(false),
+})
+
 const ProviderSchema = z.object({
   code: Code,
   name: z.string().min(1).max(200),
@@ -213,6 +227,45 @@ export async function POST(request: Request) {
             isActive: parsed.data.isActive,
           },
         })
+        break
+      }
+
+      case 'rotateApplication': {
+        // There was no rotation path at all, while the dashboard told operators
+        // to "rotate it" when a key was lost. The only recovery from a leaked
+        // partner key was deleting the application — which cannot be done once
+        // it has payment history, and is not what you want during an incident.
+        const parsed = RotateApplicationSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
+
+        const credentials = newApplicationCredentials()
+        const rotateWebhookSecret = parsed.data.rotateWebhookSecret === true
+
+        const updated = await db.application.update({
+          where: { id: parsed.data.id },
+          data: {
+            apiKeyHash: credentials.data.apiKeyHash,
+            apiKeyHint: credentials.data.apiKeyHint,
+            apiKeyRotatedAt: credentials.data.apiKeyRotatedAt,
+            // Destroying the old cleartext is what makes this a real
+            // revocation rather than a second working key. `findApplicationByApiKey`
+            // consults the cleartext column only for rows with no hash, so once
+            // this row has the new hash the superseded key is dead.
+            apiKey: null,
+            ...(rotateWebhookSecret
+              ? { webhookSecretEncrypted: credentials.data.webhookSecretEncrypted }
+              : {}),
+          },
+          omit: { apiKey: true, apiKeyHash: true, webhookSecretEncrypted: true },
+        })
+
+        // Returned exactly once. Neither value is recoverable afterwards.
+        result = {
+          ...updated,
+          apiKey: credentials.plaintextApiKey,
+          webhookSecretRotated: rotateWebhookSecret,
+          ...(rotateWebhookSecret ? { webhookSecret: credentials.webhookSecret } : {}),
+        }
         break
       }
 

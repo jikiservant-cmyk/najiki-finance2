@@ -209,6 +209,45 @@ export default function SetupPage() {
     }
   }
 
+  /**
+   * Rotate an application's API key.
+   *
+   * Confirmed first, because it is irreversible and immediately breaks any
+   * integration still using the old key. The new key is shown once, in the same
+   * banner a newly created application uses.
+   */
+  async function handleRotateApplication(appId: string, appName: string) {
+    if (!window.confirm(
+      `Rotate the API key for "${appName}"?\n\n` +
+      'The current key stops working immediately. Any integration still using ' +
+      'it will start getting 401s until it is updated.'
+    )) return
+
+    try {
+      const res = await fetch('/api/setup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'rotateApplication', data: { id: appId } }),
+      })
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        setStatusMessage({ type: 'error', text: err.error || 'Failed to rotate API key' })
+        return
+      }
+
+      const rotated = await res.json()
+      setNewApiKey(rotated.apiKey)
+      setStatusMessage({
+        type: 'success',
+        text: `New API key issued for "${appName}". Copy it now — it is not stored and cannot be shown again.`,
+      })
+      fetchData()
+    } catch {
+      setStatusMessage({ type: 'error', text: 'Failed to rotate API key' })
+    }
+  }
+
   async function handleCreateProvider(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault()
     const formData = new FormData(e.currentTarget)
@@ -595,8 +634,17 @@ export default function SetupPage() {
                           </div>
                           <p className="text-[11px] text-muted-foreground mt-1">
                             Only a hash is stored, so the key cannot be shown again. If it
-                            is lost, rotate it — the old one stops working immediately.
+                            is lost or leaked, rotate it — the old one stops working immediately.
                           </p>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="mt-2"
+                            onClick={() => handleRotateApplication(app.id, app.name)}
+                          >
+                            Rotate API Key
+                          </Button>
                         </div>
                       )}
                     </CardContent>
