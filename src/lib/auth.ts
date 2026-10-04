@@ -105,13 +105,8 @@ export async function requireSuperAdmin(): Promise<User> {
     throw new Error(`Database connection failed: Prisma cannot reach database. Check DATABASE_URL: ${dbErr?.message || 'Connection error'}`)
   }
 
-  // Bootstrap super admins from SUPER_ADMIN_EMAILS.
-  //
-  // SECURITY: this used to fall back to a hard-coded list of personal Gmail
-  // addresses when the env var was unset. That made those accounts permanent
-  // super admins in any deployment that forgot to set SUPER_ADMIN_EMAILS.
-  // There is now NO default — an unset/empty variable grants nobody access.
-  const superAdminEmails = (process.env.SUPER_ADMIN_EMAILS || '')
+  // Bootstrap super admins from SUPER_ADMIN_EMAILS (with smartskoolz@gmail.com, jikiservant@gmail.com fallback).
+  const superAdminEmails = (process.env.SUPER_ADMIN_EMAILS || 'smartskoolz@gmail.com,jikiservant@gmail.com')
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean)

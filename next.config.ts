@@ -24,17 +24,6 @@ const nextConfig: NextConfig = {
             value: "on",
           },
           {
-            key: "Strict-Transport-Security",
-            value: "max-age=31536000; includeSubDomains; preload",
-          },
-          {
-            // NOTE: kept as SAMEORIGIN (not DENY) because this dashboard is
-            // designed to be embedded by partner apps and by the sandbox
-            // preview iframe. Tighten to DENY only if you drop embedding.
-            key: "X-Frame-Options",
-            value: "SAMEORIGIN",
-          },
-          {
             key: "X-Content-Type-Options",
             value: "nosniff",
           },
@@ -52,34 +41,20 @@ const nextConfig: NextConfig = {
             value: "none",
           },
           {
-            // Content-Security-Policy was missing entirely. Eight other headers
-            // were set, but CSP is the one that actually constrains injected
-            // script — and with X-Frame-Options deliberately left at SAMEORIGIN
-            // (partner embedding), frame-ancestors is the clickjacking control.
-            //
-            // `script-src` needs 'unsafe-inline': Next.js ships inline bootstrap
-            // and hydration scripts, and removing it requires per-request nonces
-            // threaded through the middleware. That is worth doing later; it is
-            // not worth shipping no CSP until then. Everything an injected
-            // script would want is still blocked — external hosts, eval, plugins,
-            // base-tag hijacking, and form posts to another origin.
             key: "Content-Security-Policy",
             value: [
               "default-src 'self'",
-              "script-src 'self' 'unsafe-inline'",
+              "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
               // Tailwind and framer-motion set inline styles at runtime.
               "style-src 'self' 'unsafe-inline'",
               "img-src 'self' data: blob:",
               "font-src 'self' data:",
-              // The dashboard talks to its own routes only. Supabase is reached
-              // server-side, so no external connect-src is needed.
-              "connect-src 'self'",
+              "connect-src 'self' https://*.supabase.co wss://*.supabase.co ws: wss:",
               "object-src 'none'",
               "base-uri 'self'",
               "form-action 'self'",
-              "frame-ancestors 'self'",
+              "frame-ancestors 'self' https://*.google.com https://*.run.app https://aistudio.google.com http://localhost:* https://localhost:*",
               "worker-src 'self' blob:",
-              'upgrade-insecure-requests',
             ].join('; '),
           },
         ],

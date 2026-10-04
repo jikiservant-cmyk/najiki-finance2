@@ -1,0 +1,7 @@
+{
+  "name": "Na'jiki Finance",
+  "description": "Unified Payment & Messaging Gateway",
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
