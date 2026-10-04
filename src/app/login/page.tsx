@@ -9,7 +9,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from '@/components/ui/card'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { Loader2, AlertCircle, Info, Database, CheckCircle2, ArrowRight, RefreshCw } from 'lucide-react'
+import { Loader2, AlertCircle, Info } from 'lucide-react'
 
 export default function LoginPage() {
   const [email, setEmail] = useState('')
@@ -17,11 +17,6 @@ export default function LoginPage() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [isConfigured, setIsConfigured] = useState(true)
-  const [isCheckingHealth, setIsCheckingHealth] = useState(false)
-  const [healthStatus, setHealthStatus] = useState<{
-    database?: { ok: boolean; detail?: string }
-    cache?: { ok: boolean; detail?: string }
-  } | null>(null)
 
   const router = useRouter()
   const supabase = useMemo(() => createClient(), [])
@@ -30,22 +25,7 @@ export default function LoginPage() {
     setIsConfigured(isBrowserSupabaseConfigured())
   }, [])
 
-  const checkConnection = async () => {
-    setIsCheckingHealth(true)
-    try {
-      const res = await fetch('/api/health')
-      const data = await res.json()
-      setHealthStatus(data.checks || {})
-    } catch {
-      setHealthStatus({
-        database: { ok: false, detail: 'Failed to reach health endpoint' },
-      })
-    } finally {
-      setIsCheckingHealth(false)
-    }
-  }
-
-  const handleLogin = async (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setLoading(true)
     setError(null)
@@ -81,10 +61,6 @@ export default function LoginPage() {
     }
   }
 
-  const handleDevBypass = () => {
-    router.push('/')
-  }
-
   return (
     <div className="min-h-screen flex items-center justify-center bg-background px-4 py-8">
       <Card className="w-full max-w-md shadow-lg border-border/60">
@@ -112,7 +88,9 @@ export default function LoginPage() {
             </svg>
           </div>
           <CardTitle className="text-2xl font-bold">Na&apos;jiki Finance</CardTitle>
-          <CardDescription>Sign in to access the payment and messaging gateway</CardDescription>
+          <CardDescription>
+            Sign in to access the payment and messaging gateway
+          </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           {!isConfigured && (
@@ -121,22 +99,8 @@ export default function LoginPage() {
               <AlertTitle className="text-amber-300 font-semibold text-xs tracking-wider uppercase">
                 Supabase Auth Not Configured
               </AlertTitle>
-              <AlertDescription className="text-xs text-amber-200/90 mt-1 space-y-2">
-                <p>
-                  <code>NEXT_PUBLIC_SUPABASE_URL</code> and <code>NEXT_PUBLIC_SUPABASE_ANON_KEY</code> are missing or set to placeholder values.
-                </p>
-                {process.env.NODE_ENV !== 'production' && (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={handleDevBypass}
-                    className="w-full mt-2 border-amber-400/40 text-amber-300 hover:bg-amber-400/20 text-xs font-mono"
-                  >
-                    Enter Dashboard (Dev Mode Bypass)
-                    <ArrowRight className="ml-1.5 h-3.5 w-3.5" />
-                  </Button>
-                )}
+              <AlertDescription className="text-xs text-amber-200/90 mt-1">
+                <code>NEXT_PUBLIC_SUPABASE_URL</code> and <code>NEXT_PUBLIC_SUPABASE_ANON_KEY</code> are missing or set to placeholder values.
               </AlertDescription>
             </Alert>
           )}
@@ -145,7 +109,7 @@ export default function LoginPage() {
             <Alert variant="destructive">
               <AlertCircle className="h-4 w-4" />
               <AlertTitle className="text-xs font-semibold uppercase tracking-wider">
-                Connection / Login Error
+                Authentication Error
               </AlertTitle>
               <AlertDescription className="text-xs mt-1 leading-relaxed whitespace-pre-wrap">
                 {error}
@@ -153,7 +117,7 @@ export default function LoginPage() {
             </Alert>
           )}
 
-          <form onSubmit={handleLogin} className="space-y-4">
+          <form onSubmit={handleSubmit} className="space-y-4">
             <div className="space-y-2">
               <Label htmlFor="email">Email</Label>
               <Input
@@ -189,51 +153,6 @@ export default function LoginPage() {
               )}
             </Button>
           </form>
-
-          {/* Connection status diagnostics */}
-          <div className="pt-2 border-t border-border/40">
-            <div className="flex items-center justify-between text-xs text-muted-foreground mb-2">
-              <span className="font-mono text-[11px] uppercase tracking-wider flex items-center gap-1.5">
-                <Database className="w-3.5 h-3.5" />
-                Connection Diagnostics
-              </span>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={checkConnection}
-                disabled={isCheckingHealth}
-                className="h-6 px-2 text-[10px] font-mono gap-1 text-muted-foreground hover:text-foreground"
-              >
-                <RefreshCw className={`w-3 h-3 ${isCheckingHealth ? 'animate-spin' : ''}`} />
-                Check DB
-              </Button>
-            </div>
-
-            {healthStatus && (
-              <div className="rounded-md bg-muted/50 p-2.5 text-xs font-mono space-y-1.5 border border-border/50">
-                <div className="flex items-center justify-between">
-                  <span className="text-muted-foreground">Prisma Database:</span>
-                  {healthStatus.database?.ok ? (
-                    <span className="text-emerald-400 flex items-center gap-1">
-                      <CheckCircle2 className="w-3 h-3" /> Connected
-                    </span>
-                  ) : (
-                    <span className="text-red-400 flex items-center gap-1">
-                      <AlertCircle className="w-3 h-3" />
-                      {healthStatus.database?.detail || 'Disconnected'}
-                    </span>
-                  )}
-                </div>
-
-                {!healthStatus.database?.ok && (
-                  <p className="text-[10px] text-muted-foreground/90 font-sans pt-1 border-t border-border/40">
-                    💡 If connecting Prisma to Supabase pooler on port 6543, ensure <code>?pgbouncer=true</code> is appended to <code>DATABASE_URL</code> in <code>.env</code>.
-                  </p>
-                )}
-              </div>
-            )}
-          </div>
         </CardContent>
         <CardFooter className="justify-center border-t border-border/30 pt-3">
           <p className="text-[11px] text-muted-foreground font-mono text-center">

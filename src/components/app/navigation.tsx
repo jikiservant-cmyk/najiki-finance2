@@ -24,6 +24,7 @@ export function Navigation() {
   const supabase = useMemo(() => createClient(), [])
 
   const handleLogout = async () => {
+    document.cookie = 'dev_session=; path=/; max-age=0; SameSite=Lax'
     await supabase.auth.signOut()
     router.refresh()
     router.push('/login')

@@ -7,12 +7,15 @@
  * Check whether Supabase environment variables are provided and not placeholders.
  */
 export function isSupabaseConfigured(
-  url: string | undefined | null = process.env.NEXT_PUBLIC_SUPABASE_URL,
-  key: string | undefined | null = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  url?: string | null,
+  key?: string | null
 ): boolean {
-  if (!url || !key) return false
-  const trimmedUrl = String(url).trim()
-  const trimmedKey = String(key).trim()
+  const resolvedUrl = arguments.length > 0 ? url : process.env.NEXT_PUBLIC_SUPABASE_URL
+  const resolvedKey = arguments.length > 1 ? key : process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+
+  if (!resolvedUrl || !resolvedKey) return false
+  const trimmedUrl = String(resolvedUrl).trim()
+  const trimmedKey = String(resolvedKey).trim()
 
   if (!trimmedUrl.startsWith('http://') && !trimmedUrl.startsWith('https://')) return false
   if (trimmedUrl.includes('placeholder') || trimmedUrl.includes('your-project')) return false
