@@ -138,6 +138,8 @@ export async function processPayment(data: {
           webhookUrl: `${payment.application.baseUrl}${payment.application.webhookPath}`,
           webhookSecret: webhookSecretFromRow(payment.application),
           externalEntityId: payment.externalEntityId,
+          tenantId: payment.tenantId ?? null,
+          tenantCode: payment.tenant?.code ?? null,
           metadata: safeJsonObject(payment.metadata),
         })
       }
@@ -299,6 +301,8 @@ export async function completePayment(data: {
         providerPaymentId: providerPaymentId || '',
         failureReason: failureReason || null,
         externalEntityId: fullPaymentIntent.externalEntityId,
+        tenantId: fullPaymentIntent.tenantId,
+        tenantCode: fullPaymentIntent.tenant?.code ?? null,
         metadata: safeJsonObject(fullPaymentIntent.metadata),
       }
 
@@ -505,6 +509,9 @@ export async function enqueueWebhookNotification(data: {
   /** Outbound signing secret — see `webhookSecretFromRow`. */
   webhookSecret: string | null
   externalEntityId?: string | null
+  /** Tenant attribution, so partners can credit the right tenant (pen-test F-D). */
+  tenantId?: string | null
+  tenantCode?: string | null
   metadata: any
 }) {
   // P1-4: Reject SSRF / private targets before enqueuing or delivering
@@ -528,6 +535,8 @@ export async function enqueueWebhookNotification(data: {
     providerPaymentId: data.providerPaymentId,
     failureReason: data.failureReason,
     externalEntityId: data.externalEntityId,
+    tenantId: data.tenantId ?? null,
+    tenantCode: data.tenantCode ?? null,
     metadata: data.metadata,
   }
 

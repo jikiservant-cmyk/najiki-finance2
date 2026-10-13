@@ -31,6 +31,7 @@ import { buildSignatureUrlCandidates } from '@/lib/webhook-url'
 import { readTextWithLimit } from '@/lib/request-body'
 import { safeJsonObject } from '@/lib/json'
 import { decideWebhookLogAction } from '@/lib/webhook-dedupe'
+import { PLATFORM_FEE_TYPES } from '@/lib/constants'
 
 /** Providers retry with at-least-once semantics; 64 KB is far above any real payload. */
 const MAX_WEBHOOK_BYTES = 64 * 1024
@@ -102,7 +103,11 @@ export async function POST(
     if (tentativeReference) {
       const intent = await db.paymentIntent.findUnique({
         where: { reference: tentativeReference },
-        select: { tenantId: true, providerId: true },
+        select: {
+          tenantId: true,
+          providerId: true,
+          paymentType: { select: { code: true } },
+        },
       })
       if (intent?.tenantId) {
         const tenantConfig = await db.tenantProviderConfig.findFirst({
@@ -113,6 +118,25 @@ export async function POST(
           if (customCredentials?._encrypted) {
             customCredentials = JSON.parse(decrypt(customCredentials._encrypted))
           }
+        }
+
+        // Pen-test finding (F-B): a TENANT-collected payment must be confirmed
+        // by the tenant's own provider account, signed with the TENANT's
+        // webhook secret. Falling back to the platform's global secret here
+        // would let anything signed with the platform secret settle a tenant
+        // payment — crediting the tenant's wallet with no tenant-side money
+        // (proven live: a global-secret-signed callback credited abc-sacco).
+        // Platform-fee payments are exempt: they settle on the platform's own
+        // account and verify against the global secret.
+        const isPlatformPayment =
+          intent.paymentType && PLATFORM_FEE_TYPES.includes(String(intent.paymentType.code).toUpperCase())
+        if (!isPlatformPayment && !customCredentials?.webhookSecret) {
+          console.error(
+            `[Webhook] Rejecting ${normalizedProvider} callback for ${tentativeReference}: ` +
+              'the tenant has no webhookSecret configured, so this callback cannot be verified ' +
+              "against the tenant's provider account (fail-closed). Platform credentials are not a fallback."
+          )
+          return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
         }
       }
     }
