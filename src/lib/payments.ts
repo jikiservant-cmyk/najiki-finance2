@@ -1,10 +1,35 @@
 import { db } from './db'
 import { getPaymentProvider } from './providers'
 import { decrypt } from './encryption'
-import { PLATFORM_FEE_TYPES } from './constants'
+import { PLATFORM_FEE_TYPES, appRequiresTenantCredentials } from './constants'
 import { toMinorUnits } from './money'
 import { webhookSecretFromRow } from './application-auth'
 import { safeJsonObject } from './json'
+
+/**
+ * The tenant's active credential row for a provider, or null when there isn't
+ * a usable one.
+ *
+ * A row that exists but carries no credential material (an empty `{}`) does
+ * NOT count: the provider constructor falls back to the platform's env
+ * credentials when a field is missing, which is exactly the silent
+ * commingling this helper exists to prevent.
+ */
+export async function findActiveTenantCredentials(tenantId: string, providerId: string) {
+  const config = await db.tenantProviderConfig.findFirst({
+    where: { tenantId, providerId, isActive: true },
+  })
+  if (!config) return null
+  const json = config.configJson
+  if (
+    json &&
+    typeof json === 'object' &&
+    ((json as any)._encrypted || (json as any).apiKey || (json as any).api_key)
+  ) {
+    return config
+  }
+  return null
+}
 
 export async function processPayment(data: {
   paymentIntentId: string,
@@ -24,27 +49,31 @@ export async function processPayment(data: {
     let customCredentials: any = undefined
     const payment = await db.paymentIntent.findUnique({
       where: { id: paymentIntentId },
-      include: { application: true, paymentType: true },
+      include: { application: true, paymentType: true, tenant: true },
     })
 
     // Define payment types that go to the platform (owner's main account)
     const isPlatformPayment = payment?.paymentType && PLATFORM_FEE_TYPES.includes(payment.paymentType.code.toUpperCase())
 
-    // Only load tenant credentials if it's NOT a platform payment. 
-    // Platform payments use the default global credentials.
+    // Only load tenant credentials if it's NOT a platform payment.
+    // Platform payments use the default global credentials — that account is
+    // the platform wallet, where SMS purchases and platform fees belong.
     if (payment?.tenantId && payment?.providerId && !isPlatformPayment) {
-      const tenantConfig = await db.tenantProviderConfig.findFirst({
-        where: {
-          tenantId: payment.tenantId,
-          providerId: payment.providerId,
-          isActive: true,
-        },
-      })
+      const tenantConfig = await findActiveTenantCredentials(payment.tenantId, payment.providerId)
       if (tenantConfig?.configJson && typeof tenantConfig.configJson === 'object') {
         customCredentials = tenantConfig.configJson
         if (customCredentials?._encrypted) {
           customCredentials = JSON.parse(decrypt(customCredentials._encrypted))
         }
+      } else if (payment.application && appRequiresTenantCredentials(payment.application.code)) {
+        // Defense in depth: payment creation refuses these, but a
+        // required-credentials tenant must NEVER silently transact on the
+        // platform's account — that commingles the tenant's money with
+        // everyone else's.
+        throw new Error(
+          `Tenant "${payment.tenant?.code ?? payment.tenantId}" has no active credentials for provider "${providerCode}". ` +
+            `Application "${payment.application.code}" requires per-tenant credentials; platform credentials are not a fallback.`
+        )
       }
     }
 
