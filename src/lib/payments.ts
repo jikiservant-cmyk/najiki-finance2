@@ -55,6 +55,22 @@ export async function processPayment(data: {
     // Define payment types that go to the platform (owner's main account)
     const isPlatformPayment = payment?.paymentType && PLATFORM_FEE_TYPES.includes(payment.paymentType.code.toUpperCase())
 
+    // Defense in depth (payment creation rejects these): in an app that
+    // requires per-tenant credentials, the money unit is the tenant — a
+    // tenant-less collection is unattributed money and must never run on
+    // platform credentials.
+    if (
+      !isPlatformPayment &&
+      !payment?.tenantId &&
+      payment?.application &&
+      appRequiresTenantCredentials(payment.application.code)
+    ) {
+      throw new Error(
+        `Application "${payment.application.code}" requires a tenant for tenant collections; ` +
+          `payment ${paymentIntentId} has none. Platform credentials are not a fallback.`
+      )
+    }
+
     // Only load tenant credentials if it's NOT a platform payment.
     // Platform payments use the default global credentials — that account is
     // the platform wallet, where SMS purchases and platform fees belong.

@@ -253,7 +253,23 @@ export async function POST(request: Request) {
     // commingled with every other tenant's money. Refuse before an intent
     // exists or any money moves. Platform-fee payments are exempt — they are
     // platform revenue and settle on the platform's own LivePay account.
-    if (tenant && !isPlatformPayment && appRequiresTenantCredentials(application.code)) {
+    //
+    // The money unit in these apps is the TENANT, so a tenant-less collection
+    // is not a smaller payment — it is unattributed money. Reject it outright:
+    // with tenantCode optional, a tenant-less payment used to sail through on
+    // platform credentials and could never be credited to any wallet (pen-test
+    // finding F1).
+    if (!isPlatformPayment && appRequiresTenantCredentials(application.code)) {
+      if (!tenant) {
+        return NextResponse.json(
+          {
+            error:
+              `Application "${application.code}" requires a tenantCode for tenant collections. ` +
+              'Tenant-less payments are not accepted — platform credentials are not used for tenant money.',
+          },
+          { status: 400 }
+        )
+      }
       const tenantCredentials = await findActiveTenantCredentials(tenant.id, provider.id)
       if (!tenantCredentials) {
         return NextResponse.json(
