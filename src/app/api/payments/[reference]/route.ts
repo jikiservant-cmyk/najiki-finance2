@@ -1,7 +1,9 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
-import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
+import { enqueueWebhookNotification, completePayment, findActiveTenantCredentials } from '@/lib/payments'
+import { decrypt } from '@/lib/encryption'
+import { PLATFORM_FEE_TYPES } from '@/lib/constants'
 import { webhookSecretFromRow, findApplicationByApiKey } from '@/lib/application-auth'
 import { safeJsonObject } from '@/lib/json'
 import { Ratelimit } from '@upstash/ratelimit'
@@ -98,7 +100,27 @@ export async function GET(
       
       if (secondsSinceUpdate > 15) {
         try {
-          const providerClient = getPaymentProvider(paymentIntent.provider.code)
+          // Pen-test finding (F-A): poll with the TENANT's own credentials for
+          // tenant-collected payments — the same rule the creation path, the
+          // webhook path and both cron pollers use. Polling a tenant's payment
+          // under the platform's account checks the wrong account.
+          let pollCredentials: any = undefined
+          const isPlatformPayment =
+            paymentIntent.paymentType &&
+            PLATFORM_FEE_TYPES.includes(String(paymentIntent.paymentType.code).toUpperCase())
+          if (paymentIntent.tenantId && paymentIntent.providerId && !isPlatformPayment) {
+            const tenantCredentials = await findActiveTenantCredentials(
+              paymentIntent.tenantId,
+              paymentIntent.providerId
+            )
+            if (tenantCredentials?.configJson && typeof tenantCredentials.configJson === 'object') {
+              pollCredentials = tenantCredentials.configJson
+              if (pollCredentials?._encrypted) {
+                pollCredentials = JSON.parse(decrypt(pollCredentials._encrypted))
+              }
+            }
+          }
+          const providerClient = getPaymentProvider(paymentIntent.provider.code, pollCredentials)
           if (providerClient.checkPaymentStatus) {
             const statusResult = await providerClient.checkPaymentStatus(
               paymentIntent.reference,
@@ -132,6 +154,8 @@ export async function GET(
                   webhookUrl: `${application.baseUrl}${application.webhookPath}`,
                   webhookSecret: webhookSecretFromRow(application),
                   externalEntityId: paymentIntent.externalEntityId,
+                  tenantId: paymentIntent.tenantId,
+                  tenantCode: paymentIntent.tenant?.code ?? null,
                   metadata: safeJsonObject(paymentIntent.metadata),
                 })
               }

@@ -22,8 +22,8 @@ import {
   providerDisplayName,
 } from '@/lib/providers'
 import { CreatePaymentRequestSchema } from '@/lib/schemas'
-import { processPayment } from '@/lib/payments'
-import { PLATFORM_FEE_TYPES } from '@/lib/constants'
+import { processPayment, findActiveTenantCredentials } from '@/lib/payments'
+import { PLATFORM_FEE_TYPES, appRequiresTenantCredentials } from '@/lib/constants'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
 import { findApplicationByApiKey } from '@/lib/application-auth'
 
@@ -244,6 +244,45 @@ export async function POST(request: Request) {
         },
         { status: 503 }
       )
+    }
+
+    // ── Per-tenant credential enforcement ──────────────────────────────────
+    // Apps whose tenants must transact on their own credentials (SACCOs) are
+    // never processed on platform credentials: a missing config would
+    // silently route the tenant's collections into the platform's account,
+    // commingled with every other tenant's money. Refuse before an intent
+    // exists or any money moves. Platform-fee payments are exempt — they are
+    // platform revenue and settle on the platform's own LivePay account.
+    //
+    // The money unit in these apps is the TENANT, so a tenant-less collection
+    // is not a smaller payment — it is unattributed money. Reject it outright:
+    // with tenantCode optional, a tenant-less payment used to sail through on
+    // platform credentials and could never be credited to any wallet (pen-test
+    // finding F1).
+    if (!isPlatformPayment && appRequiresTenantCredentials(application.code)) {
+      if (!tenant) {
+        return NextResponse.json(
+          {
+            error:
+              `Application "${application.code}" requires a tenantCode for tenant collections. ` +
+              'Tenant-less payments are not accepted — platform credentials are not used for tenant money.',
+          },
+          { status: 400 }
+        )
+      }
+      const tenantCredentials = await findActiveTenantCredentials(tenant.id, provider.id)
+      if (!tenantCredentials) {
+        return NextResponse.json(
+          {
+            error:
+              `Tenant "${tenant.code}" has no active credentials configured for ${providerDisplayName(provider.code)}. ` +
+              'This application requires per-tenant credentials — configure them in Setup. ' +
+              'Platform credentials are not used for tenant collections.',
+            availableProviders: getAvailableProviders(),
+          },
+          { status: 503 }
+        )
+      }
     }
 
     const reference = generateReference(validatedBody.applicationCode, validatedBody.paymentTypeCode)

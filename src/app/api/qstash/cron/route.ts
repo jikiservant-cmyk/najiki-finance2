@@ -102,9 +102,11 @@ async function handleCron(request: Request) {
                 applicationId: payment.applicationId,
                 webhookUrl: `${payment.application.baseUrl}${payment.application.webhookPath}`,
                 webhookSecret: webhookSecretFromRow(payment.application),
-                externalEntityId: payment.externalEntityId,
-                metadata: safeJsonObject(payment.metadata),
-              })
+              externalEntityId: payment.externalEntityId,
+              tenantId: payment.tenantId,
+              tenantCode: payment.tenant?.code ?? null,
+              metadata: safeJsonObject(payment.metadata),
+            })
             }
 
             pollResults.push({ id: payment.id, reference: payment.reference, status: 'resolved', polledStatus: result.status })

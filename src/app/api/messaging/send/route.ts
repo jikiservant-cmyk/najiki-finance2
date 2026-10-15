@@ -99,6 +99,34 @@ export async function POST(request: Request) {
       )
     }
 
+    // Pen-test finding (F-C): sending SMS spends real provider money, and the
+    // SMS purchase flow (platform-fee payments) is what pays for it — but
+    // nothing on this endpoint checked a spend, so any valid API key could
+    // send without bound. Hard daily cap per application, counted in the DB
+    // so it works with or without Redis. Tune with SMS_DAILY_LIMIT_PER_APP
+    // (default 10000); set it to 0 to disable.
+    const dailyLimit = Number(process.env.SMS_DAILY_LIMIT_PER_APP || 10000)
+    if (dailyLimit > 0) {
+      const startOfDay = new Date()
+      startOfDay.setHours(0, 0, 0, 0)
+      const sentToday = await db.smsMessage.count({
+        where: { applicationId: application.id, createdAt: { gte: startOfDay } },
+      })
+      if (sentToday >= dailyLimit) {
+        const midnight = new Date(startOfDay)
+        midnight.setDate(midnight.getDate() + 1)
+        return NextResponse.json(
+          { error: `Daily SMS limit of ${dailyLimit} reached for this application. Try again after midnight.` },
+          {
+            status: 429,
+            headers: {
+              'Retry-After': String(Math.max(1, Math.ceil((midnight.getTime() - Date.now()) / 1000))),
+            },
+          }
+        )
+      }
+    }
+
     const appCode = application.code
     const appId = application.id
     const customSender = from || senderId || undefined
