@@ -1,4 +1,8 @@
-import {
+// All six are interfaces — type positions only. Without `import type`, Node's
+// strip-only type erasure (what `npm test` runs under) keeps them as runtime
+// imports and the module fails to instantiate. Bundlers erase them, so this
+// only ever affected the test runner.
+import type {
   PaymentProvider,
   ProviderCredentials,
   InitiatePaymentParams,

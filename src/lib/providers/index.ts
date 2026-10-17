@@ -1,4 +1,8 @@
-import { PaymentProvider, ProviderCredentials, InitiatePaymentParams, InitiatePaymentResponse, ParsedWebhook } from './types'
+// All five are interfaces. Without `import type` Node's strip-only type erasure
+// (which is what `npm test` runs under) keeps them as runtime imports, and the
+// module fails to instantiate with "does not provide an export named ...".
+// Next.js/bundlers erase them, so this never surfaced in the app itself.
+import type { PaymentProvider, ProviderCredentials, InitiatePaymentParams, InitiatePaymentResponse, ParsedWebhook } from './types'
 import { LivePayProvider } from './livepay'
 
 // Provider-availability rules live in ./availability, which has no imports, so
