@@ -28,7 +28,15 @@ jobs:
       NEXT_PUBLIC_SUPABASE_URL: https://placeholder.supabase.co
       NEXT_PUBLIC_SUPABASE_ANON_KEY: ci-placeholder-anon-key
       SUPABASE_SERVICE_ROLE_KEY: ci-placeholder-service-role-key
-      APP_ENCRYPTION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+      # Deliberately NOT the 0123456789abcdef... value that used to be here: it
+      # is a valid 64-hex string that satisfied the production format check while
+      # being public in this repo, and env.ts now rejects it outright. CI only
+      # needs the shape to be plausible; the build phase skips runtime assertion.
+      # Format-valid 64-hex, but NOT the 0123456789abcdef... value that used to
+      # be here: that one satisfied the production format check while being
+      # public in this repo, and env.ts now rejects it outright. This is a
+      # throwaway — the build phase skips runtime assertion anyway.
+      APP_ENCRYPTION_KEY: '7af3e0ff5b0cd542cfb44a7888fe393428cb38e8c232f356913f4a240da76cbd'
       SUPER_ADMIN_EMAILS: ci@example.com
       NEXTAUTH_URL: https://ci.example.com
       LIVEPAY_API_KEY: ci-placeholder

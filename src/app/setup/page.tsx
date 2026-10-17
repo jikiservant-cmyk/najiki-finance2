@@ -45,7 +45,6 @@ interface Tenant {
   id: string
   applicationId: string
   code: string
-  appType?: string
   name: string
   defaultProviderId: string | null
   isActive: boolean
@@ -74,7 +73,8 @@ interface Provider {
 /**
  * Providers that can actually take a payment.
  *
- * Kept in sync with IMPLEMENTED_PROVIDER_CODES in src/lib/providers/index.ts.
+ * Kept in sync with IMPLEMENTED_PROVIDER_CODES in
+ * src/lib/providers/availability.ts (re-exported from src/lib/providers).
  * The Setup API rejects anything not on this list, so offering it in the
  * dropdown would only produce a failed setup.
  */
@@ -121,6 +121,14 @@ export default function SetupPage() {
 
   const [tenantConfigs, setTenantConfigs] = useState<TenantProviderConfig[]>([])
   const [tenantsList, setTenantsList] = useState<any[]>([])
+  // Tenants whose default provider has no working adapter (or is deactivated).
+  // They cannot take a payment at all, and previously nothing said so.
+  const [providerIssues, setProviderIssues] = useState<
+    Array<{ code: string; providerCode: string | null; issue: string }>
+  >([])
+  // Applications that have tenants but sit outside tenant-credential
+  // enforcement, i.e. their money settles on the platform account.
+  const [unenforcedApps, setUnenforcedApps] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
   const [activeTab, setActiveTab] = useState('applications')
   const [newApiKey, setNewApiKey] = useState<string | null>(null)
@@ -153,6 +161,8 @@ export default function SetupPage() {
         setProviders(data.providers || [])
         setTenantConfigs(data.tenantProviderConfigs || [])
         setTenantsList(data.tenants || [])
+        setProviderIssues(data.tenantsWithDefaultProviderIssue || [])
+        setUnenforcedApps(data.tenantCredentialEnforcement?.unenforcedApplicationsWithTenants || [])
       } else if (res.status === 401) {
         setStatusMessage({ type: 'error', text: 'Your session has expired. Please sign in again.' })
       } else if (res.status === 403) {
@@ -277,7 +287,6 @@ export default function SetupPage() {
     const data = {
       applicationId: formData.get('applicationId') as string,
       code: formData.get('code') as string,
-      appType: (formData.get('appType') as string) || 'sacco',
       name: formData.get('name') as string,
       defaultProviderId: formData.get('defaultProviderId') as string,
       isActive: (formData.get('isActive') as string) === 'on',
@@ -404,7 +413,17 @@ export default function SetupPage() {
   }
 
   async function handleDeleteConfig(id: string) {
-    if (!confirm('Are you sure you want to delete these provider credentials? This SACCO will revert to platform fallback keys.')) {
+    if (
+      !confirm(
+        'Delete these provider credentials?\n\n' +
+          'If this tenant belongs to an application under tenant-credential enforcement ' +
+          '(TENANT_CREDENTIALS_REQUIRED_APP_CODES, e.g. "sacco"), its payments will be ' +
+          'REFUSED until new credentials are configured — platform keys are never used for ' +
+          'tenant money.\n\n' +
+          'For any other application, its payments WILL run on the global platform ' +
+          'credentials, commingling this tenant\u2019s money with the platform account.'
+      )
+    ) {
       return
     }
     try {
@@ -724,6 +743,62 @@ export default function SetupPage() {
         {/* TAB 3: TENANTS (SACCOs, Branches, Churches) */}
         {/* ============================================================ */}
         <TabsContent value="tenants">
+          {/*
+            Two things an operator could previously only discover by reading the
+            code or by reconciling a bank statement:
+
+            1. A tenant pointed at a provider with no adapter cannot take a
+               payment at all. The seed ships xyz-sacco on MTN and hope-academy
+               on Pesapal, and only LivePay has an implementation.
+            2. An application outside TENANT_CREDENTIALS_REQUIRED_APP_CODES
+               settles its tenants' money on the platform account. That is the
+               intended model for church/school, so it is reported neutrally
+               rather than as an error — but a NEW app is never silent.
+          */}
+          {providerIssues.length > 0 && (
+            <div className="mb-6 rounded-lg border border-amber-300 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-950">
+              <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">
+                {providerIssues.length} tenant{providerIssues.length === 1 ? '' : 's'} cannot take payments
+              </p>
+              <p className="mt-1 text-xs text-amber-800 dark:text-amber-300">
+                Their default provider has no working adapter, or is deactivated. Every charge will fail.
+                Only {IMPLEMENTED_PROVIDER_CODES.join(', ')} can currently accept a payment.
+              </p>
+              <ul className="mt-2 space-y-1 text-xs text-amber-800 dark:text-amber-300">
+                {providerIssues.map((issue) => (
+                  <li key={issue.code} className="font-mono">
+                    {issue.code} → {issue.providerCode ?? 'no provider'}{' '}
+                    <span className="font-sans not-italic opacity-80">
+                      ({issue.issue === 'inactive' ? 'deactivated' : issue.issue === 'unimplemented' ? 'no adapter' : 'no adapter and deactivated'})
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {unenforcedApps.length > 0 && (
+            <div className="mb-6 rounded-lg border p-4">
+              <p className="text-sm font-semibold">
+                {unenforcedApps.length} application{unenforcedApps.length === 1 ? '' : 's'} settle on the platform account
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Tenant-credential enforcement is keyed to the exact application code, and these are not in
+                TENANT_CREDENTIALS_REQUIRED_APP_CODES. For church and school that is intended — you collect and
+                settle yourself. If one of these is meant to pay into the tenant&apos;s own account, add its code to
+                that variable and give each of its tenants complete credentials first, or their payments will be
+                refused.
+              </p>
+              <ul className="mt-2 space-y-1 text-xs text-muted-foreground">
+                {unenforcedApps.map((app) => (
+                  <li key={app.code ?? app.id} className="font-mono">
+                    {app.code}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
             <Card>
               <CardHeader>
@@ -752,7 +827,24 @@ export default function SetupPage() {
                   </div>
                   <div>
                     <Label>App / Organization Type</Label>
-                    <Input name="appType" placeholder="sacco" defaultValue="sacco" />
+                    {/*
+                      Pen-test F-3: this used to be a free-text `appType` input
+                      defaulting to "sacco" that nothing stored and nothing read
+                      — Zod dropped it, the Tenant model has no such column, and
+                      the enforcement gate keys off the APPLICATION code. An
+                      operator could type "sacco" here and get no enforcement and
+                      no error. Replaced with the actual rule.
+                    */}
+                    <div className="flex h-9 items-center rounded border border-dashed px-3 text-xs text-muted-foreground">
+                      Set by the application, not per tenant
+                    </div>
+                    <p className="mt-1 text-[11px] leading-snug text-muted-foreground">
+                      Whether a tenant must use its own provider credentials is a property of
+                      its <strong>application</strong>: any code listed in{' '}
+                      <code>TENANT_CREDENTIALS_REQUIRED_APP_CODES</code> (default:{' '}
+                      <code>sacco</code>). Tenants of those applications are refused unless a
+                      complete credential row exists — platform keys are never a fallback.
+                    </p>
                   </div>
                   <div>
                     <Label>Default Provider</Label>
@@ -1054,9 +1146,10 @@ export default function SetupPage() {
                     <Key className="w-10 h-10 text-muted-foreground mx-auto opacity-50" />
                     <h4 className="font-semibold text-base">No SACCO Provider Keys Added Yet</h4>
                     <p className="text-xs text-muted-foreground max-w-md mx-auto">
-                      All SACCO payments currently fall back to the global platform credentials configured in your
-                      server environment. Use the form on the left to add a custom merchant account for a specific
-                      SACCO.
+                      Tenants of applications under tenant-credential enforcement (e.g. <code>sacco</code>) have
+                      their payments <strong>refused</strong> until a credential row exists — platform keys are
+                      never used for tenant money. Use the form on the left to add a merchant account for each one.
+                      Tenants of any other application fall back to the global platform credentials.
                     </p>
                   </CardContent>
                 </Card>

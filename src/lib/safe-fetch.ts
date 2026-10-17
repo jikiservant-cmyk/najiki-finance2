@@ -60,6 +60,20 @@ export function isPrivateOrInternalIp(ip: string): boolean {
       }
       return true
     }
+    // IPv6 transition mechanisms EMBED an arbitrary IPv4 address, so each of
+    // these can name 127.0.0.1 or 169.254.169.254 while looking like a public
+    // IPv6 address. They were absent from this list, which made the whole
+    // blocklist bypassable with e.g. http://[64:ff9b::a9fe:a9fe]/ (pen-test
+    // PT-01). Blocking the prefix outright is correct: nothing legitimate this
+    // app calls is reachable only via NAT64, 6to4 or Teredo.
+    //
+    //   64:ff9b::/96   NAT64 (well-known prefix)
+    //   64:ff9b:1::/48 NAT64 (local-use)
+    //   2002::/16      6to4
+    //   2001:0000::/32 Teredo  (second hextet zero — not 2001:db8:: etc.)
+    if (normalized.startsWith('64:ff9b:') || normalized.startsWith('64:ff9b:1:')) return true
+    if (normalized.startsWith('2002:')) return true
+    if (/^2001:0{0,4}:/.test(normalized) || normalized === '2001::') return true
     // Unique Local Addresses fc00::/7 (starts with fc or fd)
     if (normalized.startsWith('fc') || normalized.startsWith('fd')) return true
     // Link-local fe80::/10 (starts with fe8, fe9, fea, feb)
@@ -104,7 +118,13 @@ export async function validateSafeUrl(urlString: string): Promise<URL> {
     throw new Error(`Unsupported protocol for fetch: "${parsedUrl.protocol}"`)
   }
 
-  const hostname = parsedUrl.hostname.toLowerCase()
+  // `URL.hostname` KEEPS the square brackets for an IPv6 host, and
+  // `net.isIP('[::ffff:127.0.0.1]')` is 0 — so a bracketed literal used to skip
+  // the IP check entirely and fall into the DNS branch, where dns.lookup()
+  // threw on the bracketed string and the catch discarded the error. fetch()
+  // then parsed the literal itself and connected with no DNS at all. Proven
+  // against a live listener in pentest/ssrf-poc.ts. Strip them first.
+  const hostname = parsedUrl.hostname.toLowerCase().replace(/^\[|\]$/g, '')
 
   // 1. Check for placeholder / template domains
   if (isPlaceholderUrl(cleaned)) {
@@ -140,7 +160,11 @@ export async function validateSafeUrl(urlString: string): Promise<URL> {
       if (err.message && err.message.includes('blocked internal IP')) {
         throw err
       }
-      // If DNS resolution fails outright, fetch will fail anyway
+      // Fail CLOSED. The old comment here claimed "fetch will fail anyway",
+      // which is not true: undici resolves IP literals without DNS, so a lookup
+      // error says nothing about whether fetch would connect. An unresolvable
+      // host is not a reason to allow the request.
+      throw new Error(`Target host ${hostname} could not be resolved`)
     }
   }
 

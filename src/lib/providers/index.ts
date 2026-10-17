@@ -1,26 +1,20 @@
 import { PaymentProvider, ProviderCredentials, InitiatePaymentParams, InitiatePaymentResponse, ParsedWebhook } from './types'
 import { LivePayProvider } from './livepay'
 
-/**
- * Providers with a working implementation.
- *
- * This list is load-bearing, not documentation. `stub` providers below throw on
- * `initiatePayment`, and the seeded database has MTN/Airtel/Pesapal rows marked
- * `isActive: true` — so "pick the first active provider" could select a provider
- * that cannot accept a payment, and did. Every provider-selection path filters
- * on this list.
- *
- * Adding a provider to this array without implementing it re-introduces the bug.
- */
-export const IMPLEMENTED_PROVIDER_CODES = ['livepay'] as const
-
-type ImplementedProviderCode = (typeof IMPLEMENTED_PROVIDER_CODES)[number]
-
-/** True when a working adapter exists for this code. */
-export function isProviderImplemented(code: string | null | undefined): boolean {
-  const normalized = String(code ?? '').trim().toLowerCase()
-  return (IMPLEMENTED_PROVIDER_CODES as readonly string[]).includes(normalized)
-}
+// Provider-availability rules live in ./availability, which has no imports, so
+// `npm test` can exercise them directly. This module cannot be loaded by the
+// test runner: the extensionless `./types` and `./livepay` specifiers above are
+// not resolved by Node's strip-only type erasure. Re-exported here so every
+// existing `@/lib/providers` import site keeps working unchanged.
+export {
+  IMPLEMENTED_PROVIDER_CODES,
+  isProviderImplemented,
+  getAvailableProviders,
+  providerDisplayName,
+  defaultProviderIssue,
+  tenantsWithDefaultProviderIssue,
+} from './availability'
+export type { DefaultProviderIssue, TenantProviderProblem, TenantProviderShape } from './availability'
 
 /**
  * Providers that exist as rows but have no adapter.
@@ -29,12 +23,22 @@ export function isProviderImplemented(code: string | null | undefined): boolean 
  * implemented") instead of the opaque throw from the stub itself.
  */
 class StubProvider implements PaymentProvider {
-  constructor(public code: string, public name: string) {}
+  // Plain field declarations rather than constructor parameter properties:
+  // `constructor(public code: ...)` is not supported by Node's strip-only type
+  // erasure. That is not cosmetic — it made the module fail to parse under the
+  // test runner before the resolver issue even came up.
+  code: string
+  name: string
+
+  constructor(code: string, name: string) {
+    this.code = code
+    this.name = name
+  }
 
   async initiatePayment(params: InitiatePaymentParams): Promise<InitiatePaymentResponse> {
     throw new Error(
       `Provider ${this.name} (${this.code}) has no working adapter. It must not be ` +
-        `selectable for payments — see IMPLEMENTED_PROVIDER_CODES in src/lib/providers/index.ts.`
+        `selectable for payments — see IMPLEMENTED_PROVIDER_CODES in src/lib/providers/availability.ts.`
     )
   }
 
@@ -62,25 +66,4 @@ export function getPaymentProvider(code: string, credentials?: ProviderCredentia
     default:
       throw new Error(`Provider not found: ${code}`)
   }
-}
-
-/**
- * Providers that may be used to take a payment.
- *
- * Used to filter provider queries and to populate the Setup UI, so an operator
- * cannot configure a tenant onto a provider that will throw on first use.
- */
-export function getAvailableProviders(): string[] {
-  return [...IMPLEMENTED_PROVIDER_CODES as readonly string[]]
-}
-
-/** Display name for a code, for error messages. */
-export function providerDisplayName(code: string): string {
-  const names: Record<string, string> = {
-    livepay: 'LivePay',
-    mtn: 'MTN Mobile Money',
-    airtel: 'Airtel Money',
-    pesapal: 'Pesapal',
-  }
-  return names[String(code).toLowerCase()] ?? String(code)
 }

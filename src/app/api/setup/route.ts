@@ -8,10 +8,12 @@ import {
   getAvailableProviders,
   isProviderImplemented,
   providerDisplayName,
+  tenantsWithDefaultProviderIssue,
 } from '@/lib/providers'
 import { encrypt, decrypt } from '@/lib/encryption'
 import { generateApiKey, hashApiKey, apiKeyHint } from '@/lib/api-keys'
 import { summarizeProviderConfig, shouldPreserveStoredSecret } from '@/lib/provider-config-summary'
+import { listUnenforcedApplications, tenantCredentialAppCodes } from '@/lib/constants'
 
 // Every write path is validated. These payloads previously went straight from
 // `request.json()` into Prisma, so a typo in the dashboard (or a crafted
@@ -157,10 +159,26 @@ export async function GET() {
           application: {
             omit: { apiKey: true, apiKeyHash: true, webhookSecretEncrypted: true },
           },
+          // Needed to tell the operator which tenants are pointed at a provider
+          // that cannot actually take a payment (no adapter, or deactivated).
+          defaultProvider: {
+            select: { code: true, name: true, isActive: true },
+          },
         },
         orderBy: { createdAt: 'desc' },
       }),
     ])
+
+    // Pen-test F-1 visibility. Enforcement is keyed to the application code, so
+    // an application created with a code outside TENANT_CREDENTIALS_REQUIRED_APP_CODES
+    // silently collects its tenants' money on the platform account. That used to
+    // be discoverable only by reading the code or by reconciling a statement;
+    // now the dashboard can say so on the page where the operator would fix it.
+    const unenforcedApplicationsWithTenants = listUnenforcedApplications(applications)
+
+    // Tenants pointed at a provider with no working adapter. These are inert —
+    // no payment path can succeed for them — and previously nothing said so.
+    const tenantsWithProviderIssue = tenantsWithDefaultProviderIssue(tenants)
 
     // This payload contains application API keys and provider credential
     // references — never let it be cached by a browser or intermediary.
@@ -170,6 +188,16 @@ export async function GET() {
         providers,
         tenantProviderConfigs,
         tenants,
+        tenantCredentialEnforcement: {
+          enforcedAppCodes: tenantCredentialAppCodes(),
+          // Applications that HAVE tenants but are NOT under enforcement — their
+          // tenants' money settles on the platform account. For `church` and
+          // `school` that is the intended business model; it is surfaced here so
+          // a NEW application that lands outside the list is never silent.
+          unenforcedApplicationsWithTenants,
+        },
+        // Tenants whose default provider has no adapter, or is deactivated.
+        tenantsWithDefaultProviderIssue: tenantsWithProviderIssue,
       },
       { headers: { 'Cache-Control': 'no-store, max-age=0' } }
     )

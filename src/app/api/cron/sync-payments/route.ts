@@ -1,10 +1,8 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
-import { completePayment, enqueueWebhookNotification } from '@/lib/payments'
+import { completePayment, enqueueWebhookNotification, resolvePaymentCredentials } from '@/lib/payments'
 import { verifyCronRequest } from '@/lib/qstash-verify'
-import { decrypt } from '@/lib/encryption'
-import { PLATFORM_FEE_TYPES } from '@/lib/constants'
 import { webhookSecretFromRow } from '@/lib/application-auth'
 import { safeJsonObject } from '@/lib/json'
 
@@ -46,29 +44,52 @@ async function handleSync(request: Request) {
     })
 
     const pollResults: Array<{ id: string; reference: string; status: string; polledStatus?: string }> = []
+    // Tenant payments refused rather than polled on platform credentials.
+    const skippedIsolation: Array<{
+      reference: string
+      tenantId: string | null
+      reason: string
+      missing?: string[]
+    }> = []
 
     for (const payment of pendingPayments) {
       try {
-        const isPlatformPayment = payment.paymentType && PLATFORM_FEE_TYPES.includes(payment.paymentType.code.toUpperCase())
+        // Tenant isolation (pen-test F-2b). This poller used to leave
+        // `customCredentials` undefined when a tenant had no usable credential
+        // row, and `getPaymentProvider` then substituted the PLATFORM key and
+        // account number. For a tenant collection that is the wrong account:
+        // the webhook path refuses the same payment outright (fail-closed), so
+        // whichever path reached it first decided whether the customer's money
+        // was stranded in the platform account or credited to the tenant
+        // against money sitting there. Both are wrong; skipping is neither.
+        const resolved = await resolvePaymentCredentials({
+          tenantId: payment.tenantId,
+          providerId: payment.providerId,
+          paymentType: payment.paymentType,
+        })
 
-        let customCredentials: any = undefined
-        if (payment.tenantId && !isPlatformPayment) {
-          const tenantConfig = await db.tenantProviderConfig.findFirst({
-            where: {
-              tenantId: payment.tenantId,
-              providerId: payment.providerId,
-              isActive: true,
-            },
+        if (!resolved.ok) {
+          const detail =
+            resolved.reason === 'incomplete-credentials'
+              ? `incomplete credentials (missing: ${resolved.missing?.join(', ')})`
+              : 'no active credentials configured'
+          console.error(
+            `[sync-payments] Skipping ${payment.reference} (tenant ${payment.tenantId}): ${detail}. ` +
+              'Refusing to poll on platform credentials — this is a tenant collection. ' +
+              'Configure the tenant\u2019s provider credentials in Setup.'
+          )
+          skippedIsolation.push({
+            reference: payment.reference,
+            tenantId: payment.tenantId,
+            reason: resolved.reason,
+            missing: resolved.missing,
           })
-          if (tenantConfig?.configJson && typeof tenantConfig.configJson === 'object') {
-            customCredentials = tenantConfig.configJson
-            if (customCredentials?._encrypted) {
-              customCredentials = JSON.parse(decrypt(customCredentials._encrypted))
-            }
-          }
+          // The `finally` below still stamps lastPolledAt, so a misconfigured
+          // tenant cannot monopolise the 50-row batch on every run.
+          continue
         }
 
-        const providerClient = getPaymentProvider(payment.provider.code, customCredentials)
+        const providerClient = getPaymentProvider(payment.provider.code, resolved.credentials)
         if (providerClient.checkPaymentStatus) {
           const result = await providerClient.checkPaymentStatus(
             payment.reference,
@@ -124,6 +145,10 @@ async function handleSync(request: Request) {
       success: true,
       polledCount: pendingPayments.length,
       results: pollResults,
+      // Non-empty means tenant money is not being reconciled. A monitor should
+      // treat this as an alert, not a footnote.
+      skippedIsolationCount: skippedIsolation.length,
+      ...(skippedIsolation.length > 0 ? { skippedIsolation } : {}),
     })
   } catch (error: any) {
     console.error('sync-payments cron error:', error)

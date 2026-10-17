@@ -21,8 +21,7 @@ import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getAvailableProviders, getPaymentProvider } from '@/lib/providers'
 import { createWebhookLog, getPaymentByReference } from '@/lib/data'
-import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
-import { decrypt } from '@/lib/encryption'
+import { enqueueWebhookNotification, completePayment, resolvePaymentCredentials } from '@/lib/payments'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
 import { computeWebhookEventHash } from '@/lib/webhook-hash'
 import { webhookSecretFromRow } from '@/lib/application-auth'
@@ -31,7 +30,6 @@ import { buildSignatureUrlCandidates } from '@/lib/webhook-url'
 import { readTextWithLimit } from '@/lib/request-body'
 import { safeJsonObject } from '@/lib/json'
 import { decideWebhookLogAction } from '@/lib/webhook-dedupe'
-import { PLATFORM_FEE_TYPES } from '@/lib/constants'
 
 /** Providers retry with at-least-once semantics; 64 KB is far above any real payload. */
 const MAX_WEBHOOK_BYTES = 64 * 1024
@@ -99,7 +97,7 @@ export async function POST(
       return NextResponse.json({ error: 'Provider not active' }, { status: 404 })
     }
 
-    let customCredentials: any = undefined
+    let customCredentials: Record<string, unknown> | undefined = undefined
     if (tentativeReference) {
       const intent = await db.paymentIntent.findUnique({
         where: { reference: tentativeReference },
@@ -109,17 +107,7 @@ export async function POST(
           paymentType: { select: { code: true } },
         },
       })
-      if (intent?.tenantId) {
-        const tenantConfig = await db.tenantProviderConfig.findFirst({
-          where: { tenantId: intent.tenantId, providerId: intent.providerId, isActive: true },
-        })
-        if (tenantConfig?.configJson && typeof tenantConfig.configJson === 'object') {
-          customCredentials = tenantConfig.configJson
-          if (customCredentials?._encrypted) {
-            customCredentials = JSON.parse(decrypt(customCredentials._encrypted))
-          }
-        }
-
+      if (intent) {
         // Pen-test finding (F-B): a TENANT-collected payment must be confirmed
         // by the tenant's own provider account, signed with the TENANT's
         // webhook secret. Falling back to the platform's global secret here
@@ -128,16 +116,32 @@ export async function POST(
         // (proven live: a global-secret-signed callback credited abc-sacco).
         // Platform-fee payments are exempt: they settle on the platform's own
         // account and verify against the global secret.
-        const isPlatformPayment =
-          intent.paymentType && PLATFORM_FEE_TYPES.includes(String(intent.paymentType.code).toUpperCase())
-        if (!isPlatformPayment && !customCredentials?.webhookSecret) {
+        //
+        // Pen-test finding (F-2): this used to test only for the presence of
+        // `webhookSecret`, so a tenant config with a secret but no `accountNo`
+        // passed and then had the platform account number substituted in by the
+        // provider constructor. It now goes through the same all-or-nothing
+        // resolver as every other path, so a partial row is refused rather than
+        // half-applied.
+        const resolved = await resolvePaymentCredentials({
+          tenantId: intent.tenantId,
+          providerId: intent.providerId,
+          paymentType: intent.paymentType,
+        })
+
+        if (!resolved.ok) {
           console.error(
             `[Webhook] Rejecting ${normalizedProvider} callback for ${tentativeReference}: ` +
-              'the tenant has no webhookSecret configured, so this callback cannot be verified ' +
-              "against the tenant's provider account (fail-closed). Platform credentials are not a fallback."
+              (resolved.reason === 'incomplete-credentials'
+                ? `the tenant's credentials are incomplete (missing: ${resolved.missing?.join(', ')}), `
+                : 'the tenant has no active credentials configured, ') +
+              'so this callback cannot be verified against the tenant\u2019s own provider account ' +
+              '(fail-closed). Platform credentials are not a fallback.'
           )
           return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
         }
+
+        customCredentials = resolved.credentials
       }
     }
 

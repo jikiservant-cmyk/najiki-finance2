@@ -1,34 +1,123 @@
 import { db } from './db'
 import { getPaymentProvider } from './providers'
 import { decrypt } from './encryption'
-import { PLATFORM_FEE_TYPES, appRequiresTenantCredentials } from './constants'
+import { PLATFORM_FEE_TYPES, appRequiresTenantCredentials, isPlatformFeeType, missingCredentialFields } from './constants'
 import { toMinorUnits } from './money'
 import { webhookSecretFromRow } from './application-auth'
 import { safeJsonObject } from './json'
 
 /**
- * The tenant's active credential row for a provider, or null when there isn't
- * a usable one.
+ * The tenant's active, COMPLETE credential row for a provider, or null.
  *
- * A row that exists but carries no credential material (an empty `{}`) does
- * NOT count: the provider constructor falls back to the platform's env
- * credentials when a field is missing, which is exactly the silent
- * commingling this helper exists to prevent.
+ * Two things disqualify a row:
+ *
+ *   1. It is missing or inactive.
+ *   2. It is PARTIAL — some credential fields present, others blank.
+ *
+ * (2) is the important one and was missing before. `LivePayProvider` substitutes
+ * a platform env value for whichever field is absent, so a row with `apiKey`
+ * set and `accountNo` blank authenticated as the tenant but settled into the
+ * PLATFORM account number — the exact commingling this helper exists to
+ * prevent, arriving through a row that looked configured. A partial row is now
+ * treated as no row at all, which makes the caller's existing "no credentials"
+ * branch (refuse, or fail closed) handle it.
+ *
+ * Legacy rows hold credentials in the clear; current rows hold
+ * `{ _encrypted }`. Both are decrypted here and validated the same way.
  */
 export async function findActiveTenantCredentials(tenantId: string, providerId: string) {
   const config = await db.tenantProviderConfig.findFirst({
     where: { tenantId, providerId, isActive: true },
   })
   if (!config) return null
-  const json = config.configJson
-  if (
-    json &&
-    typeof json === 'object' &&
-    ((json as any)._encrypted || (json as any).apiKey || (json as any).api_key)
-  ) {
-    return config
+
+  const material = decryptTenantCredentialMaterial(config.configJson)
+  if (!material) return null
+
+  const missing = missingCredentialFields(material)
+  if (missing.length > 0) {
+    console.error(
+      `[credentials] Tenant ${tenantId} / provider ${providerId} has an INCOMPLETE credential row ` +
+        `(missing: ${missing.join(', ')}). Treating it as unconfigured rather than letting the ` +
+        `provider substitute platform values for the missing fields.`
+    )
+    return null
   }
-  return null
+
+  return config
+}
+
+/**
+ * Decrypt a `tenantProviderConfig.configJson` blob into credential material.
+ *
+ * Returns null when there is nothing usable — an empty blob, or a ciphertext
+ * that will not decrypt. A decryption failure must NOT fall back to platform
+ * credentials; returning null routes the caller into its "no credentials"
+ * branch, which refuses or fails closed.
+ */
+export function decryptTenantCredentialMaterial(configJson: unknown): Record<string, unknown> | null {
+  if (!configJson || typeof configJson !== 'object') return null
+  const blob = configJson as Record<string, unknown>
+
+  if (typeof blob._encrypted === 'string') {
+    try {
+      const decoded = JSON.parse(decrypt(blob._encrypted))
+      return decoded && typeof decoded === 'object' ? (decoded as Record<string, unknown>) : null
+    } catch (error) {
+      console.error('[credentials] Could not decrypt a tenant credential blob; refusing to guess.', error)
+      return null
+    }
+  }
+
+  // Legacy plaintext blob.
+  return blob
+}
+
+/** Outcome of resolving the credentials a payment must be processed with. */
+export type TenantCredentialResolution =
+  | { ok: true; credentials: Record<string, unknown> | undefined }
+  | { ok: false; reason: 'no-credentials' | 'incomplete-credentials'; missing?: string[] }
+
+/**
+ * Resolve the credentials for one payment, enforcing tenant isolation.
+ *
+ * THE RULE, stated once so all six call sites cannot drift:
+ *
+ *   * platform-fee payment  → platform credentials (undefined), always allowed
+ *   * tenant-less payment   → platform credentials, always allowed
+ *   * tenant payment        → the tenant's OWN complete credentials, or REFUSE
+ *
+ * Refusing is the whole point. Before this existed the three status-poll paths
+ * silently polled the platform account for a tenant payment whose credentials
+ * were missing, which either stranded the customer's money in the platform
+ * account (when the webhook got there first and 401'd) or credited the tenant
+ * against money sitting in the platform account (when the poller got there
+ * first). Same payment, two contradictory outcomes, decided by timing.
+ */
+export async function resolvePaymentCredentials(payment: {
+  tenantId?: string | null
+  providerId?: string | null
+  paymentType?: { code: string } | null
+}): Promise<TenantCredentialResolution> {
+  if (isPlatformFeeType(payment.paymentType?.code)) {
+    return { ok: true, credentials: undefined }
+  }
+  if (!payment.tenantId || !payment.providerId) {
+    return { ok: true, credentials: undefined }
+  }
+
+  const config = await db.tenantProviderConfig.findFirst({
+    where: { tenantId: payment.tenantId, providerId: payment.providerId, isActive: true },
+  })
+  if (!config) return { ok: false, reason: 'no-credentials' }
+
+  const material = decryptTenantCredentialMaterial(config.configJson)
+  if (!material) return { ok: false, reason: 'no-credentials' }
+
+  const missing = missingCredentialFields(material)
+  if (missing.length > 0) return { ok: false, reason: 'incomplete-credentials', missing }
+
+  return { ok: true, credentials: material }
 }
 
 export async function processPayment(data: {

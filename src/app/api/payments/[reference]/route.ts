@@ -1,9 +1,7 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
-import { enqueueWebhookNotification, completePayment, findActiveTenantCredentials } from '@/lib/payments'
-import { decrypt } from '@/lib/encryption'
-import { PLATFORM_FEE_TYPES } from '@/lib/constants'
+import { enqueueWebhookNotification, completePayment, resolvePaymentCredentials } from '@/lib/payments'
 import { webhookSecretFromRow, findApplicationByApiKey } from '@/lib/application-auth'
 import { safeJsonObject } from '@/lib/json'
 import { Ratelimit } from '@upstash/ratelimit'
@@ -104,23 +102,30 @@ export async function GET(
           // tenant-collected payments — the same rule the creation path, the
           // webhook path and both cron pollers use. Polling a tenant's payment
           // under the platform's account checks the wrong account.
-          let pollCredentials: any = undefined
-          const isPlatformPayment =
-            paymentIntent.paymentType &&
-            PLATFORM_FEE_TYPES.includes(String(paymentIntent.paymentType.code).toUpperCase())
-          if (paymentIntent.tenantId && paymentIntent.providerId && !isPlatformPayment) {
-            const tenantCredentials = await findActiveTenantCredentials(
-              paymentIntent.tenantId,
-              paymentIntent.providerId
+          //
+          // Pen-test finding (F-2b): and when the tenant has no usable
+          // credentials, DO NOT POLL AT ALL. This path used to fall through to
+          // platform credentials, which for a tenant collection either settles
+          // the payment against money sitting in the platform account or
+          // contradicts the webhook path that refuses the same payment. Not
+          // polling leaves the intent in its stored state for an operator to
+          // fix; that is recoverable, whereas a wrong-account settlement is not.
+          const resolved = await resolvePaymentCredentials({
+            tenantId: paymentIntent.tenantId,
+            providerId: paymentIntent.providerId,
+            paymentType: paymentIntent.paymentType,
+          })
+
+          if (!resolved.ok) {
+            console.error(
+              `[payments/${reference}] Not polling: tenant ${paymentIntent.tenantId} has ` +
+                (resolved.reason === 'incomplete-credentials'
+                  ? `incomplete credentials (missing: ${resolved.missing?.join(', ')})`
+                  : 'no active credentials configured') +
+                '. Refusing to check the platform account for a tenant collection.'
             )
-            if (tenantCredentials?.configJson && typeof tenantCredentials.configJson === 'object') {
-              pollCredentials = tenantCredentials.configJson
-              if (pollCredentials?._encrypted) {
-                pollCredentials = JSON.parse(decrypt(pollCredentials._encrypted))
-              }
-            }
-          }
-          const providerClient = getPaymentProvider(paymentIntent.provider.code, pollCredentials)
+          } else {
+          const providerClient = getPaymentProvider(paymentIntent.provider.code, resolved.credentials)
           if (providerClient.checkPaymentStatus) {
             const statusResult = await providerClient.checkPaymentStatus(
               paymentIntent.reference,
@@ -170,6 +175,7 @@ export async function GET(
                  data: { updatedAt: new Date() }
                })
             }
+          }
           }
         } catch (pollError) {
           console.error('[Payment API] Error polling provider status:', pollError)

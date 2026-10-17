@@ -58,6 +58,24 @@ export function assertRuntimeEnv(): void {
     throw new Error('FATAL: APP_ENCRYPTION_KEY must be a 64-character hex string in production')
   }
 
+  // The format check above is satisfied by the placeholder that used to ship in
+  // .env.example (0123456789abcdef... repeated), and by the value CI uses. A
+  // deploy that copied the example therefore booted clean and encrypted every
+  // tenant provider credential under a key that is public in this repository.
+  // Format is not the same as secrecy — reject the known values explicitly.
+  const KNOWN_BAD_ENCRYPTION_KEYS = new Set([
+    '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', // former .env.example + CI value
+    '0000000000000000000000000000000000000000000000000000000000000000',
+    'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+  ])
+  if (KNOWN_BAD_ENCRYPTION_KEYS.has(encryptionKey.toLowerCase())) {
+    console.error('[FATAL] APP_ENCRYPTION_KEY is a well-known placeholder, not a secret')
+    throw new Error(
+      'FATAL: APP_ENCRYPTION_KEY is a documented placeholder. Generate a real one with ' +
+        '`openssl rand -hex 32`. Every tenant provider credential is encrypted with this key.'
+    )
+  }
+
   // Cron/QStash endpoints are also protected by CRON_SECRET; without it the
   // QStash signature is the only gate, so require the secret explicitly.
   if (!process.env.CRON_SECRET || process.env.CRON_SECRET.length < 16) {

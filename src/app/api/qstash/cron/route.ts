@@ -1,10 +1,8 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
-import { completePayment, enqueueWebhookNotification } from '@/lib/payments'
+import { completePayment, enqueueWebhookNotification, resolvePaymentCredentials } from '@/lib/payments'
 import { verifyCronRequest } from '@/lib/qstash-verify'
-import { decrypt } from '@/lib/encryption'
-import { PLATFORM_FEE_TYPES } from '@/lib/constants'
 import { webhookSecretFromRow } from '@/lib/application-auth'
 import { safeJsonObject } from '@/lib/json'
 
@@ -47,29 +45,45 @@ async function handleCron(request: Request) {
     })
 
     const pollResults: Array<{ id: string; reference: string; status: string; polledStatus?: string }> = []
+    const skippedIsolation: Array<{
+      reference: string
+      tenantId: string | null
+      reason: string
+      missing?: string[]
+    }> = []
 
     for (const payment of pendingPayments) {
       try {
-        const isPlatformPayment = payment.paymentType && PLATFORM_FEE_TYPES.includes(payment.paymentType.code.toUpperCase())
+        // Tenant isolation (pen-test F-2b) — see the same comment in
+        // src/app/api/cron/sync-payments/route.ts. A tenant payment with no
+        // usable credential row is SKIPPED, never polled on platform
+        // credentials: the webhook path refuses it, so polling it here would
+        // settle it against the platform account instead.
+        const resolved = await resolvePaymentCredentials({
+          tenantId: payment.tenantId,
+          providerId: payment.providerId,
+          paymentType: payment.paymentType,
+        })
 
-        let customCredentials: any = undefined
-        if (payment.tenantId && !isPlatformPayment) {
-          const tenantConfig = await db.tenantProviderConfig.findFirst({
-            where: {
-              tenantId: payment.tenantId,
-              providerId: payment.providerId,
-              isActive: true,
-            },
+        if (!resolved.ok) {
+          const detail =
+            resolved.reason === 'incomplete-credentials'
+              ? `incomplete credentials (missing: ${resolved.missing?.join(', ')})`
+              : 'no active credentials configured'
+          console.error(
+            `[qstash-cron] Skipping ${payment.reference} (tenant ${payment.tenantId}): ${detail}. ` +
+              'Refusing to poll on platform credentials — this is a tenant collection.'
+          )
+          skippedIsolation.push({
+            reference: payment.reference,
+            tenantId: payment.tenantId,
+            reason: resolved.reason,
+            missing: resolved.missing,
           })
-          if (tenantConfig?.configJson && typeof tenantConfig.configJson === 'object') {
-            customCredentials = tenantConfig.configJson
-            if (customCredentials?._encrypted) {
-              customCredentials = JSON.parse(decrypt(customCredentials._encrypted))
-            }
-          }
+          continue
         }
 
-        const providerClient = getPaymentProvider(payment.provider.code, customCredentials)
+        const providerClient = getPaymentProvider(payment.provider.code, resolved.credentials)
         if (providerClient.checkPaymentStatus) {
           const result = await providerClient.checkPaymentStatus(
             payment.reference,
@@ -126,6 +140,8 @@ async function handleCron(request: Request) {
       timestamp: new Date().toISOString(),
       polledPaymentsCount: pendingPayments.length,
       pollResults,
+      skippedIsolationCount: skippedIsolation.length,
+      ...(skippedIsolation.length > 0 ? { skippedIsolation } : {}),
     })
   } catch (error: any) {
     console.error('QStash cron error:', error)
