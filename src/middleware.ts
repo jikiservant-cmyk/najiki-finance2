@@ -1,6 +1,7 @@
 import { createServerClient, type CookieOptions } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
 import { isSupabaseConfigured } from '@/lib/supabase-config'
+import { allowInsecureDevAuth } from '@/lib/dev-auth'
 
 /**
  * Routes that are reachable without a dashboard session.
@@ -49,10 +50,15 @@ export async function middleware(request: NextRequest) {
       console.error('[Middleware] Supabase auth is not configured (fail-closed)')
       return NextResponse.json({ error: 'Auth not configured' }, { status: 500 })
     }
-    // Development without Supabase configured: allow through so the UI can be
-    // worked on locally, but make it loud.
-    console.warn('[Middleware] Supabase env vars missing or placeholder — auth is DISABLED (development only)')
-    return response
+    if (allowInsecureDevAuth(process.env.NODE_ENV, process.env.ALLOW_INSECURE_DEV_AUTH)) {
+      console.warn('[Middleware] Explicit insecure local dev auth is enabled')
+      return response
+    }
+    if (PUBLIC_ROUTES.includes(request.nextUrl.pathname)) return response
+    if (request.nextUrl.pathname.startsWith('/api/')) {
+      return NextResponse.json({ error: 'Auth not configured' }, { status: 503 })
+    }
+    return NextResponse.redirect(new URL('/login', request.url))
   }
 
   // Cookies must only carry the Secure flag when actually served over HTTPS,

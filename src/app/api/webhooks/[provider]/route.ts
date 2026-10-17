@@ -22,7 +22,7 @@ import { db } from '@/lib/db'
 import { getAvailableProviders, getPaymentProvider } from '@/lib/providers'
 import { createWebhookLog, getPaymentByReference } from '@/lib/data'
 import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
-import { decrypt } from '@/lib/encryption'
+import { loadTenantProviderCredentials } from '@/lib/tenant-credentials'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
 import { computeWebhookEventHash } from '@/lib/webhook-hash'
 import { webhookSecretFromRow } from '@/lib/application-auth'
@@ -109,33 +109,12 @@ export async function POST(
           paymentType: { select: { code: true } },
         },
       })
-      if (intent?.tenantId) {
-        const tenantConfig = await db.tenantProviderConfig.findFirst({
-          where: { tenantId: intent.tenantId, providerId: intent.providerId, isActive: true },
-        })
-        if (tenantConfig?.configJson && typeof tenantConfig.configJson === 'object') {
-          customCredentials = tenantConfig.configJson
-          if (customCredentials?._encrypted) {
-            customCredentials = JSON.parse(decrypt(customCredentials._encrypted))
-          }
-        }
-
-        // Pen-test finding (F-B): a TENANT-collected payment must be confirmed
-        // by the tenant's own provider account, signed with the TENANT's
-        // webhook secret. Falling back to the platform's global secret here
-        // would let anything signed with the platform secret settle a tenant
-        // payment — crediting the tenant's wallet with no tenant-side money
-        // (proven live: a global-secret-signed callback credited abc-sacco).
-        // Platform-fee payments are exempt: they settle on the platform's own
-        // account and verify against the global secret.
-        const isPlatformPayment =
-          intent.paymentType && PLATFORM_FEE_TYPES.includes(String(intent.paymentType.code).toUpperCase())
-        if (!isPlatformPayment && !customCredentials?.webhookSecret) {
-          console.error(
-            `[Webhook] Rejecting ${normalizedProvider} callback for ${tentativeReference}: ` +
-              'the tenant has no webhookSecret configured, so this callback cannot be verified ' +
-              "against the tenant's provider account (fail-closed). Platform credentials are not a fallback."
-          )
+      const isPlatformPayment =
+        intent?.paymentType && PLATFORM_FEE_TYPES.includes(String(intent.paymentType.code).toUpperCase())
+      if (intent?.tenantId && !isPlatformPayment) {
+        customCredentials = await loadTenantProviderCredentials(intent.tenantId, intent.providerId)
+        if (!customCredentials) {
+          console.error(`[Webhook] Tenant credentials unavailable for ${tentativeReference}; refusing platform fallback`)
           return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
         }
       }

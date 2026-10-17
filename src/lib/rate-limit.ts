@@ -66,9 +66,12 @@ export async function checkRateLimit(
   opts: { tokens: number; window: Duration; timeoutMs?: number }
 ): Promise<RateLimitDecision> {
   const limiter = getLimiter(name, opts.tokens, opts.window)
-  if (!limiter) return { ok: true } // not configured → dev/no-op
-
   const isProduction = process.env.NODE_ENV === 'production'
+  if (!limiter) {
+    return isProduction
+      ? { ok: false, status: 503, message: 'Service temporarily unavailable' }
+      : { ok: true } // development without Redis
+  }
   const timeoutMs = opts.timeoutMs ?? 1000
 
   try {

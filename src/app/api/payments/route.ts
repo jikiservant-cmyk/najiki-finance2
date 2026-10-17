@@ -22,7 +22,8 @@ import {
   providerDisplayName,
 } from '@/lib/providers'
 import { CreatePaymentRequestSchema } from '@/lib/schemas'
-import { processPayment, findActiveTenantCredentials } from '@/lib/payments'
+import { processPayment } from '@/lib/payments'
+import { loadTenantProviderCredentials } from '@/lib/tenant-credentials'
 import { PLATFORM_FEE_TYPES, appRequiresTenantCredentials } from '@/lib/constants'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
 import { findApplicationByApiKey } from '@/lib/application-auth'
@@ -259,7 +260,7 @@ export async function POST(request: Request) {
     // with tenantCode optional, a tenant-less payment used to sail through on
     // platform credentials and could never be credited to any wallet (pen-test
     // finding F1).
-    if (!isPlatformPayment && appRequiresTenantCredentials(application.code)) {
+    if (!isPlatformPayment && (tenant || appRequiresTenantCredentials(application.code))) {
       if (!tenant) {
         return NextResponse.json(
           {
@@ -270,13 +271,13 @@ export async function POST(request: Request) {
           { status: 400 }
         )
       }
-      const tenantCredentials = await findActiveTenantCredentials(tenant.id, provider.id)
+      const tenantCredentials = await loadTenantProviderCredentials(tenant.id, provider.id)
       if (!tenantCredentials) {
         return NextResponse.json(
           {
             error:
               `Tenant "${tenant.code}" has no active credentials configured for ${providerDisplayName(provider.code)}. ` +
-              'This application requires per-tenant credentials — configure them in Setup. ' +
+              'Tenant collections require complete per-tenant credentials — configure them in Setup. ' +
               'Platform credentials are not used for tenant collections.',
             availableProviders: getAvailableProviders(),
           },

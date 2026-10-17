@@ -3,6 +3,8 @@ import { cookies } from 'next/headers'
 import { db } from '@/lib/db'
 import { isSupabaseConfigured } from '@/lib/supabase-config'
 import type { User } from '@supabase/supabase-js'
+import { isAllowedSuperAdminEmail } from '@/lib/admin-allowlist'
+import { allowInsecureDevAuth } from '@/lib/dev-auth'
 
 /**
  * Create a request-scoped Supabase server client from the auth cookies.
@@ -39,7 +41,7 @@ export async function requireAuth(): Promise<User> {
   const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
   const configured = isSupabaseConfigured(supabaseUrl, supabaseKey)
 
-  if (!configured && process.env.NODE_ENV !== 'production') {
+  if (!configured && allowInsecureDevAuth(process.env.NODE_ENV, process.env.ALLOW_INSECURE_DEV_AUTH)) {
     return {
       id: 'dev-super-admin',
       app_metadata: {},
@@ -74,7 +76,7 @@ export async function requireSuperAdmin(): Promise<User> {
   const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
   const configured = isSupabaseConfigured(supabaseUrl, supabaseKey)
 
-  if (!configured && process.env.NODE_ENV !== 'production') {
+  if (!configured && allowInsecureDevAuth(process.env.NODE_ENV, process.env.ALLOW_INSECURE_DEV_AUTH)) {
     return {
       id: 'dev-super-admin',
       app_metadata: {},
@@ -105,13 +107,12 @@ export async function requireSuperAdmin(): Promise<User> {
     throw new Error(`Database connection failed: Prisma cannot reach database. Check DATABASE_URL: ${dbErr?.message || 'Connection error'}`)
   }
 
-  // Bootstrap super admins from SUPER_ADMIN_EMAILS (with smartskoolz@gmail.com, jikiservant@gmail.com fallback).
-  const superAdminEmails = (process.env.SUPER_ADMIN_EMAILS || 'smartskoolz@gmail.com,jikiservant@gmail.com')
-    .split(',')
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean)
+  // An existing DB role must not outlive removal from the allowlist.
+  if (!isAllowedSuperAdminEmail(user.email, process.env.SUPER_ADMIN_EMAILS)) {
+    throw new Error('Forbidden: Super Admin required')
+  }
 
-  if (user.email && superAdminEmails.includes(user.email.toLowerCase())) {
+  if (user.email) {
     if (!adminProfile) {
       adminProfile = await db.adminProfile.create({
         data: { id: user.id, role: 'super_admin' },

@@ -1,28 +1,13 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
-import { enqueueWebhookNotification, completePayment, findActiveTenantCredentials } from '@/lib/payments'
-import { decrypt } from '@/lib/encryption'
+import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
+import { loadTenantProviderCredentials } from '@/lib/tenant-credentials'
+import { isConfirmedTerminalStatus } from '@/lib/payment-security'
+import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
 import { PLATFORM_FEE_TYPES } from '@/lib/constants'
 import { webhookSecretFromRow, findApplicationByApiKey } from '@/lib/application-auth'
 import { safeJsonObject } from '@/lib/json'
-import { Ratelimit } from '@upstash/ratelimit'
-import { Redis } from '@upstash/redis'
-
-// Use Upstash Redis for distributed rate limiting if configured
-let ratelimit: Ratelimit | null = null;
-try {
-  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
-    const redis = Redis.fromEnv()
-    ratelimit = new Ratelimit({
-      redis,
-      limiter: Ratelimit.slidingWindow(60, '1 m'),
-      analytics: true,
-    })
-  }
-} catch (e) {
-  console.warn('Failed to initialize rate limiter:', e)
-}
 
 export async function GET(
   request: Request,
@@ -35,25 +20,10 @@ export async function GET(
     }
     const apiKey = authHeader.slice(7) // Remove 'Bearer ' prefix
 
-    if (ratelimit) {
-      try {
-        // Enforce a strict 1-second timeout on the Redis rate limit check
-        const ratelimitPromise = ratelimit.limit(`get_payment_${apiKey}`)
-        const timeoutPromise = new Promise<{success: boolean}>((_, reject) => 
-           setTimeout(() => reject(new Error('Rate limit timeout')), 1000)
-        )
-        
-        const { success } = await Promise.race([ratelimitPromise, timeoutPromise])
-        if (!success) {
-          return NextResponse.json(
-            { error: 'Too many requests' },
-            { status: 429, headers: { 'Retry-After': '60' } }
-          )
-        }
-      } catch (ratelimitError) {
-        console.warn('Rate limiter failed or timed out, bypassing:', ratelimitError)
-      }
-    }
+    const ipDecision = await checkRateLimit('get-payment-ip', clientIdentifier(request), { tokens: 120, window: '1 m' })
+    if (!ipDecision.ok) return NextResponse.json({ error: ipDecision.message }, { status: ipDecision.status, headers: ipDecision.retryAfter ? { 'Retry-After': ipDecision.retryAfter } : {} })
+    const keyDecision = await checkRateLimit('get-payment-key', apiKey, { tokens: 60, window: '1 m' })
+    if (!keyDecision.ok) return NextResponse.json({ error: keyDecision.message }, { status: keyDecision.status, headers: keyDecision.retryAfter ? { 'Retry-After': keyDecision.retryAfter } : {} })
 
     const auth = await findApplicationByApiKey(apiKey)
     const application = auth?.application ?? null
@@ -109,15 +79,10 @@ export async function GET(
             paymentIntent.paymentType &&
             PLATFORM_FEE_TYPES.includes(String(paymentIntent.paymentType.code).toUpperCase())
           if (paymentIntent.tenantId && paymentIntent.providerId && !isPlatformPayment) {
-            const tenantCredentials = await findActiveTenantCredentials(
-              paymentIntent.tenantId,
-              paymentIntent.providerId
-            )
-            if (tenantCredentials?.configJson && typeof tenantCredentials.configJson === 'object') {
-              pollCredentials = tenantCredentials.configJson
-              if (pollCredentials?._encrypted) {
-                pollCredentials = JSON.parse(decrypt(pollCredentials._encrypted))
-              }
+            pollCredentials = await loadTenantProviderCredentials(paymentIntent.tenantId, paymentIntent.providerId)
+            if (!pollCredentials) {
+              // Keep the intent reconcilable; do not query the platform account.
+              throw new Error(`Tenant credentials unavailable for payment ${paymentIntent.id}`)
             }
           }
           const providerClient = getPaymentProvider(paymentIntent.provider.code, pollCredentials)
@@ -129,7 +94,11 @@ export async function GET(
             )
 
             // If status changed to success or failed, update the DB
-            if (statusResult.status !== 'pending' && statusResult.status !== 'processing') {
+            if (isConfirmedTerminalStatus(statusResult, {
+              amount: Number(paymentIntent.amount),
+              currency: paymentIntent.currency,
+              providerPaymentId: paymentIntent.providerPaymentId,
+            })) {
               const { intent: updatedIntent, wasAlreadyProcessed } = await completePayment({
                 paymentIntentId: paymentIntent.id,
                 status: statusResult.status,

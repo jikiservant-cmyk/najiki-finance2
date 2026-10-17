@@ -19,10 +19,21 @@ export class LivePayProvider implements PaymentProvider {
   private baseUrl: string
 
   constructor(config?: Partial<ProviderCredentials>) {
-    this.apiKey = config?.apiKey || config?.api_key || process.env.LIVEPAY_API_KEY || ''
-    this.accountNo = config?.accountNo || config?.account_number || config?.accountNumber || process.env.LIVEPAY_ACCOUNT_NO || ''
-    this.webhookSecret = config?.webhookSecret || config?.webhook_secret || process.env.LIVEPAY_WEBHOOK_SECRET || ''
-    this.baseUrl = config?.baseUrl || config?.base_url || process.env.LIVEPAY_BASE_URL || 'https://livepay.me'
+    // An explicit tenant config is never supplemented from the platform account.
+    if (config) {
+      this.apiKey = config.apiKey || config.api_key || ''
+      this.accountNo = config.accountNo || config.account_number || config.accountNumber || ''
+      this.webhookSecret = config.webhookSecret || config.webhook_secret || ''
+      this.baseUrl = config.baseUrl || config.base_url || 'https://livepay.me'
+      if (!this.apiKey || !this.accountNo || this.webhookSecret.length < 16) {
+        throw new Error('Incomplete tenant LivePay credentials')
+      }
+    } else {
+      this.apiKey = process.env.LIVEPAY_API_KEY || ''
+      this.accountNo = process.env.LIVEPAY_ACCOUNT_NO || ''
+      this.webhookSecret = process.env.LIVEPAY_WEBHOOK_SECRET || ''
+      this.baseUrl = process.env.LIVEPAY_BASE_URL || 'https://livepay.me'
+    }
   }
 
   async initiatePayment(params: InitiatePaymentParams): Promise<InitiatePaymentResponse> {
@@ -62,13 +73,14 @@ export class LivePayProvider implements PaymentProvider {
 
       return {
         success: false,
-        status: 'failed',
+        status: response.status >= 500 ? 'processing' : 'failed',
         failureReason: data.error || 'Failed to initiate payment',
       }
     } catch (error) {
       return {
         success: false,
-        status: 'failed',
+        // A timeout or malformed 5xx body does not prove no money was collected.
+        status: 'processing',
         failureReason: error instanceof Error ? error.message : 'Unknown error',
       }
     }
@@ -113,7 +125,7 @@ export class LivePayProvider implements PaymentProvider {
 
       return {
         success: false,
-        status: 'failed',
+        status: 'pending',
         failureReason: data.message || 'Status check failed',
       }
     } catch (error) {
