@@ -9,15 +9,14 @@
  * retention story, and made the delivery-report path scan every message ever
  * sent. Indexed Postgres lookups replace it.
  *
- * The Redis list is still used as the work queue (see sms-queue.ts) — only the
- * message records moved.
+ * The database is also the durable outbox; Redis holds optional wake-up hints
+ * only. See sms-queue.ts.
  */
 
 import { randomBytes } from 'crypto'
 import { db } from './db'
-import { normalizePhoneNumber } from './redact'
 
-export type SmsStatus = 'queued' | 'pending' | 'delivered' | 'failed'
+export type SmsStatus = 'queued' | 'pending' | 'unknown' | 'delivered' | 'failed'
 
 export interface SmsRequest {
   id: string
@@ -34,6 +33,8 @@ export interface SmsRequest {
   providerMessageId?: string | null
   failureReason?: string | null
   nextAttemptAt?: Date | null
+  notificationDeliveredAt?: Date | null
+  notificationAttemptedAt?: Date | null
   createdAt: string
   updatedAt: string
 }
@@ -59,44 +60,36 @@ function toSms(row: unknown): SmsRequest {
   return row as SmsRequest
 }
 
-function normalizeStatus(value: unknown): SmsStatus {
-  const status = String(value || '').toLowerCase()
-  if (status === 'pending' || status === 'delivered' || status === 'failed' || status === 'queued') {
-    return status
+export class SmsDailyLimitError extends Error {
+  readonly retryAfter: number
+  constructor(retryAfter: number) {
+    super('Daily SMS limit reached for this application')
+    this.name = 'SmsDailyLimitError'
+    this.retryAfter = retryAfter
   }
-  return 'queued'
+}
+
+function newSmsData(params: {
+  recipient: string; message: string; applicationCode: string; providerCode: string
+  cost: number; applicationId?: string | null; senderId?: string | null; idempotencyKey?: string | null
+}) {
+  return {
+    id: newId(), reference: newReference(), recipient: params.recipient,
+    message: params.message, status: 'queued', attemptCount: 0,
+    applicationId: params.applicationId ?? null, applicationCode: params.applicationCode,
+    providerCode: params.providerCode, cost: params.cost,
+    senderId: params.senderId ?? null, idempotencyKey: params.idempotencyKey ?? null,
+  }
+}
+
+export class SmsIdempotencyConflictError extends Error {
+  constructor() {
+    super('Idempotency key was already used for a different SMS')
+    this.name = 'SmsIdempotencyConflictError'
+  }
 }
 
 export const smsStore = {
-  create: async (params: {
-    recipient: string
-    message: string
-    applicationCode: string
-    providerCode: string
-    cost: number
-    applicationId?: string | null
-    senderId?: string | null
-    idempotencyKey?: string | null
-  }): Promise<SmsRequest> => {
-    const row = await db.smsMessage.create({
-      data: {
-        id: newId(),
-        reference: newReference(),
-        recipient: params.recipient,
-        message: params.message,
-        status: 'queued',
-        attemptCount: 0,
-        applicationId: params.applicationId ?? null,
-        applicationCode: params.applicationCode,
-        providerCode: params.providerCode,
-        cost: params.cost,
-        senderId: params.senderId ?? null,
-        idempotencyKey: params.idempotencyKey ?? null,
-      },
-    })
-    return toSms(row)
-  },
-
   /**
    * Create a message, or return the one a previous attempt with the same
    * idempotency key already created.
@@ -114,32 +107,122 @@ export const smsStore = {
     applicationCode: string
     providerCode: string
     cost: number
-    applicationId?: string | null
+    applicationId: string
     senderId?: string | null
     idempotencyKey?: string | null
+    dailyLimit: number
   }): Promise<{ sms: SmsRequest; created: boolean }> => {
     const key = params.idempotencyKey?.trim() || null
+    const now = new Date()
+    const dayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
+    const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000)
 
-    if (key && params.applicationId) {
-      const existing = await db.smsMessage.findFirst({
-        where: { applicationId: params.applicationId, idempotencyKey: key },
+    // The transaction-level advisory lock serializes all sends for this app.
+    // Count and insert MUST use the same transaction/connection; a separate
+    // count in the route let concurrent requests all observe quota remaining.
+    return db.$transaction(async (tx) => {
+      await tx.$queryRawUnsafe('SELECT pg_advisory_xact_lock(hashtext($1))::text', params.applicationId)
+      if (key) {
+        const existing = await tx.smsMessage.findFirst({
+          where: { applicationId: params.applicationId, idempotencyKey: key },
+        })
+        if (existing) {
+          if (existing.recipient !== params.recipient || existing.message !== params.message ||
+              (existing.senderId ?? null) !== (params.senderId ?? null)) {
+            throw new SmsIdempotencyConflictError()
+          }
+          return { sms: toSms(existing), created: false }
+        }
+      }
+      const sentToday = await tx.smsMessage.count({
+        where: { applicationId: params.applicationId, createdAt: { gte: dayStart, lt: dayEnd } },
       })
-      if (existing) return { sms: toSms(existing), created: false }
-    }
+      if (sentToday >= params.dailyLimit) {
+        throw new SmsDailyLimitError(Math.max(1, Math.ceil((dayEnd.getTime() - now.getTime()) / 1000)))
+      }
+      const sms = await tx.smsMessage.create({ data: newSmsData({ ...params, idempotencyKey: key }) })
+      return { sms: toSms(sms), created: true }
+    }, { maxWait: 5_000, timeout: 10_000 })
+  },
 
-    try {
-      const sms = await smsStore.create({ ...params, idempotencyKey: key })
-      return { sms, created: true }
-    } catch (error: any) {
-      // P2002: the unique constraint fired, so a concurrent retry won the race.
-      if (error?.code !== 'P2002' || !key || !params.applicationId) throw error
+  /** A DB compare-and-swap is the send claim. Duplicate Redis jobs are harmless. */
+  claimForSending: async (id: string): Promise<SmsRequest | null> => {
+    const now = new Date()
+    const result = await db.smsMessage.updateMany({
+      where: { id, status: 'queued', OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }] },
+      data: { status: 'pending', attemptCount: { increment: 1 }, nextAttemptAt: null },
+    })
+    if (result.count !== 1) return null
+    const row = await db.smsMessage.findUnique({ where: { id } })
+    return row ? toSms(row) : null
+  },
 
-      const winner = await db.smsMessage.findFirst({
-        where: { applicationId: params.applicationId, idempotencyKey: key },
-      })
-      if (!winner) throw error
-      return { sms: toSms(winner), created: false }
-    }
+  /** Redis is only a wake-up hint; queued DB rows survive missing list writes. */
+  getDueQueued: async (limit = 50): Promise<string[]> => {
+    const rows = await db.smsMessage.findMany({
+      where: { status: 'queued', OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: new Date() } }] },
+      select: { id: true }, orderBy: { createdAt: 'asc' }, take: limit,
+    })
+    return rows.map((row) => row.id)
+  },
+
+  /** Do not overwrite a terminal DLR that arrived before the send response. */
+  recordProviderAcceptance: async (id: string, providerMessageId: string | undefined): Promise<boolean> => {
+    const result = await db.smsMessage.updateMany({
+      where: { id, status: 'pending' },
+      data: { ...(providerMessageId ? { providerMessageId } : {}), failureReason: null },
+    })
+    return result.count === 1
+  },
+
+  /** Explicit provider rejection is safe to fail; transport exceptions are NOT. */
+  failExplicitly: async (id: string): Promise<boolean> => {
+    const result = await db.smsMessage.updateMany({
+      where: { id, status: 'pending' },
+      data: { status: 'failed', failureReason: 'Provider rejected SMS' },
+    })
+    return result.count === 1
+  },
+
+  /** A missing/late DLR is unknown, never delivered and never auto-retried. */
+  markStalePendingUnknown: async (hours = 48): Promise<number> => {
+    const result = await db.smsMessage.updateMany({
+      where: { status: 'pending', updatedAt: { lt: new Date(Date.now() - hours * 60 * 60 * 1000) } },
+      data: { status: 'unknown' },
+    })
+    return result.count
+  },
+
+  getPendingTerminalNotifications: async (limit = 20): Promise<SmsRequest[]> => {
+    const rows = await db.smsMessage.findMany({
+      where: { status: { in: ['delivered', 'failed'] }, notificationDeliveredAt: null },
+      // Never let an unavailable endpoint monopolize the first page forever.
+      orderBy: { notificationAttemptedAt: { sort: 'asc', nulls: 'first' } }, take: limit,
+    })
+    return (rows as unknown[]).map(toSms)
+  },
+
+  markNotificationAttempted: async (id: string, status: SmsStatus): Promise<void> => {
+    await db.smsMessage.updateMany({
+      where: { id, status, notificationDeliveredAt: null },
+      data: { notificationAttemptedAt: new Date() },
+    })
+  },
+
+  markNotificationDelivered: async (id: string, status: SmsStatus): Promise<void> => {
+    await db.smsMessage.updateMany({
+      where: { id, status, notificationDeliveredAt: null },
+      data: { notificationDeliveredAt: new Date() },
+    })
+  },
+
+  /** Only a matching provider ID may transition a nonterminal message to terminal. */
+  applyDeliveryReport: async (id: string, providerMessageId: string, status: 'delivered' | 'failed'): Promise<boolean> => {
+    const result = await db.smsMessage.updateMany({
+      where: { id, providerMessageId, status: { in: ['pending', 'unknown'] } },
+      data: { status },
+    })
+    return result.count === 1
   },
 
   get: async (id: string): Promise<SmsRequest | null> => {
@@ -163,6 +246,7 @@ export const smsStore = {
     delivered: number
     pending: number
     failed: number
+    unknown: number
     queued: number
     deliveredCost: number
     deliveryRate: string
@@ -184,30 +268,10 @@ export const smsStore = {
       delivered,
       pending: counts.pending ?? 0,
       failed: counts.failed ?? 0,
+      unknown: counts.unknown ?? 0,
       queued: counts.queued ?? 0,
       deliveredCost: Number((costRows as { _sum?: { cost?: number | null } })?._sum?.cost ?? 0),
       deliveryRate: total > 0 ? ((delivered / total) * 100).toFixed(1) : '0',
-    }
-  },
-
-  updateStatus: async (
-    id: string,
-    status: SmsStatus,
-    failureReason?: string,
-    attemptCount?: number,
-    providerMessageId?: string
-  ): Promise<SmsRequest | null> => {
-    const data: Record<string, unknown> = { status: normalizeStatus(status) }
-    if (failureReason !== undefined) data.failureReason = failureReason
-    if (typeof attemptCount === 'number') data.attemptCount = attemptCount
-    if (providerMessageId) data.providerMessageId = providerMessageId
-
-    try {
-      const row = await db.smsMessage.update({ where: { id }, data })
-      return toSms(row)
-    } catch {
-      // Row removed or never existed — callers treat null as "not found".
-      return null
     }
   },
 
@@ -244,51 +308,9 @@ export const smsStore = {
    */
   findByProviderMessageId: async (providerMessageId: string): Promise<SmsRequest | null> => {
     if (!providerMessageId) return null
-    const row = await db.smsMessage.findFirst({
-      where: { providerMessageId },
-      orderBy: { createdAt: 'desc' },
-    })
-    return row ? toSms(row) : null
+    const rows = await db.smsMessage.findMany({ where: { providerMessageId }, take: 2 })
+    // A non-unique provider ID is ambiguous; never guess the application.
+    return rows.length === 1 ? toSms(rows[0]) : null
   },
 
-  /**
-   * Fallback delivery-report lookup for providers that only echo the MSISDN.
-   * Bounded to recent, still-unresolved messages and matched on normalised
-   * digits (the stored value may be E.164 while the callback is local format).
-   */
-  findRecentUnresolvedByRecipient: async (
-    recipient: string,
-    withinHours = 48
-  ): Promise<SmsRequest | null> => {
-    const digits = normalizePhoneNumber(recipient)
-    if (digits.length < 9) return null
-
-    const since = new Date(Date.now() - withinHours * 60 * 60 * 1000)
-    const candidates = await db.smsMessage.findMany({
-      where: {
-        createdAt: { gte: since },
-        status: { in: ['queued', 'pending'] },
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 50,
-    })
-
-    for (const candidate of candidates as unknown[]) {
-      const row = toSms(candidate)
-      const stored = normalizePhoneNumber(row.recipient)
-      if (stored === digits || stored.endsWith(digits) || digits.endsWith(stored)) {
-        return row
-      }
-    }
-    return null
-  },
-
-  /** Queue bookkeeping: when the worker should look at this message again. */
-  setNextAttemptAt: async (id: string, at: Date | null): Promise<void> => {
-    try {
-      await db.smsMessage.update({ where: { id }, data: { nextAttemptAt: at } })
-    } catch {
-      // best effort — a missing row means the message was deleted
-    }
-  },
 }

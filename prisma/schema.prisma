@@ -60,7 +60,7 @@ model SmsMessage {
   reference         String       @unique
   recipient         String
   message           String
-  // queued | pending | delivered | failed
+  // queued | pending | unknown | delivered | failed
   status            String       @default("queued")
   attemptCount      Int          @map("attempt_count") @default(0)
   applicationId     String?      @map("application_id")
@@ -81,10 +81,14 @@ model SmsMessage {
   providerMessageId String?      @map("provider_message_id")
   failureReason     String?      @map("failure_reason")
   nextAttemptAt     DateTime?    @map("next_attempt_at")
+  /// Terminal delivery webhook is retried by the SMS cron until acknowledged.
+  notificationDeliveredAt DateTime? @map("notification_delivered_at")
+  notificationAttemptedAt DateTime? @map("notification_attempted_at")
   createdAt         DateTime     @default(now()) @map("created_at")
   updatedAt         DateTime     @updatedAt @map("updated_at")
 
   @@index([status, nextAttemptAt])
+  @@index([status, notificationDeliveredAt], map: "sms_messages_notification_pending_idx")
   @@index([providerMessageId])
   @@index([recipient, createdAt])
   // Scoped per application, like payment idempotency: two partners may pick the

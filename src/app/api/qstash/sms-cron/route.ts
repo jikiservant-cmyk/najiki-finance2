@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
-import { smsQueue } from '@/lib/sms-queue'
+import { smsQueue, retrySmsNotifications } from '@/lib/sms-queue'
+import { smsStore } from '@/lib/sms-store'
 import { verifyCronRequest } from '@/lib/qstash-verify'
 
 // Optional: allow function to run longer on Vercel
@@ -14,16 +15,20 @@ async function handleSmsCron(request: Request) {
 
     // Process up to 20 SMS messages in one batch
     const results = await smsQueue.processBatch(20)
+    const staleMarkedUnknown = await smsStore.markStalePendingUnknown()
+    const notificationsDelivered = await retrySmsNotifications()
     
     return NextResponse.json({
       success: true,
       timestamp: new Date().toISOString(),
       processedCount: results.length,
+      staleMarkedUnknown,
+      notificationsDelivered,
       results,
     })
   } catch (error: any) {
-    console.error('SMS cron error:', error)
-    return NextResponse.json({ error: error.message || 'Internal server error' }, { status: 500 })
+    console.error('SMS cron failed (details omitted)')
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
 

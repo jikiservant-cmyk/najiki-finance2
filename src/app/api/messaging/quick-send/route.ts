@@ -1,16 +1,11 @@
 import { NextResponse, after } from 'next/server'
 import { db } from '@/lib/db'
-import { smsStore, SMS_COST_PLACEHOLDER } from '@/lib/sms-store'
+import { smsStore, SMS_COST_PLACEHOLDER, SmsDailyLimitError, SmsIdempotencyConflictError } from '@/lib/sms-store'
 import { smsQueue } from '@/lib/sms-queue'
 import { requireSuperAdmin } from '@/lib/auth'
 import { checkRateLimit } from '@/lib/rate-limit'
-import { z } from 'zod'
-
-const QuickSendSchema = z.object({
-  to: z.string().min(9).max(20),
-  message: z.string().min(1).max(918),
-  applicationCode: z.string().min(1).max(64).optional(),
-})
+import { SmsInputSchema, MAX_SMS_BODY_BYTES, resolveSmsDailyLimit } from '@/lib/sms-policy'
+import { readTextWithLimit, PayloadTooLargeError } from '@/lib/request-body'
 
 export async function POST(request: Request) {
   try {
@@ -43,46 +38,43 @@ export async function POST(request: Request) {
       )
     }
 
-    const parsed = QuickSendSchema.safeParse(await request.json())
+    const parsed = SmsInputSchema.safeParse(JSON.parse(await readTextWithLimit(request, MAX_SMS_BODY_BYTES)))
     if (!parsed.success) {
       const details = parsed.error.issues.map((issue) => `${issue.path.join('.') || 'body'}: ${issue.message}`)
       return NextResponse.json({ error: 'Validation failed', details }, { status: 400 })
     }
     const { to, message, applicationCode } = parsed.data
+    const key = request.headers.get('Idempotency-Key')?.trim() || parsed.data.idempotencyKey
+    if (key && (key.length < 8 || key.length > 255)) {
+      return NextResponse.json({ error: 'Invalid idempotency key' }, { status: 400 })
+    }
 
     // 2. Resolve target application
     const appCode = applicationCode || 'church'
-    let application: any = null
-    try {
-      application = await db.application.findFirst({
-        where: { code: appCode, isActive: true },
-      })
-    } catch (dbErr) {
-      console.warn('[Quick Send API] Application lookup failed, falling back:', dbErr)
-    }
+    const application = await db.application.findFirst({ where: { code: appCode, isActive: true } })
+    if (!application) return NextResponse.json({ error: 'Active application not found' }, { status: 404 })
 
-    // 3. Create SMS record in store
-    const smsRequest = await smsStore.create({
-      recipient: to,
-      message,
-      applicationCode: application?.code || appCode,
-      providerCode: 'africastalking',
-      // Placeholder until the provider reports the real charge; overwritten
-      // by smsQueue via smsStore.updateProviderCost(). See SMS_COST_PLACEHOLDER.
-      cost: SMS_COST_PLACEHOLDER,
-      applicationId: application?.id,
+    // Apply the same atomic application ceiling as partner requests. Admin
+    // quick-sends do not debit purchased credits (partners own those ledgers).
+    const { sms: smsRequest, created } = await smsStore.createOrGet({
+      recipient: to, message, applicationCode: application.code,
+      providerCode: 'africastalking', cost: SMS_COST_PLACEHOLDER,
+      applicationId: application.id, idempotencyKey: key,
+      dailyLimit: resolveSmsDailyLimit(process.env.SMS_DAILY_LIMIT_PER_APP),
     })
 
     // 4. Enqueue for background execution
-    await smsQueue.enqueue(smsRequest.id)
+    if (created) await smsQueue.enqueue(smsRequest.id)
 
     // Trigger worker asynchronously using Next.js 15 'after' API if available in request context
-    try {
-      after(() => {
-        smsQueue.processBatch(5).catch(err => console.error('Background worker error:', err))
-      })
-    } catch {
-      // Fallback: smsQueue.enqueue already triggered detached background batch processing
+    if (created) {
+      try {
+        after(() => {
+          smsQueue.processBatch(5).catch(() => console.error('Background SMS worker failed'))
+        })
+      } catch {
+        // Cron sweeps the durable DB outbox if after() is unavailable.
+      }
     }
 
     return NextResponse.json({
@@ -93,7 +85,13 @@ export async function POST(request: Request) {
       status: smsRequest.status,
     }, { status: 202 })
   } catch (error) {
-    console.error('Quick send API Error:', error)
+    if (error instanceof SmsDailyLimitError) return NextResponse.json(
+      { error: error.message }, { status: 429, headers: { 'Retry-After': String(error.retryAfter) } }
+    )
+    if (error instanceof SmsIdempotencyConflictError) return NextResponse.json({ error: error.message }, { status: 409 })
+    if (error instanceof PayloadTooLargeError) return NextResponse.json({ error: 'Payload too large' }, { status: 413 })
+    if (error instanceof SyntaxError) return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
+    console.error('Quick send API failed (details omitted)')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

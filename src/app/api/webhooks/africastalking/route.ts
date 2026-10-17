@@ -21,7 +21,7 @@
 
 import { NextResponse } from 'next/server'
 import { smsStore } from '@/lib/sms-store'
-import { maskPhoneNumber } from '@/lib/redact'
+import { deliverSmsNotification } from '@/lib/sms-queue'
 import { authorizeCallback } from '@/lib/callback-auth'
 import { resolveClientIp } from '@/lib/client-ip'
 import { checkRateLimit } from '@/lib/rate-limit'
@@ -114,51 +114,31 @@ export async function POST(request: Request) {
 
     const id = payload.id == null ? '' : String(payload.id)
     const status = payload.status == null ? '' : String(payload.status)
-    const phoneNumber = payload.phoneNumber == null ? '' : String(payload.phoneNumber)
-    const failureReason = payload.failureReason == null ? '' : String(payload.failureReason)
-    const networkCode = payload.networkCode == null ? '' : String(payload.networkCode)
-    console.log(
-      `[Africa's Talking DLR] Received callback for message ${id || 'unknown'}: status=${status}, phone=${maskPhoneNumber(phoneNumber || '')}, reason=${failureReason || 'none'} (auth: ${auth.via})`
-    )
-
-    const normalizedStatus = String(status || '').toLowerCase()
-    const isSuccess = normalizedStatus === 'success' || normalizedStatus === 'delivered'
-    const newStatus = isSuccess ? 'delivered' : normalizedStatus === 'buffered' ? 'pending' : 'failed'
-    const note = failureReason
-      ? `${status}: ${failureReason} (network: ${networkCode || 'N/A'})`
-      : undefined
-
-    if (id) {
-      // O(1) on the provider_message_id index.
-      const byProviderId = await smsStore.findByProviderMessageId(String(id))
-
-      // Some campaigns only echo the MSISDN — fall back to a bounded recent
-      // lookup, matched on normalised digits.
-      const match =
-        byProviderId ||
-        (phoneNumber ? await smsStore.findRecentUnresolvedByRecipient(String(phoneNumber)) : null)
-
-      if (!match) {
-        // Nothing to update (e.g. a message from before this store existed).
-        // Acknowledge so Africa's Talking does not retry forever.
-        console.warn(`[Africa's Talking DLR] No SMS record found for provider id ${id} — acknowledging`)
-        return new NextResponse('OK', { status: 200, headers: { 'Content-Type': 'text/plain' } })
+    // Only terminal reports can change state; "buffered"/"submitted" are
+    // acceptance events, not proof of delivery. No recipient-only fallback.
+    const normalized = status.toLowerCase()
+    const finalStatus = ['success', 'delivered'].includes(normalized) ? 'delivered'
+      : ['failed', 'rejected', 'expired', 'undeliverable'].includes(normalized) ? 'failed'
+      : null
+    if (id && finalStatus) {
+      const match = await smsStore.findByProviderMessageId(id)
+      if (match) {
+        const changed = await smsStore.applyDeliveryReport(match.id, id, finalStatus)
+        if (changed) {
+          const updated = await smsStore.get(match.id)
+          if (updated) await deliverSmsNotification(updated)
+        }
+      } else {
+        // Unknown/duplicate provider IDs are not associated with a recipient;
+        // acknowledge but do not mutate another app's row.
+        console.warn("[Africa's Talking DLR] Unmatched provider ID; no SMS updated")
       }
-
-      const updated = await smsStore.updateStatus(match.id, newStatus, note, undefined, String(id))
-      if (!updated) {
-        // Persistence failed (DB error) — let Africa's Talking retry.
-        console.error(`[Africa's Talking DLR] Failed to persist status for SMS ${match.id}`)
-        return new NextResponse('Retry', { status: 500, headers: { 'Content-Type': 'text/plain' } })
-      }
-
-      console.log(`[Africa's Talking DLR] Updated SMS ${match.id} status to ${newStatus}`)
     }
 
     // Africa's Talking expects a 200 OK response
     return new NextResponse('OK', { status: 200, headers: { 'Content-Type': 'text/plain' } })
-  } catch (error: any) {
-    console.error("[Africa's Talking DLR] Callback handling error:", error)
+  } catch {
+    console.error("[Africa's Talking DLR] Callback handling error; retry requested")
     // 500 and not 200: a retried delivery report is cheap, a silently dropped
     // one leaves the message stuck in "pending" forever.
     return new NextResponse('Internal Error', { status: 500 })

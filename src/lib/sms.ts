@@ -19,7 +19,7 @@ export async function sendSmsViaProvider(to: string, message: string, fromSender
       )
     }
 
-    console.log(`[SMS Simulation] (development only) Sending to ${to}: "${message}"`)
+    console.log("[SMS Simulation] (development only) Simulating SMS; content and recipient omitted")
     // Mock delivery delay for demonstration
     await new Promise((resolve) => setTimeout(resolve, 500))
     return { success: true, providerId: 'sim_' + Math.random().toString(36).substring(2, 11) }
@@ -29,7 +29,7 @@ export async function sendSmsViaProvider(to: string, message: string, fromSender
     const atClient = africastalking({ apiKey, username })
     const formattedTo = normalizeToE164(to)
     
-    console.log(`[Africa's Talking] Dispatching to ${formattedTo} with username: "${username}"...`)
+    console.log("[Africa's Talking] Dispatching SMS")
     
     const sendOptions: { to: string[]; message: string; from?: string } = {
       to: [formattedTo],
@@ -42,7 +42,6 @@ export async function sendSmsViaProvider(to: string, message: string, fromSender
     }
 
     let result = await atClient.SMS.send(sendOptions)
-    console.log("[Africa's Talking] Send result:", JSON.stringify(result, null, 2))
     
     let recipientData = result.SMSMessageData?.Recipients?.[0]
     let status = recipientData?.status || ''
@@ -61,10 +60,9 @@ export async function sendSmsViaProvider(to: string, message: string, fromSender
       String(recipientData?.status || '').toLowerCase().includes('invalidsenderid')
 
     if (sendOptions.from && senderIdRejected) {
-      console.warn(`[Africa's Talking] Sender ID "${sendOptions.from}" rejected as InvalidSenderId by telco. Retrying via default route...`)
+      console.warn("[Africa's Talking] Sender ID rejected; retrying via default route")
       delete sendOptions.from
       result = await atClient.SMS.send(sendOptions)
-      console.log("[Africa's Talking] Retry send result:", JSON.stringify(result, null, 2))
       recipientData = result.SMSMessageData?.Recipients?.[0]
       status = recipientData?.status || ''
     }
@@ -72,24 +70,27 @@ export async function sendSmsViaProvider(to: string, message: string, fromSender
     const isSuccess = status.toLowerCase() === 'success' || status.toLowerCase() === 'submitted' || status.toLowerCase() === 'buffered'
 
     if (!isSuccess) {
-      const errorMessage = recipientData?.status || result.SMSMessageData?.Message || 'SMS delivery rejected by provider'
-      console.warn(`[Africa's Talking] Delivery not confirmed: ${errorMessage}`)
+      // A missing/malformed status is not an explicit rejection: the request
+      // might have been accepted before the response was lost or truncated.
+      const explicitRejection = /^(failed|rejected|invalidsenderid|invalidphonenumber|insufficientbalance|invalidnumber|invalidphone|invalid)$/i.test(status)
+      if (!explicitRejection) throw new Error('Provider outcome unknown')
+      console.warn("[Africa's Talking] Provider explicitly rejected SMS")
       return {
         success: false,
-        providerId: recipientData?.messageId || 'at_msg',
-        error: errorMessage,
+        providerId: recipientData?.messageId,
+        error: 'Provider rejected SMS',
       }
     }
 
     return { 
       success: true, 
-      providerId: recipientData?.messageId || 'at_msg',
+      providerId: recipientData?.messageId,
       cost: recipientData?.cost,
       status: status,
     }
-  } catch (error: any) {
-    console.error("[Africa's Talking] Exception sending SMS:", error)
-    throw error 
+  } catch {
+    // SDK/HTTP errors can echo request options (including SMS body). Never log them.
+    throw new Error("Provider outcome unknown")
   }
 }
 

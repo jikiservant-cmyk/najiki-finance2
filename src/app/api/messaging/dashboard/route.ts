@@ -123,6 +123,7 @@ export async function GET() {
           delivered: stats.delivered,
           pending: stats.pending,
           failed: stats.failed,
+          unknown: stats.unknown,
           queued: stats.queued,
         },
         deliveryRate: stats.deliveryRate,
