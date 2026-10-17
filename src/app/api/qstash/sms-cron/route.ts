@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { smsQueue, retrySmsNotifications } from '@/lib/sms-queue'
+import { smsQueue, retrySmsNotifications, reconcileSmsDeliveryReports } from '@/lib/sms-queue'
 import { smsStore } from '@/lib/sms-store'
 import { verifyCronRequest } from '@/lib/qstash-verify'
 
@@ -13,15 +13,20 @@ async function handleSmsCron(request: Request) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    // Process up to 20 SMS messages in one batch
-    const results = await smsQueue.processBatch(20)
+    // Keep this within the 60s serverless limit even when the provider or a
+    // partner endpoint is slow. Queued records remain durable for the next run.
+    const results = await smsQueue.processBatch(10)
+    const reportsResolved = await reconcileSmsDeliveryReports()
     const staleMarkedUnknown = await smsStore.markStalePendingUnknown()
     const notificationsDelivered = await retrySmsNotifications()
+    const reportsPruned = await smsStore.pruneDeliveryReports()
     
     return NextResponse.json({
       success: true,
       timestamp: new Date().toISOString(),
       processedCount: results.length,
+      reportsResolved,
+      reportsPruned,
       staleMarkedUnknown,
       notificationsDelivered,
       results,

@@ -1,6 +1,31 @@
 import africastalking from 'africastalking'
 import { normalizeToE164 } from '@/lib/phone'
 
+/** The AT SDK does not configure an Axios timeout. A timed-out call is
+ * ambiguous, so its SMS stays pending and is NEVER automatically resent.
+ * This bounds a cron invocation without pretending to cancel provider I/O.
+ */
+export async function waitForSmsProvider<T>(operation: Promise<T>, maxWaitMs = 12_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Provider outcome unknown')), maxWaitMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+type AfricaTalkingSmsResponse = {
+  SMSMessageData?: {
+    Message?: string
+    Recipients?: Array<{ status?: string; messageId?: string; cost?: string | number }>
+  }
+}
+
 export async function sendSmsViaProvider(to: string, message: string, fromSenderId?: string) {
   const apiKey = process.env.AFRICASTALKING_API_KEY
   const username = process.env.AFRICASTALKING_USERNAME || 'sandbox'
@@ -41,7 +66,7 @@ export async function sendSmsViaProvider(to: string, message: string, fromSender
       sendOptions.from = senderId.trim()
     }
 
-    let result = await atClient.SMS.send(sendOptions)
+    let result = await waitForSmsProvider<AfricaTalkingSmsResponse>(atClient.SMS.send(sendOptions))
     
     let recipientData = result.SMSMessageData?.Recipients?.[0]
     let status = recipientData?.status || ''
@@ -54,15 +79,16 @@ export async function sendSmsViaProvider(to: string, message: string, fromSender
     // send had actually succeeded and simply returned an empty array, the
     // message went out twice and was billed twice. Only an explicit
     // sender-ID rejection justifies a retry now.
+    // Never trust a contradictory top-level error over an accepted recipient:
+    // retrying that case can produce two paid SMS messages.
     const senderIdRejected =
-      result.SMSMessageData?.Message === 'InvalidSenderId' ||
-      String(status || '').toLowerCase() === 'invalidsenderid' ||
-      String(recipientData?.status || '').toLowerCase().includes('invalidsenderid')
+      String(status).toLowerCase() === 'invalidsenderid' ||
+      (!recipientData && String(result.SMSMessageData?.Message || '').toLowerCase() === 'invalidsenderid')
 
     if (sendOptions.from && senderIdRejected) {
       console.warn("[Africa's Talking] Sender ID rejected; retrying via default route")
       delete sendOptions.from
-      result = await atClient.SMS.send(sendOptions)
+      result = await waitForSmsProvider<AfricaTalkingSmsResponse>(atClient.SMS.send(sendOptions))
       recipientData = result.SMSMessageData?.Recipients?.[0]
       status = recipientData?.status || ''
     }

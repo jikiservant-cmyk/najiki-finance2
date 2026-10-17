@@ -112,7 +112,7 @@ export async function POST(request: Request) {
       return new NextResponse('Unauthorized', { status: 401 })
     }
 
-    const id = payload.id == null ? '' : String(payload.id)
+    const id = payload.id == null ? '' : String(payload.id).trim()
     const status = payload.status == null ? '' : String(payload.status)
     // Only terminal reports can change state; "buffered"/"submitted" are
     // acceptance events, not proof of delivery. No recipient-only fallback.
@@ -121,18 +121,12 @@ export async function POST(request: Request) {
       : ['failed', 'rejected', 'expired', 'undeliverable'].includes(normalized) ? 'failed'
       : null
     if (id && finalStatus) {
-      const match = await smsStore.findByProviderMessageId(id)
-      if (match) {
-        const changed = await smsStore.applyDeliveryReport(match.id, id, finalStatus)
-        if (changed) {
-          const updated = await smsStore.get(match.id)
-          if (updated) await deliverSmsNotification(updated)
-        }
-      } else {
-        // Unknown/duplicate provider IDs are not associated with a recipient;
-        // acknowledge but do not mutate another app's row.
-        console.warn("[Africa's Talking DLR] Unmatched provider ID; no SMS updated")
-      }
+      if (id.length > 255) return new NextResponse('Invalid provider ID', { status: 400 })
+      // Persist first: the DLR may beat the provider-send response and its ID
+      // write. Cron reconciles the inbox later without a recipient fallback.
+      await smsStore.rememberDeliveryReport(id, finalStatus)
+      const updated = await smsStore.resolveDeliveryReport(id)
+      if (updated) await deliverSmsNotification(updated)
     }
 
     // Africa's Talking expects a 200 OK response

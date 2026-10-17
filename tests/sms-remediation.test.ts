@@ -131,12 +131,12 @@ test('DLR requires matching provider ID and monotonic terminal transition', asyn
 
 test('authenticated DLR with unknown ID and matching phone cannot touch another app', async () => {
   let updates = 0
-  let lookedUp = 0
+  const remembered: string[] = []
   const { POST } = load('src/app/api/webhooks/africastalking/route.ts', {
     'next/server': { NextResponse: class extends Response {} },
     '@/lib/sms-store': { smsStore: {
-      findByProviderMessageId: async () => { lookedUp++; return null },
-      applyDeliveryReport: async () => { updates++; return true },
+      rememberDeliveryReport: async (id: string) => { remembered.push(id) },
+      resolveDeliveryReport: async () => { updates++; return null },
     } },
     '@/lib/sms-queue': { deliverSmsNotification: async () => true },
     '@/lib/callback-auth': { authorizeCallback: () => ({ ok: true, via: 'secret' }) },
@@ -149,8 +149,8 @@ test('authenticated DLR with unknown ID and matching phone cannot touch another 
     body: JSON.stringify({ id: 'unknown', status: 'Failed', phoneNumber: input.to }),
   }))
   assert.equal(response.status, 200)
-  assert.equal(lookedUp, 1)
-  assert.equal(updates, 0)
+  assert.deepEqual(remembered, ['unknown'])
+  assert.equal(updates, 1)
 })
 
 test('retention purges terminal SMS content independently of phone-number masking', async () => {
@@ -228,4 +228,132 @@ test('terminal partner notifications require 2xx; unsuccessful attempts remain r
   ok = true
   assert.equal(await deliverSmsNotification(sms), true)
   assert.deepEqual(attempts, ['attempted', 'delivered'])
+})
+
+test('a terminal DLR arriving before provider-ID persistence is retained and reconciled', async () => {
+  const sms: any = { id: 'app-a-sms', recipient: input.to, message: 'secret', status: 'pending',
+    providerMessageId: null, applicationId: 'app-a' }
+  const reports = new Map<string, any>()
+  const db = {
+    smsDeliveryReport: {
+      create: async ({ data }: any) => {
+        if (reports.has(data.providerMessageId)) throw Object.assign(Error('duplicate'), { code: 'P2002' })
+        reports.set(data.providerMessageId, { ...data, appliedAt: null, lastCheckedAt: null })
+      },
+      findUnique: async ({ where }: any) => reports.get(where.providerMessageId) ?? null,
+      updateMany: async ({ where, data }: any) => {
+        const report = reports.get(where.providerMessageId)
+        if (report && !report.appliedAt) Object.assign(report, data)
+        return { count: report ? 1 : 0 }
+      },
+      findMany: async () => [...reports.values()].filter(r => !r.appliedAt),
+    },
+    smsMessage: {
+      findMany: async ({ where }: any) => sms.providerMessageId === where.providerMessageId ? [sms] : [],
+      updateMany: async ({ where, data }: any) => {
+        if (where.id !== sms.id || !where.status.in.includes(sms.status) ||
+            where.providerMessageId !== sms.providerMessageId) return { count: 0 }
+        Object.assign(sms, data)
+        return { count: 1 }
+      },
+      findUnique: async () => sms,
+    },
+  }
+  const { smsStore } = load('src/lib/sms-store.ts', { './db': { db } })
+  await smsStore.rememberDeliveryReport('provider-42', 'delivered')
+  assert.equal(await smsStore.resolveDeliveryReport('provider-42'), null)
+  assert.equal(sms.status, 'pending')
+  assert.deepEqual(await smsStore.getUnappliedDeliveryReportIds(), ['provider-42'])
+  await smsStore.rememberDeliveryReport('provider-42', 'failed') // first report wins
+  assert.equal(reports.get('provider-42').status, 'delivered')
+  sms.providerMessageId = 'provider-42' // response finally persisted
+  const resolved = await smsStore.resolveDeliveryReport('provider-42')
+  assert.equal(resolved.status, 'delivered')
+  assert.equal(reports.get('provider-42').appliedAt instanceof Date, true)
+  assert.equal(await smsStore.resolveDeliveryReport('provider-42'), null)
+})
+
+test('quota uses the same UTC day as the row even when waiting across midnight', async () => {
+  const OriginalDate = globalThis.Date
+  let lockReleased = false
+  let countedDay: string | undefined
+  let insertedDay: string | undefined
+  class CrossingDate extends OriginalDate {
+    constructor(...args: any[]) {
+      if (args.length === 0) super(lockReleased ? '2026-10-18T00:00:00.000Z' : '2026-10-17T23:59:59.999Z')
+      else super(args[0])
+    }
+  }
+  const tx = {
+    $queryRawUnsafe: async () => { lockReleased = true },
+    smsMessage: {
+      count: async ({ where }: any) => { countedDay = where.createdAt.gte.toISOString(); return 0 },
+      create: async ({ data }: any) => { insertedDay = data.createdAt.toISOString(); return data },
+    },
+  }
+  const { smsStore } = load('src/lib/sms-store.ts', {
+    './db': { db: { $transaction: (fn: any) => fn(tx) } },
+  })
+  try {
+    globalThis.Date = CrossingDate as DateConstructor
+    await smsStore.createOrGet({ recipient: input.to, message: 'hi', applicationCode: 'app',
+      providerCode: 'at', cost: 50, applicationId: 'app', dailyLimit: 1 })
+  } finally {
+    globalThis.Date = OriginalDate
+  }
+  assert.equal(countedDay, '2026-10-18T00:00:00.000Z')
+  assert.equal(insertedDay, '2026-10-18T00:00:00.000Z')
+})
+
+test('contradictory sender-ID error never triggers a second provider send', async () => {
+  let calls = 0
+  const provider = load('src/lib/sms.ts', {
+    africastalking: () => ({ SMS: { send: async () => {
+      calls++
+      return { SMSMessageData: { Message: 'InvalidSenderId',
+        Recipients: [{ status: 'Success', messageId: 'accepted-1' }] } }
+    } } }),
+    '@/lib/phone': { normalizeToE164: (phone: string) => phone },
+  })
+  const oldKey = process.env.AFRICASTALKING_API_KEY
+  const oldUsername = process.env.AFRICASTALKING_USERNAME
+  try {
+    process.env.AFRICASTALKING_API_KEY = 'fake-key'
+    process.env.AFRICASTALKING_USERNAME = 'live'
+    const result = await provider.sendSmsViaProvider(input.to, 'do not repeat', 'NAJIKI')
+    assert.equal(result.success, true)
+    assert.equal(calls, 1)
+  } finally {
+    if (oldKey === undefined) delete process.env.AFRICASTALKING_API_KEY
+    else process.env.AFRICASTALKING_API_KEY = oldKey
+    if (oldUsername === undefined) delete process.env.AFRICASTALKING_USERNAME
+    else process.env.AFRICASTALKING_USERNAME = oldUsername
+  }
+})
+
+test('old durable outbox rows take priority over a constant stream of Redis hints', async () => {
+  const claimed: string[] = []
+  const { smsQueue } = load('src/lib/sms-queue.ts', {
+    './redis': { redis: { rpop: async () => 'new-hint' } },
+    './sms-store': { smsStore: {
+      getDueQueued: async () => ['old-durable-job'],
+      claimForSending: async (id: string) => {
+        claimed.push(id)
+        return { id, recipient: input.to, message: 'hi', senderId: null }
+      },
+      recordProviderAcceptance: async () => true,
+    } },
+    './sms': { sendSmsViaProvider: async () => ({ success: true, providerId: 'provider-1' }) },
+    './db': { db: {} }, './safe-fetch': {}, './application-auth': {},
+    './notification-signature': {}, './provider-cost': { parseProviderCost: () => null },
+  })
+  await smsQueue.processBatch(1)
+  assert.deepEqual(claimed, ['old-durable-job'])
+})
+
+test('a hung provider call has a bounded, ambiguous outcome rather than a retry', async () => {
+  const { waitForSmsProvider } = load('src/lib/sms.ts', {
+    africastalking: () => ({}), '@/lib/phone': { normalizeToE164: (phone: string) => phone },
+  })
+  await assert.rejects(waitForSmsProvider(new Promise(() => {}), 5), /Provider outcome unknown/)
 })

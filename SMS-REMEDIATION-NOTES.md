@@ -5,19 +5,25 @@ It does **not** add a platform-managed SMS credit ledger: `BUY_SMS` payments sti
 route to Na'jiki's platform account; the receiving partner application allocates
 its own SMS credits after the payment-success webhook.
 
-- Deploy the new Prisma migration **before** deploying application code. The
-  migration adds retry bookkeeping for terminal SMS partner webhooks and marks
+- Deploy **both SMS Prisma migrations** before deploying application code.
+  They add webhook retry bookkeeping and the early-DLR inbox. The first marks
   pre-existing terminal rows as notified to avoid a historical webhook replay.
+  Run `npm run db:harden` after migrations and verify Data API access is denied.
 - Keep `/api/qstash/sms-cron` scheduled (normally every minute): Postgres
   `queued` rows are the durable outbox; Redis only accelerates dispatch. The
   `queued -> pending` database claim occurs before provider I/O. A worker crash
   or provider/network timeout *after* claiming can leave an SMS unconfirmed;
-  the system deliberately will **not** auto-resend it. Investigate the provider
-  account manually before deciding whether another SMS is appropriate.
+  the SDK wait is bounded to 12 seconds, but the system deliberately will **not**
+  auto-resend it. Investigate the provider account manually before deciding
+  whether another SMS is appropriate.
 - Provider `submitted`/`buffered` responses remain `pending`. An authenticated,
-  provider-ID-matched DLR alone may confirm `delivered` or `failed`. Pending
-  messages become `unknown` after 48 hours without a terminal DLR; late DLRs
-  can still resolve them. Never treat `unknown` as proof of failure or delivery.
+  provider-ID-matched DLR alone may confirm `delivered` or `failed`. A DLR that
+  arrives before the provider ID is saved is held in `sms_delivery_reports` and
+  reconciled by the SMS cron; unmatched reports expire after seven days. The
+  correlation is by provider ID **only**, never the recipient phone number.
+  Pending messages become `unknown` after 48 hours without a terminal DLR;
+  late DLRs can still resolve them. Never treat `unknown` as proof of failure
+  or delivery.
 - Partners receive signed `SMS_DELIVERY_UPDATE` webhooks for terminal states;
   non-2xx responses are retried by cron. Deliveries are **at least once**, so
   partners should deduplicate using `(smsId, status)`. Missing/placeholder
@@ -33,8 +39,11 @@ its own SMS credits after the payment-success webhook.
 
 Mocked regression tests cover quota serialization, Redis failures, duplicate
 jobs, ambiguous provider outcomes, delivery-report correlation, segment limits,
-provider logging and content retention. A real database/Redis/provider staging
-run is still needed: this sandbox cannot fetch the Prisma schema engine and
-has no live provider credentials. Existing historical rows previously marked
-`delivered` at provider acceptance cannot be reliably reclassified after the
-fact without external provider records.
+provider logging, callback-before-ID reconciliation, UTC-midnight quota races,
+and content retention. The schema parsed using Prisma's local WASM DMMF
+parser; the baseline plus both SMS migrations applied in an in-memory
+PostgreSQL runtime. A real database/Redis/provider staging run is still
+needed: this sandbox cannot fetch the native Prisma schema engine, generate
+a complete client or run a production build, and has no live provider
+credentials. Historical rows previously marked `delivered` at provider
+acceptance cannot be reliably reclassified without provider records.

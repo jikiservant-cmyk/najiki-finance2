@@ -113,15 +113,18 @@ export const smsStore = {
     dailyLimit: number
   }): Promise<{ sms: SmsRequest; created: boolean }> => {
     const key = params.idempotencyKey?.trim() || null
-    const now = new Date()
-    const dayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
-    const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000)
 
     // The transaction-level advisory lock serializes all sends for this app.
     // Count and insert MUST use the same transaction/connection; a separate
     // count in the route let concurrent requests all observe quota remaining.
     return db.$transaction(async (tx) => {
       await tx.$queryRawUnsafe('SELECT pg_advisory_xact_lock(hashtext($1))::text', params.applicationId)
+      // Measure the UTC day AFTER waiting for the lock; otherwise a request
+      // stalled across midnight can be counted against yesterday but inserted
+      // into today's quota. Persist that exact timestamp with the SMS.
+      const now = new Date()
+      const dayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
+      const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000)
       if (key) {
         const existing = await tx.smsMessage.findFirst({
           where: { applicationId: params.applicationId, idempotencyKey: key },
@@ -140,7 +143,9 @@ export const smsStore = {
       if (sentToday >= params.dailyLimit) {
         throw new SmsDailyLimitError(Math.max(1, Math.ceil((dayEnd.getTime() - now.getTime()) / 1000)))
       }
-      const sms = await tx.smsMessage.create({ data: newSmsData({ ...params, idempotencyKey: key }) })
+      const sms = await tx.smsMessage.create({
+        data: { ...newSmsData({ ...params, idempotencyKey: key }), createdAt: now },
+      })
       return { sms: toSms(sms), created: true }
     }, { maxWait: 5_000, timeout: 10_000 })
   },
@@ -223,6 +228,57 @@ export const smsStore = {
       data: { status },
     })
     return result.count === 1
+  },
+
+  /** Store an authenticated report BEFORE looking up the SMS. First terminal
+   * report wins, including when concurrent duplicate callbacks arrive.
+   */
+  rememberDeliveryReport: async (providerMessageId: string, status: 'delivered' | 'failed'): Promise<void> => {
+    try {
+      await db.smsDeliveryReport.create({ data: { providerMessageId, status } })
+    } catch (error) {
+      if ((error as { code?: string })?.code !== 'P2002') throw error
+    }
+  },
+
+  /** Reconcile even when a callback raced with recordProviderAcceptance(). */
+  resolveDeliveryReport: async (providerMessageId: string): Promise<SmsRequest | null> => {
+    const report = await db.smsDeliveryReport.findUnique({ where: { providerMessageId } })
+    if (!report || report.appliedAt) return null
+    const match = await smsStore.findByProviderMessageId(providerMessageId)
+    if (!match || !['pending', 'unknown', 'delivered', 'failed'].includes(match.status)) {
+      await db.smsDeliveryReport.updateMany({
+        where: { providerMessageId, appliedAt: null }, data: { lastCheckedAt: new Date() },
+      })
+      return null
+    }
+    // CAS prevents contradictory/duplicate DLRs from rewriting terminal rows.
+    const changed = await smsStore.applyDeliveryReport(match.id, providerMessageId, report.status as 'delivered' | 'failed')
+    await db.smsDeliveryReport.updateMany({
+      where: { providerMessageId, appliedAt: null }, data: { appliedAt: new Date() },
+    })
+    return changed ? smsStore.get(match.id) : null
+  },
+
+  getUnappliedDeliveryReportIds: async (limit = 20): Promise<string[]> => {
+    const rows = await db.smsDeliveryReport.findMany({
+      where: { appliedAt: null },
+      orderBy: { lastCheckedAt: { sort: 'asc', nulls: 'first' } },
+      select: { providerMessageId: true }, take: limit,
+    })
+    return rows.map((row) => row.providerMessageId)
+  },
+
+  pruneDeliveryReports: async (days = 7): Promise<number> => {
+    const expired = await db.smsDeliveryReport.findMany({
+      where: { receivedAt: { lt: new Date(Date.now() - days * 24 * 60 * 60 * 1000) } },
+      select: { providerMessageId: true }, orderBy: { receivedAt: 'asc' }, take: 200,
+    })
+    if (!expired.length) return 0
+    const result = await db.smsDeliveryReport.deleteMany({
+      where: { providerMessageId: { in: expired.map((row) => row.providerMessageId) } },
+    })
+    return result.count
   },
 
   get: async (id: string): Promise<SmsRequest | null> => {

@@ -37,35 +37,34 @@ export const smsQueue = {
     } catch {
       console.warn('[smsQueue] Redis read unavailable; sweeping DB outbox')
     }
-    // Also catches lost hints, pre-existing stranded jobs and duplicate HTTP
-    // requests. A second worker/duplicate hint loses the atomic claim.
-    ids.push(...await smsStore.getDueQueued(size))
-    const results: Array<{ smsId: string; success: boolean; status: string }> = []
-    for (const id of new Set(ids)) {
-      if (results.length >= size) break
+    // Sweep DB *before* hints to keep old stranded rows moving even under a
+    // continuous stream of fresh Redis jobs. Only the DB claim grants a send.
+    const due = await smsStore.getDueQueued(size)
+    const workIds = [...new Set([...due, ...ids])].slice(0, size)
+    // Limit concurrency to the caller's batch size (10 for cron). Serial SDK
+    // requests could consume the entire 60s serverless window before the
+    // delivery-report reconciliation and webhook retry steps run.
+    const outcomes = await Promise.all(workIds.map(async (id) => {
       const sms = await smsStore.claimForSending(id)
-      if (!sms) continue
+      if (!sms) return null
       try {
         const result = await sendSmsViaProvider(sms.recipient, sms.message, sms.senderId ?? undefined)
         if (!result.success) {
           await smsStore.failExplicitly(id)
-          results.push({ smsId: id, success: false, status: 'failed' })
-          continue
+          return { smsId: id, success: false, status: 'failed' }
         }
-        // 'success', 'submitted', and 'buffered' acknowledge acceptance only.
-        // Actual delivery requires an authenticated DLR with the same provider ID.
+        // Provider acceptance is NOT proof of delivery.
         await smsStore.recordProviderAcceptance(id, result.providerId)
         const cost = parseProviderCost(result.cost)
         if (cost) await smsStore.updateProviderCost(id, cost.amountMinor)
-        results.push({ smsId: id, success: true, status: 'pending' })
+        return { smsId: id, success: true, status: 'pending' }
       } catch {
-        // Network timeout, lost provider response, or DB write failure: the
-        // provider may have sent the text already. Keep the claim in pending;
-        // manual reconciliation is needed. Never retry the same SMS blindly.
+        // SDK timeout or lost response is ambiguous: never retry automatically.
         console.error(`[smsQueue] Ambiguous send for ${id}; held pending, no automatic resend`)
-        results.push({ smsId: id, success: false, status: 'pending' })
+        return { smsId: id, success: false, status: 'pending' }
       }
-    }
+    }))
+    const results = outcomes.filter((item): item is NonNullable<typeof item> => item !== null)
     return results
   },
 }
@@ -79,10 +78,15 @@ export async function deliverSmsNotification(sms: SmsRequest): Promise<boolean> 
     const app = sms.applicationId
       ? await db.application.findUnique({ where: { id: sms.applicationId } })
       : null
-    // Admin quick-sends can have no application; no partner endpoint exists.
-    if (!app || !app.webhookPath) {
+    // Legacy admin sends may have no application. An existing application
+    // without a webhook is misconfigured, not an acknowledged delivery.
+    if (!app && !sms.applicationId) {
       await smsStore.markNotificationDelivered(sms.id, sms.status)
       return true
+    }
+    if (!app || !app.webhookPath) {
+      await smsStore.markNotificationAttempted(sms.id, sms.status)
+      return false
     }
     const target = `${app.baseUrl || ''}${app.webhookPath.startsWith('/') ? '' : '/'}${app.webhookPath}`
     if (isPlaceholderUrl(target)) {
@@ -115,9 +119,18 @@ export async function deliverSmsNotification(sms: SmsRequest): Promise<boolean> 
   }
 }
 
-export async function retrySmsNotifications(limit = 20): Promise<number> {
+export async function retrySmsNotifications(limit = 10): Promise<number> {
   const pending = await smsStore.getPendingTerminalNotifications(limit)
-  let sent = 0
-  for (const sms of pending) if (await deliverSmsNotification(sms)) sent++
-  return sent
+  const outcomes = await Promise.all(pending.map(deliverSmsNotification))
+  return outcomes.filter(Boolean).length
+}
+
+export async function reconcileSmsDeliveryReports(limit = 10): Promise<number> {
+  const ids = await smsStore.getUnappliedDeliveryReportIds(limit)
+  const outcomes = await Promise.all(ids.map(async (id) => {
+    const updated = await smsStore.resolveDeliveryReport(id)
+    if (updated) await deliverSmsNotification(updated)
+    return !!updated
+  }))
+  return outcomes.filter(Boolean).length
 }
