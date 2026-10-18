@@ -37,24 +37,30 @@ export class LivePayProvider implements PaymentProvider {
   }
 
   async initiatePayment(params: InitiatePaymentParams): Promise<InitiatePaymentResponse> {
-    const rawAuthUrl = process.env.NEXTAUTH_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:3000')
-    const normalizedBase = rawAuthUrl.replace(/\/+$/, '')
-    // LivePay expects 2567... without +, amount as integer for UGX
-    const normalizedPhone = normalizePhone(params.phoneNumber)
-    // Ensure amount is integer for UGX (zero-decimal) — avoid 5000.00 vs 5000 mismatch
+    // Docs: https://docs.livepay.me/request-money — payload is ONLY accountNumber, phoneNumber, amount, currency, reference, description (+ network for non-UGX)
+    // No webhookUrl per request — webhook is configured per LivePay account dashboard. Sending extra field can 400.
+    // Phone: docs example is "0777123456" (any format accepted per docs, so avoid over-normalizing to 256...)
+    // Reference: no spaces, max 30 chars, unique per account
+    const normalizedPhone = String(params.phoneNumber || '').trim().replace(/[\s\-()]/g, '')
+    // For UGX, LivePay example uses 50000 (major units, zero-decimal). Ensure amount is integer.
     const normalizedAmount = params.currency?.toUpperCase() === 'UGX' ? Math.round(Number(params.amount)) : params.amount
-    const payload = {
+    // Enforce reference constraints per docs: max 30, no spaces
+    let safeReference = String(params.reference || '').trim().replace(/\s+/g, '-')
+    if (safeReference.length > 30) safeReference = safeReference.slice(0, 30)
+    const payload: Record<string, any> = {
       accountNumber: this.accountNo,
       phoneNumber: normalizedPhone,
       amount: normalizedAmount,
       currency: params.currency || 'UGX',
-      reference: params.reference,
+      reference: safeReference,
       description: params.description || 'Payment',
-      webhookUrl: params.webhookUrl || `${normalizedBase}/api/webhooks/livepay`,
+    }
+    // Only add network for non-UGX per docs
+    if (payload.currency.toUpperCase() !== 'UGX' && (params as any).network) {
+      payload.network = (params as any).network
     }
 
-    // Log for ops (phone masked) — helps debug 200 but no PIN
-    console.log(`[LivePay] collect-money → ${this.baseUrl}/api/collect-money phone=${normalizedPhone.slice(0,4)}****${normalizedPhone.slice(-2)} amount=${normalizedAmount} ${payload.currency} ref=${params.reference} account=${this.accountNo.slice(0,4)}**** webhook=${payload.webhookUrl}`)
+    console.log(`[LivePay] collect-money → ${this.baseUrl}/api/collect-money phone=${normalizedPhone.slice(0,4)}****${normalizedPhone.slice(-2)} amount=${normalizedAmount} ${payload.currency} ref=${safeReference} account=${this.accountNo.slice(0,4)}****`)
 
     try {
       const response = await fetch(`${this.baseUrl}/api/collect-money`, {
