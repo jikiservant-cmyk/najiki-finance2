@@ -1,10 +1,11 @@
 import { NextResponse } from 'next/server'
 import { after } from 'next/server'
-import { db } from '@/lib/db'
-import { smsStore, SMS_COST_PLACEHOLDER } from '@/lib/sms-store'
+import { smsStore, SMS_COST_PLACEHOLDER, SmsDailyLimitError, SmsIdempotencyConflictError } from '@/lib/sms-store'
 import { smsQueue } from '@/lib/sms-queue'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
 import { findApplicationByApiKey } from '@/lib/application-auth'
+import { SmsInputSchema, MAX_SMS_BODY_BYTES, resolveSmsDailyLimit } from '@/lib/sms-policy'
+import { readTextWithLimit, PayloadTooLargeError } from '@/lib/request-body'
 
 export function OPTIONS(request: Request) {
   const origin = request.headers.get('origin') || '*'
@@ -14,7 +15,7 @@ export function OPTIONS(request: Request) {
   }
   const headers: Record<string, string> = {
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, Idempotency-Key',
     'Vary': 'Origin',
   }
 
@@ -38,21 +39,14 @@ export async function POST(request: Request) {
       )
     }
 
-    const rawBody = await request.json()
-    const { to, message, applicationCode, from, senderId, apiKey: bodyApiKey } = rawBody
-
-    // Standard `Idempotency-Key` header, with the body field as a fallback for
-    // clients that cannot set headers.
-    const idempotencyKey = (
-      request.headers.get('Idempotency-Key') ||
-      request.headers.get('idempotency-key') ||
-      rawBody.idempotencyKey ||
-      ''
-    ).toString().trim().slice(0, 255) || null
-
-    if (!to || !message) {
-      return NextResponse.json({ error: 'Recipient (to) and message content are required' }, { status: 400 })
+    const rawBody = JSON.parse(await readTextWithLimit(request, MAX_SMS_BODY_BYTES))
+    const keyHeader = request.headers.get('Idempotency-Key')?.trim()
+    const parsed = SmsInputSchema.safeParse(rawBody)
+    if (!parsed.success || (keyHeader && (keyHeader.length < 8 || keyHeader.length > 255))) {
+      return NextResponse.json({ error: 'Invalid SMS payload or idempotency key' }, { status: 400 })
     }
+    const { to, message, applicationCode, from, senderId, apiKey: bodyApiKey } = parsed.data
+    const idempotencyKey = keyHeader || parsed.data.idempotencyKey || null
 
     // 1. Resolve API key from Authorization header, x-api-key header, or body
     const authHeader = request.headers.get('Authorization')
@@ -99,33 +93,10 @@ export async function POST(request: Request) {
       )
     }
 
-    // Pen-test finding (F-C): sending SMS spends real provider money, and the
-    // SMS purchase flow (platform-fee payments) is what pays for it — but
-    // nothing on this endpoint checked a spend, so any valid API key could
-    // send without bound. Hard daily cap per application, counted in the DB
-    // so it works with or without Redis. Tune with SMS_DAILY_LIMIT_PER_APP
-    // (default 10000); set it to 0 to disable.
-    const dailyLimit = Number(process.env.SMS_DAILY_LIMIT_PER_APP || 10000)
-    if (dailyLimit > 0) {
-      const startOfDay = new Date()
-      startOfDay.setHours(0, 0, 0, 0)
-      const sentToday = await db.smsMessage.count({
-        where: { applicationId: application.id, createdAt: { gte: startOfDay } },
-      })
-      if (sentToday >= dailyLimit) {
-        const midnight = new Date(startOfDay)
-        midnight.setDate(midnight.getDate() + 1)
-        return NextResponse.json(
-          { error: `Daily SMS limit of ${dailyLimit} reached for this application. Try again after midnight.` },
-          {
-            status: 429,
-            headers: {
-              'Retry-After': String(Math.max(1, Math.ceil((midnight.getTime() - Date.now()) / 1000))),
-            },
-          }
-        )
-      }
-    }
+    // This is an operational per-app safety ceiling, not a prepaid credit
+    // balance. BUY_SMS funds go to Na'jiki; the partner allocates SMS credits.
+    // Count and insert are serialized inside createOrGet's DB transaction.
+    const dailyLimit = resolveSmsDailyLimit(process.env.SMS_DAILY_LIMIT_PER_APP)
 
     const appCode = application.code
     const appId = application.id
@@ -146,6 +117,7 @@ export async function POST(request: Request) {
       applicationId: appId,
       senderId: customSender,
       idempotencyKey,
+      dailyLimit,
     })
 
     // A reused record has already been queued and is on its way. Re-enqueuing
@@ -158,10 +130,10 @@ export async function POST(request: Request) {
       // Trigger the worker asynchronously using Next.js 15 'after' API if available in request context
       try {
         after(() => {
-          smsQueue.processBatch(5).catch(err => console.error('Background worker error:', err))
+          smsQueue.processBatch(5).catch(() => console.error('Background SMS worker failed'))
         })
       } catch {
-        // Fallback: smsQueue.enqueue already triggered detached background batch processing
+        // Cron sweeps the durable DB outbox if after() is unavailable.
       }
     }
 
@@ -180,7 +152,13 @@ export async function POST(request: Request) {
     }, { status: 202 })
 
   } catch (error) {
-    console.error('Send SMS API Error:', error)
+    if (error instanceof SmsDailyLimitError) return NextResponse.json(
+      { error: error.message }, { status: 429, headers: { 'Retry-After': String(error.retryAfter) } }
+    )
+    if (error instanceof SmsIdempotencyConflictError) return NextResponse.json({ error: error.message }, { status: 409 })
+    if (error instanceof PayloadTooLargeError) return NextResponse.json({ error: 'Payload too large' }, { status: 413 })
+    if (error instanceof SyntaxError) return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
+    console.error('Send SMS API failed (details omitted)')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

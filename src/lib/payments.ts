@@ -1,35 +1,10 @@
 import { db } from './db'
 import { getPaymentProvider } from './providers'
-import { decrypt } from './encryption'
+import { loadTenantProviderCredentials } from './tenant-credentials'
 import { PLATFORM_FEE_TYPES, appRequiresTenantCredentials } from './constants'
 import { toMinorUnits } from './money'
 import { webhookSecretFromRow } from './application-auth'
 import { safeJsonObject } from './json'
-
-/**
- * The tenant's active credential row for a provider, or null when there isn't
- * a usable one.
- *
- * A row that exists but carries no credential material (an empty `{}`) does
- * NOT count: the provider constructor falls back to the platform's env
- * credentials when a field is missing, which is exactly the silent
- * commingling this helper exists to prevent.
- */
-export async function findActiveTenantCredentials(tenantId: string, providerId: string) {
-  const config = await db.tenantProviderConfig.findFirst({
-    where: { tenantId, providerId, isActive: true },
-  })
-  if (!config) return null
-  const json = config.configJson
-  if (
-    json &&
-    typeof json === 'object' &&
-    ((json as any)._encrypted || (json as any).apiKey || (json as any).api_key)
-  ) {
-    return config
-  }
-  return null
-}
 
 export async function processPayment(data: {
   paymentIntentId: string,
@@ -75,21 +50,9 @@ export async function processPayment(data: {
     // Platform payments use the default global credentials — that account is
     // the platform wallet, where SMS purchases and platform fees belong.
     if (payment?.tenantId && payment?.providerId && !isPlatformPayment) {
-      const tenantConfig = await findActiveTenantCredentials(payment.tenantId, payment.providerId)
-      if (tenantConfig?.configJson && typeof tenantConfig.configJson === 'object') {
-        customCredentials = tenantConfig.configJson
-        if (customCredentials?._encrypted) {
-          customCredentials = JSON.parse(decrypt(customCredentials._encrypted))
-        }
-      } else if (payment.application && appRequiresTenantCredentials(payment.application.code)) {
-        // Defense in depth: payment creation refuses these, but a
-        // required-credentials tenant must NEVER silently transact on the
-        // platform's account — that commingles the tenant's money with
-        // everyone else's.
-        throw new Error(
-          `Tenant "${payment.tenant?.code ?? payment.tenantId}" has no active credentials for provider "${providerCode}". ` +
-            `Application "${payment.application.code}" requires per-tenant credentials; platform credentials are not a fallback.`
-        )
+      customCredentials = await loadTenantProviderCredentials(payment.tenantId, payment.providerId)
+      if (!customCredentials) {
+        throw new Error(`TENANT_CREDENTIALS_UNAVAILABLE: ${payment.tenant?.code ?? payment.tenantId}`)
       }
     }
 
@@ -146,7 +109,7 @@ export async function processPayment(data: {
     }
   } catch (err: any) {
     console.error(`processPayment error for ${paymentIntentId}:`, err)
-    const isNetworkAmbiguous = err?.name === 'AbortError' || err?.code === 'ECONNRESET'
+    const isNetworkAmbiguous = err?.message?.startsWith('TENANT_CREDENTIALS_UNAVAILABLE:') || err?.name === 'AbortError' || err?.code === 'ECONNRESET'
       || err?.code === 'ETIMEDOUT' || err?.name === 'TimeoutError' || err?.message?.includes('fetch failed')
 
     await db.$transaction([

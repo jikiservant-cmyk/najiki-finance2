@@ -3,7 +3,8 @@ import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
 import { completePayment, enqueueWebhookNotification } from '@/lib/payments'
 import { verifyCronRequest } from '@/lib/qstash-verify'
-import { decrypt } from '@/lib/encryption'
+import { loadTenantProviderCredentials } from '@/lib/tenant-credentials'
+import { isConfirmedTerminalStatus } from '@/lib/payment-security'
 import { PLATFORM_FEE_TYPES } from '@/lib/constants'
 import { webhookSecretFromRow } from '@/lib/application-auth'
 import { safeJsonObject } from '@/lib/json'
@@ -54,18 +55,9 @@ async function handleCron(request: Request) {
 
         let customCredentials: any = undefined
         if (payment.tenantId && !isPlatformPayment) {
-          const tenantConfig = await db.tenantProviderConfig.findFirst({
-            where: {
-              tenantId: payment.tenantId,
-              providerId: payment.providerId,
-              isActive: true,
-            },
-          })
-          if (tenantConfig?.configJson && typeof tenantConfig.configJson === 'object') {
-            customCredentials = tenantConfig.configJson
-            if (customCredentials?._encrypted) {
-              customCredentials = JSON.parse(decrypt(customCredentials._encrypted))
-            }
+          customCredentials = await loadTenantProviderCredentials(payment.tenantId, payment.providerId)
+          if (!customCredentials) {
+            throw new Error(`Tenant credentials unavailable for payment ${payment.id}; refusing platform fallback`)
           }
         }
 
@@ -77,7 +69,11 @@ async function handleCron(request: Request) {
             payment.providerPaymentId || undefined
           )
 
-          if (result && (result.status === 'success' || result.status === 'failed')) {
+          if (isConfirmedTerminalStatus(result, {
+              amount: Number(payment.amount),
+              currency: payment.currency,
+              providerPaymentId: payment.providerPaymentId,
+            })) {
             const completion = await completePayment({
               paymentIntentId: payment.id,
               status: result.status,

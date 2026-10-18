@@ -11,7 +11,7 @@ import Link from 'next/link'
 
 interface MessagingDashboardData {
   totalSent: number
-  statusCounts: { delivered: number; pending: number; failed: number; queued: number }
+  statusCounts: { delivered: number; pending: number; failed: number; unknown: number; queued: number }
   deliveryRate: string
   appUsage: { code: string; name: string; count: number; cost: number }[]
   providerUsage: { code: string; name: string; count: number; cost: number }[]
@@ -109,7 +109,7 @@ export default function MessagingDashboard() {
   const safeData = data || {
     totalSent: 0,
     totalCost: 0,
-    statusCounts: { delivered: 0, pending: 0, failed: 0, queued: 0 },
+    statusCounts: { delivered: 0, pending: 0, failed: 0, unknown: 0, queued: 0 },
     deliveryRate: '0',
     appUsage: [],
     providerUsage: [],
@@ -179,11 +179,12 @@ export default function MessagingDashboard() {
           <div className="px-6 md:px-16 lg:px-24 py-4 space-y-6">
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 scene-3d">
               {[
-                { label: 'Total Sent', value: safeData.totalSent.toLocaleString(), sub: 'Across all channels', accent: '#38bdf8', delay: 1.6 },
+                { label: 'Total Requests', value: safeData.totalSent.toLocaleString(), sub: 'All SMS states', accent: '#38bdf8', delay: 1.6 },
                 { label: 'Delivery Rate', value: `${safeData.deliveryRate}%`, sub: `${safeStatusCounts.delivered} confirmed`, accent: '#34d399', delay: 1.7 },
                 { label: 'Queued', value: String(safeStatusCounts.queued), sub: 'Waiting for provider', delay: 1.8 },
                 { label: 'Pending', value: String(safeStatusCounts.pending), sub: 'In transit', delay: 1.9 },
                 { label: 'Failed', value: String(safeStatusCounts.failed), sub: 'Delivery failed', accent: '#f87171', delay: 2.0 },
+                { label: 'Unknown', value: String(safeStatusCounts.unknown), sub: 'Reconcile manually', accent: '#fbbf24', delay: 2.05 },
                 { label: 'Total Cost', value: fmtCost(safeData.totalCost), sub: 'Estimated spend', accent: '#fbbf24', delay: 2.1 },
               ].map((stat, i) => (
                 <TiltCard key={stat.label} tiltAmount={8}>

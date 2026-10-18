@@ -21,9 +21,11 @@
 
 import { NextResponse } from 'next/server'
 import { smsStore } from '@/lib/sms-store'
-import { maskPhoneNumber } from '@/lib/redact'
+import { deliverSmsNotification } from '@/lib/sms-queue'
 import { authorizeCallback } from '@/lib/callback-auth'
 import { resolveClientIp } from '@/lib/client-ip'
+import { checkRateLimit } from '@/lib/rate-limit'
+import { readTextWithLimit, PayloadTooLargeError } from '@/lib/request-body'
 
 /**
  * Client IP as seen through the platform proxy.
@@ -42,21 +44,18 @@ function clientIpFrom(request: Request): string {
   })
 }
 
-/** Parse either a JSON or an `application/x-www-form-urlencoded` body. */
-async function readCallbackBody(request: Request): Promise<Record<string, any>> {
+/** A delivery report is tiny; cap streaming bodies before authentication/parsing. */
+const MAX_CALLBACK_BYTES = 16 * 1024
+
+async function readCallbackBody(request: Request): Promise<Record<string, unknown>> {
   const contentType = request.headers.get('content-type') || ''
-
+  const text = await readTextWithLimit(request, MAX_CALLBACK_BYTES)
   if (contentType.includes('application/json')) {
-    return await request.json()
+    const parsed: unknown = JSON.parse(text)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Invalid callback JSON')
+    return parsed as Record<string, unknown>
   }
-
-  // Form URL-encoded is the default for Africa's Talking callbacks.
-  const text = await request.text()
-  const payload: Record<string, string> = {}
-  for (const [key, value] of new URLSearchParams(text).entries()) {
-    payload[key] = value
-  }
-  return payload
+  return Object.fromEntries(new URLSearchParams(text))
 }
 
 export async function POST(request: Request) {
@@ -74,15 +73,24 @@ export async function POST(request: Request) {
       return new NextResponse('Unauthorized', { status: 401 })
     }
 
-    // The body is read before authorisation so a secret posted as a form field
-    // can be considered. It carries no writes of its own, and the size of a
-    // delivery report is bounded by the platform body limit.
-    let payload: Record<string, any> = {}
+    const ipDecision = await checkRateLimit('sms-callback-ip', clientIpFrom(request) || 'unknown', {
+      tokens: 120,
+      window: '1 m',
+    })
+    if (!ipDecision.ok) {
+      return new NextResponse(ipDecision.message, { status: ipDecision.status,
+        headers: ipDecision.retryAfter ? { 'Retry-After': ipDecision.retryAfter } : {} })
+    }
+
+    // Form callbacks can carry a secret in the body, so read it with a byte cap
+    // before authenticating. A chunked request cannot bypass this limit.
+    let payload: Record<string, unknown>
     try {
       payload = await readCallbackBody(request)
-    } catch (parseError) {
-      console.warn("[Africa's Talking DLR] Could not parse callback body:", parseError)
-      payload = {}
+    } catch (error) {
+      return new NextResponse(error instanceof PayloadTooLargeError ? 'Payload too large' : 'Invalid callback body', {
+        status: error instanceof PayloadTooLargeError ? 413 : 400,
+      })
     }
 
     const auth = authorizeCallback({
@@ -104,49 +112,27 @@ export async function POST(request: Request) {
       return new NextResponse('Unauthorized', { status: 401 })
     }
 
-    const { id, status, phoneNumber, failureReason, networkCode } = payload
-    console.log(
-      `[Africa's Talking DLR] Received callback for message ${id || 'unknown'}: status=${status}, phone=${maskPhoneNumber(phoneNumber || '')}, reason=${failureReason || 'none'} (auth: ${auth.via})`
-    )
-
-    const normalizedStatus = String(status || '').toLowerCase()
-    const isSuccess = normalizedStatus === 'success' || normalizedStatus === 'delivered'
-    const newStatus = isSuccess ? 'delivered' : normalizedStatus === 'buffered' ? 'pending' : 'failed'
-    const note = failureReason
-      ? `${status}: ${failureReason} (network: ${networkCode || 'N/A'})`
-      : undefined
-
-    if (id) {
-      // O(1) on the provider_message_id index.
-      const byProviderId = await smsStore.findByProviderMessageId(String(id))
-
-      // Some campaigns only echo the MSISDN — fall back to a bounded recent
-      // lookup, matched on normalised digits.
-      const match =
-        byProviderId ||
-        (phoneNumber ? await smsStore.findRecentUnresolvedByRecipient(String(phoneNumber)) : null)
-
-      if (!match) {
-        // Nothing to update (e.g. a message from before this store existed).
-        // Acknowledge so Africa's Talking does not retry forever.
-        console.warn(`[Africa's Talking DLR] No SMS record found for provider id ${id} — acknowledging`)
-        return new NextResponse('OK', { status: 200, headers: { 'Content-Type': 'text/plain' } })
-      }
-
-      const updated = await smsStore.updateStatus(match.id, newStatus, note, undefined, String(id))
-      if (!updated) {
-        // Persistence failed (DB error) — let Africa's Talking retry.
-        console.error(`[Africa's Talking DLR] Failed to persist status for SMS ${match.id}`)
-        return new NextResponse('Retry', { status: 500, headers: { 'Content-Type': 'text/plain' } })
-      }
-
-      console.log(`[Africa's Talking DLR] Updated SMS ${match.id} status to ${newStatus}`)
+    const id = payload.id == null ? '' : String(payload.id).trim()
+    const status = payload.status == null ? '' : String(payload.status)
+    // Only terminal reports can change state; "buffered"/"submitted" are
+    // acceptance events, not proof of delivery. No recipient-only fallback.
+    const normalized = status.toLowerCase()
+    const finalStatus = ['success', 'delivered'].includes(normalized) ? 'delivered'
+      : ['failed', 'rejected', 'expired', 'undeliverable'].includes(normalized) ? 'failed'
+      : null
+    if (id && finalStatus) {
+      if (id.length > 255) return new NextResponse('Invalid provider ID', { status: 400 })
+      // Persist first: the DLR may beat the provider-send response and its ID
+      // write. Cron reconciles the inbox later without a recipient fallback.
+      await smsStore.rememberDeliveryReport(id, finalStatus)
+      const updated = await smsStore.resolveDeliveryReport(id)
+      if (updated) await deliverSmsNotification(updated)
     }
 
     // Africa's Talking expects a 200 OK response
     return new NextResponse('OK', { status: 200, headers: { 'Content-Type': 'text/plain' } })
-  } catch (error: any) {
-    console.error("[Africa's Talking DLR] Callback handling error:", error)
+  } catch {
+    console.error("[Africa's Talking DLR] Callback handling error; retry requested")
     // 500 and not 200: a retried delivery report is cheap, a silently dropped
     // one leaves the message stuck in "pending" forever.
     return new NextResponse('Internal Error', { status: 500 })

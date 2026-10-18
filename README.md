@@ -35,8 +35,11 @@ npm run dev               # http://localhost:3000
 
 Sign in at `/login` with a Supabase user whose email is listed in
 `SUPER_ADMIN_EMAILS`. That account is auto-provisioned as `super_admin` on
-first login. **There is no default** — if `SUPER_ADMIN_EMAILS` is empty, nobody
-can access the dashboard.
+first login; removal from the allowlist blocks subsequent admin requests even
+if its database role remains. **There is no default** — if `SUPER_ADMIN_EMAILS`
+is empty, nobody can access the dashboard. Tenant-collected payments require a
+complete tenant provider credential set; only platform-fee payments use platform
+credentials.
 
 ---
 
@@ -188,7 +191,7 @@ npm run cron:setup             # creates/replaces all four QStash schedules
   - `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` are missing or set to placeholder values.
   - The Supabase project is **paused** (free tier projects pause after 7 days of inactivity — restore it via the Supabase dashboard).
   - Network policies or CORS prevent reaching the Supabase Auth endpoint.
-- **Local Development:** When Supabase Auth is unconfigured in development mode (`process.env.NODE_ENV !== 'production'`), the `/login` page provides a clear diagnostic warning and a dev-mode bypass to explore the dashboard.
+- **Local Development:** Missing Supabase Auth now fails closed by default. For a private, disposable local instance only, set `ALLOW_INSECURE_DEV_AUTH=true` to explicitly enable a synthetic dev admin. Never use this with real data, provider secrets, or a publicly reachable `next dev` server.
 
 ### 3. Verify Connection Status
 Run the built-in diagnostic tool to test both Prisma database connectivity and Supabase Auth:

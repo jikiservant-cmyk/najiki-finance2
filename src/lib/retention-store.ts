@@ -24,11 +24,23 @@ import {
 
 /** `recipient` is NOT NULL in Postgres, so purge replaces rather than nulls. */
 export const REDACTED_RECIPIENT = 'REDACTED'
+export const REDACTED_SMS_BODY = '[REDACTED]'
+
+/** SMS bodies are shorter-lived than recipient metadata, including in mask mode. */
+export function resolveSmsContentRetentionDays(raw = process.env.SMS_CONTENT_RETENTION_DAYS): number {
+  if (raw === undefined || raw.trim() === '') return 7
+  const days = Number(raw)
+  if (!Number.isSafeInteger(days) || days < 1 || days > 365) {
+    throw new Error('SMS_CONTENT_RETENTION_DAYS must be an integer from 1 to 365')
+  }
+  return days
+}
 
 export interface RetentionReport {
   /** Records whose phone number was masked or purged. */
   paymentIntentsRedacted: number
   smsMessagesRedacted: number
+  smsBodiesPurged: number
   /** True when the batch limit was hit and another run is needed. */
   truncated: boolean
   mode: RetentionMode
@@ -68,6 +80,7 @@ export async function applyPhoneRetention(
   const empty: RetentionReport = {
     paymentIntentsRedacted: 0,
     smsMessagesRedacted: 0,
+    smsBodiesPurged: 0,
     truncated: false,
     mode,
     retentionDays: days,
@@ -75,39 +88,59 @@ export async function applyPhoneRetention(
     dryRun,
   }
 
-  if (isRetentionDisabled(days)) return empty
+  const phoneDisabled = isRetentionDisabled(days)
+  const cutoff = retentionCutoff(phoneDisabled ? 90 : days, now)
+  const bodyCutoff = retentionCutoff(resolveSmsContentRetentionDays(), now)
 
-  const cutoff = retentionCutoff(days, now)
-
-  const [intents, messages] = await Promise.all([
-    db.paymentIntent.findMany({
+  const [intents, messages, bodies] = await Promise.all([
+    phoneDisabled ? Promise.resolve([]) : db.paymentIntent.findMany({
       where: { phoneNumber: { not: null }, phoneRedactedAt: null, createdAt: { lt: cutoff } },
       select: { id: true, phoneNumber: true },
       orderBy: { createdAt: 'asc' },
       take: batchSize + 1,
     }),
-    db.smsMessage.findMany({
-      where: { recipientRedactedAt: null, createdAt: { lt: cutoff } },
+    phoneDisabled ? Promise.resolve([]) : db.smsMessage.findMany({
+      where: { recipientRedactedAt: null, createdAt: { lt: cutoff },
+        status: { in: ['delivered', 'failed', 'unknown'] } },
       select: { id: true, recipient: true },
       orderBy: { createdAt: 'asc' },
       take: batchSize + 1,
+    }),
+    db.smsMessage.findMany({
+      where: {
+        createdAt: { lt: bodyCutoff },
+        status: { in: ['delivered', 'failed', 'unknown'] },
+        message: { not: REDACTED_SMS_BODY },
+      },
+      select: { id: true }, orderBy: { createdAt: 'asc' }, take: batchSize + 1,
     }),
   ])
 
   const intentBatch = intents.slice(0, batchSize)
   const messageBatch = messages.slice(0, batchSize)
-  const truncated = intents.length > batchSize || messages.length > batchSize
+  const bodyBatch = bodies.slice(0, batchSize)
+  const truncated = intents.length > batchSize || messages.length > batchSize || bodies.length > batchSize
 
   const report: RetentionReport = {
     ...empty,
     truncated,
-    cutoff: cutoff.toISOString(),
+    cutoff: phoneDisabled ? null : cutoff.toISOString(),
   }
 
   if (dryRun) {
     report.paymentIntentsRedacted = intentBatch.length
     report.smsMessagesRedacted = messageBatch.length
+    report.smsBodiesPurged = bodyBatch.length
     return report
+  }
+
+  if (bodyBatch.length > 0) {
+    const result = await db.smsMessage.updateMany({
+      where: { id: { in: bodyBatch.map((row) => row.id) },
+        status: { in: ['delivered', 'failed', 'unknown'] }, message: { not: REDACTED_SMS_BODY } },
+      data: { message: REDACTED_SMS_BODY },
+    })
+    report.smsBodiesPurged = result.count
   }
 
   if (mode === 'purge') {

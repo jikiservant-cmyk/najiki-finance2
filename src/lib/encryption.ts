@@ -2,7 +2,8 @@ import crypto from 'crypto'
 
 const ALGO = 'aes-256-gcm'
 
-// Generate a secure key for dev if not provided (so it doesn't crash locally, though it should be required in prod)
+// Development-only ephemeral key. Production always requires APP_ENCRYPTION_KEY.
+const ephemeralDevKey = crypto.randomBytes(32)
 const getEncryptionKey = () => {
   const envKey = process.env.APP_ENCRYPTION_KEY
   // Must be exactly 64 HEX characters (32 bytes). Length alone is not enough:
@@ -22,7 +23,8 @@ const getEncryptionKey = () => {
       '[encryption] APP_ENCRYPTION_KEY is set but is not a 64-character hex string — falling back to the development key.'
     )
   }
-  return crypto.scryptSync(process.env.NEXTAUTH_SECRET || 'fallback-secret-1234', 'salt', 32)
+  console.warn('[encryption] Using an ephemeral development key; encrypted data cannot be read after restart')
+  return ephemeralDevKey
 }
 
 export function encrypt(text: string): string {

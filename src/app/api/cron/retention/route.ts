@@ -33,14 +33,6 @@ async function handleRetention(request: Request) {
     const days = resolvePhoneRetentionDays()
     const mode = resolveRetentionMode()
 
-    if (days <= 0) {
-      return NextResponse.json({
-        success: true,
-        skipped: true,
-        reason: describeRetentionWindow(days, mode),
-      })
-    }
-
     const report = await applyPhoneRetention({ days, mode, batchSize: 500 })
 
     return NextResponse.json({
