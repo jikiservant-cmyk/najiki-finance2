@@ -388,13 +388,26 @@ export async function handleCreatePaymentIntent(request: Request) {
       throw e
     }
 
+    // Build webhook URL — must be gateway's public URL, not SACCO's Netlify host
+    // If NEXTAUTH_URL not set, we fell back to kunitydev.netlify.app host which LivePay
+    // will never callback to. That doesn't block PIN, but breaks confirmation.
     const host = request.headers.get('x-forwarded-host') || request.headers.get('host') || 'localhost:3000'
     const protocol = request.headers.get('x-forwarded-proto') || 'https'
-    const rawAppBaseUrl =
-      process.env.NEXTAUTH_URL ||
-      (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : `${protocol}://${host}`)
+    let rawAppBaseUrl = process.env.NEXTAUTH_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '')
+    if (!rawAppBaseUrl) {
+      rawAppBaseUrl = `${protocol}://${host}`
+      if (process.env.NODE_ENV === 'production') {
+        console.warn(`[payments] NEXTAUTH_URL not set in prod — using host ${host} for webhookUrl. Set NEXTAUTH_URL to gateway public origin or LivePay callback will fail.`)
+      }
+    }
     const appBaseUrl = rawAppBaseUrl.replace(/\/+$/, '')
     const webhookUrl = `${appBaseUrl}/api/webhooks/${provider.code.toLowerCase()}`
+
+    // Validate phone before we charge LivePay — UGX numbers must be 2567... (12 digits)
+    const normalizedForLog = String(validatedBody.phoneNumber).replace(/[\s\-\(\)]/g, '')
+    if (normalizedForLog.length < 9 || normalizedForLog.length > 15) {
+      console.warn(`[payments] Suspicious phone length ${normalizedForLog.length} for ${normalizedForLog.slice(0,4)}**** — LivePay may not send PIN`)
+    }
 
     await processPayment({
       paymentIntentId: paymentIntent.id,
@@ -409,12 +422,38 @@ export async function handleCreatePaymentIntent(request: Request) {
     })
 
     const updatedIntent = await db.paymentIntent.findUnique({ where: { id: paymentIntent.id } })
+    const finalStatus = updatedIntent?.status || 'pending'
+    const finalFailure = (updatedIntent as any)?.failureReason || null
+    const finalProviderId = (updatedIntent as any)?.providerPaymentId || null
+
+    // If LivePay failed to send PIN (e.g. invalid phone/account), surface it
+    // so SACCO 200 doesn't look like success with no PIN. Kunity logs 200 but
+    // user never gets prompt because gateway silently stored failed.
+    if (finalStatus === 'failed') {
+      console.error(`[payments] LivePay failed for ${reference} phone=${String(validatedBody.phoneNumber).slice(0,4)}**** reason=${finalFailure}`)
+      return NextResponse.json(
+        {
+          paymentId: paymentIntent.id,
+          reference: paymentIntent.reference,
+          status: finalStatus,
+          failureReason: finalFailure,
+          providerPaymentId: finalProviderId,
+          hint: 'PIN not sent — check phone format (2567..., 12 digits), LivePay account, and NEXTAUTH_URL webhook',
+        },
+        { status: 200 } // keep 200 so SACCO doesn't treat as gateway 500, but include failureReason
+      )
+    }
+
+    // Log success/processing for ops — helps debug 200 but no PIN (check Vercel logs for [LivePay] collect-money)
+    console.log(`[payments] Created ${reference} status=${finalStatus} provider=${provider.code} providerPaymentId=${finalProviderId || 'none'} webhook=${webhookUrl}`)
 
     return NextResponse.json(
       {
         paymentId: paymentIntent.id,
         reference: paymentIntent.reference,
-        status: updatedIntent?.status || 'pending',
+        status: finalStatus,
+        providerPaymentId: finalProviderId,
+        failureReason: finalFailure,
       },
       { status: 200 }
     )
