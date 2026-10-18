@@ -200,7 +200,7 @@ export async function handleCreatePaymentIntent(request: Request) {
         orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
       }))
 
-    const [tenant, paymentType] = await Promise.all([
+    let [tenant, paymentType] = await Promise.all([
       validatedBody.tenantCode
         ? db.tenant.findFirst({
             where: {

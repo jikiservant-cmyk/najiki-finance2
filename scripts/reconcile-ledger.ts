@@ -117,10 +117,7 @@ async function main() {
         },
         select: { amount: true },
       })
-      intentMinor = intents.reduce<bigint>(
-        (sum, intent) => sum + toMinor(intent.amount, wallet.currency),
-        0n
-      )
+      intentMinor = intents.reduce((sum: bigint, intent) => sum + toMinor(intent.amount, wallet.currency), 0n)
     } catch {
       // Applications may not be linked the way we expect; the drift above is
       // still the headline finding.
