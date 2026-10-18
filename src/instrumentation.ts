@@ -72,6 +72,17 @@ export async function register() {
 
   installProcessSafetyNets()
 
-  const { assertRuntimeEnv } = await import('@/lib/env')
-  assertRuntimeEnv()
+  // Do not crash the whole server on missing env in production.
+  // A throw here makes EVERY route return HTML 500 (Next.js error page)
+  // instead of letting API routes return JSON 503 with a diagnostic.
+  // Log loudly and continue; individual routes (health, payments) will
+  // still fail closed with JSON when they need the missing value.
+  try {
+    const { assertRuntimeEnv } = await import('@/lib/env')
+    assertRuntimeEnv()
+  } catch (err) {
+    console.error('[instrumentation] Environment validation failed — API routes will return JSON diagnostics, not HTML:', err)
+    // Do not re-throw: keep the process alive so /api/health and
+    // /api/payments can return JSON 503 instead of HTML 500.
+  }
 }
