@@ -37,19 +37,26 @@ export class LivePayProvider implements PaymentProvider {
   }
 
   async initiatePayment(params: InitiatePaymentParams): Promise<InitiatePaymentResponse> {
-    try {
-      const rawAuthUrl = process.env.NEXTAUTH_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:3000')
-      const normalizedBase = rawAuthUrl.replace(/\/+$/, '')
-      const payload = {
-        accountNumber: this.accountNo,
-        phoneNumber: normalizePhone(params.phoneNumber),
-        amount: params.amount,
-        currency: params.currency || 'UGX',
-        reference: params.reference,
-        description: params.description || 'Payment',
-        webhookUrl: params.webhookUrl || `${normalizedBase}/api/webhooks/livepay`,
-      }
+    const rawAuthUrl = process.env.NEXTAUTH_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:3000')
+    const normalizedBase = rawAuthUrl.replace(/\/+$/, '')
+    // LivePay expects 2567... without +, amount as integer for UGX
+    const normalizedPhone = normalizePhone(params.phoneNumber)
+    // Ensure amount is integer for UGX (zero-decimal) — avoid 5000.00 vs 5000 mismatch
+    const normalizedAmount = params.currency?.toUpperCase() === 'UGX' ? Math.round(Number(params.amount)) : params.amount
+    const payload = {
+      accountNumber: this.accountNo,
+      phoneNumber: normalizedPhone,
+      amount: normalizedAmount,
+      currency: params.currency || 'UGX',
+      reference: params.reference,
+      description: params.description || 'Payment',
+      webhookUrl: params.webhookUrl || `${normalizedBase}/api/webhooks/livepay`,
+    }
 
+    // Log for ops (phone masked) — helps debug 200 but no PIN
+    console.log(`[LivePay] collect-money → ${this.baseUrl}/api/collect-money phone=${normalizedPhone.slice(0,4)}****${normalizedPhone.slice(-2)} amount=${normalizedAmount} ${payload.currency} ref=${params.reference} account=${this.accountNo.slice(0,4)}**** webhook=${payload.webhookUrl}`)
+
+    try {
       const response = await fetch(`${this.baseUrl}/api/collect-money`, {
         method: 'POST',
         headers: {
@@ -57,31 +64,54 @@ export class LivePayProvider implements PaymentProvider {
           'Authorization': `Bearer ${this.apiKey}`,
         },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(10_000),
+        signal: AbortSignal.timeout(15_000),
       })
 
-      const data = await response.json()
+      let data: any = null
+      let bodyText = ''
+      try {
+        bodyText = await response.text()
+        data = JSON.parse(bodyText)
+      } catch {
+        // LivePay returned non-JSON (e.g. HTML 500 on bad account) — treat as failed, not silent processing
+        console.error(`[LivePay] Non-JSON response from collect-money: status=${response.status} body=${bodyText.slice(0,500)}`)
+        return {
+          success: false,
+          status: 'failed',
+          failureReason: `LivePay returned non-JSON (status ${response.status}): ${bodyText.slice(0,200)}`,
+        }
+      }
+
+      console.log(`[LivePay] collect-money response status=${response.status} success=${data?.success} ref=${params.reference} data=${JSON.stringify(data).slice(0,500)}`)
 
       if (response.ok && data.success) {
+        // LivePay accepted — PIN should be sent within seconds
         return {
           success: true,
-          providerPaymentId: data.internal_reference,
+          providerPaymentId: data.internal_reference || data.transactionId || data.reference,
           status: 'processing',
           metadata: data,
         }
       }
 
+      // LivePay rejected — surface reason so gateway can return 400/failed not silent 200
+      const livePayError = data?.error || data?.message || data?.error_description || JSON.stringify(data).slice(0,300)
+      // Distinguish 5xx (retryable processing) vs 4xx/200+success:false (failed)
+      const isRetryable = response.status >= 500 || response.status === 429 || data?.code === 'TIMEOUT'
       return {
         success: false,
-        status: response.status >= 500 ? 'processing' : 'failed',
-        failureReason: data.error || 'Failed to initiate payment',
+        status: isRetryable ? 'processing' : 'failed',
+        failureReason: livePayError || `LivePay rejected (HTTP ${response.status})`,
       }
-    } catch (error) {
+    } catch (error: any) {
+      const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError' || String(error?.message).includes('timeout')
+      console.error(`[LivePay] collect-money fetch failed ref=${params.reference} timeout=${isTimeout} error=${error?.message} stack=${error?.stack?.slice(0,300)}`)
       return {
         success: false,
-        // A timeout or malformed 5xx body does not prove no money was collected.
-        status: 'processing',
-        failureReason: error instanceof Error ? error.message : 'Unknown error',
+        // Only timeout is ambiguous (PIN may still arrive) — keep processing so webhook can confirm
+        // Other network errors are failed so SACCO gets actionable error, not silent pending
+        status: isTimeout ? 'processing' : 'failed',
+        failureReason: isTimeout ? `LivePay timeout after 15s: ${error.message}` : `LivePay network error: ${error.message}`,
       }
     }
   }
