@@ -9,16 +9,57 @@ import { PLATFORM_FEE_TYPES } from '@/lib/constants'
 import { webhookSecretFromRow, findApplicationByApiKey } from '@/lib/application-auth'
 import { safeJsonObject } from '@/lib/json'
 
+export const dynamic = 'force-dynamic'
+
+function extractApiKey(request: Request): string | null {
+  const authHeader = request.headers.get('Authorization')
+  if (authHeader) {
+    const trimmed = authHeader.trim()
+    if (trimmed.toLowerCase().startsWith('bearer ')) return trimmed.slice(7).trim() || null
+    if (trimmed.toLowerCase().startsWith('apikey ')) return trimmed.slice(7).trim() || null
+    if (trimmed.toLowerCase().startsWith('token ')) return trimmed.slice(6).trim() || null
+    if (trimmed) return trimmed
+  }
+  return request.headers.get('x-api-key')?.trim() || request.headers.get('X-API-KEY')?.trim() || null
+}
+
+export function OPTIONS(request: Request) {
+  const origin = request.headers.get('origin') || ''
+  const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map((o) => o.trim()).filter(Boolean)
+  if (process.env.NODE_ENV === 'production' && allowedOrigins.length === 0) {
+    return new NextResponse(null, { status: 403, headers: { 'Access-Control-Allow-Origin': 'null' } })
+  }
+  const headers: Record<string, string> = {
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key',
+    Vary: 'Origin',
+  }
+  if (allowedOrigins.length === 0) headers['Access-Control-Allow-Origin'] = '*'
+  else if (allowedOrigins.includes(origin)) headers['Access-Control-Allow-Origin'] = origin
+  return new NextResponse(null, { status: 204, headers })
+}
+
+export async function POST() {
+  return NextResponse.json({ error: 'Method not allowed. Use GET to fetch a payment or POST /api/payments to create one.' }, { status: 405 })
+}
+
+export async function PUT() {
+  return NextResponse.json({ error: 'Method not allowed.' }, { status: 405 })
+}
+
+export async function DELETE() {
+  return NextResponse.json({ error: 'Method not allowed.' }, { status: 405 })
+}
+
 export async function GET(
   request: Request,
   { params }: { params: Promise<{ reference: string }> }
 ) {
   try {
-    const authHeader = request.headers.get('Authorization')
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    const apiKey = extractApiKey(request)
+    if (!apiKey) {
       return NextResponse.json({ error: 'Missing or invalid authorization header' }, { status: 401 })
     }
-    const apiKey = authHeader.slice(7) // Remove 'Bearer ' prefix
 
     const ipDecision = await checkRateLimit('get-payment-ip', clientIdentifier(request), { tokens: 120, window: '1 m' })
     if (!ipDecision.ok) return NextResponse.json({ error: ipDecision.message }, { status: ipDecision.status, headers: ipDecision.retryAfter ? { 'Retry-After': ipDecision.retryAfter } : {} })

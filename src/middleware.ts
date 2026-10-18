@@ -131,6 +131,10 @@ export const config = {
     // future route such as /api/payments-admin cannot accidentally inherit the
     // public exemption (the previous patterns matched any prefix, e.g.
     // `api/cron` also exempted `api/crons-anything`).
-    '/((?!_next/static|_next/image|favicon.ico|manifest.json|manifest.webmanifest|sw.js|icons|logo.svg|robots.txt|api/webhooks/|api/cron/|api/qstash/|api/payments/|api/payments$|api/messaging/send|api/messaging/callback|api/health).*)',
+    // `api/payments/intent` is the legacy SACCO alias for `api/payments` — it
+    // is listed explicitly so a future matcher change cannot accidentally move
+    // deposit traffic behind the Supabase session gate and re-introduce the
+    // HTML 500 that surfaced as "NaJiki gateway error (Status 500)".
+    '/((?!_next/static|_next/image|favicon.ico|manifest.json|manifest.webmanifest|sw.js|icons|logo.svg|robots.txt|api/webhooks/|api/cron/|api/qstash/|api/payments/|api/payments$|api/payments/intent|api/messaging/send|api/messaging/callback|api/health).*)',
   ],
 }
