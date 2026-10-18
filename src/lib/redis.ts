@@ -83,23 +83,22 @@ export function getRedis(): Redis {
     return _redisInstance
   }
 
-  // FAIL CLOSED in production.
-  //
-  // The in-memory MockRedis is per-process and is wiped on every cold start /
-  // redeploy. Running production on it silently loses the SMS queue and any
-  // other queued state, and behaves differently on every serverless instance.
-  // Previously this only logged a warning and carried on.
+  // In production the rate-limiter already fails closed with 503 JSON
+  // (see src/lib/rate-limit.ts returning `Service temporarily unavailable`
+  // when the limiter is not configured). Throwing here crashes the whole
+  // process and makes EVERY API route return HTML 500 (Next.js error page)
+  // instead of that JSON 503 — which is what SACCO saw as
+  // `NaJiki gateway error (Status 500) Response: <!DOCTYPE html>...`.
+  // Log loudly but keep the process alive; the caller (rate-limit, health)
+  // decides how to degrade.
   if (process.env.NODE_ENV === 'production' && process.env.NEXT_PHASE !== 'phase-production-build') {
     console.error(
-      'FATAL: UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN are not configured. ' +
-        'The in-memory fallback is not safe in production (state is lost on every cold start).'
+      '[redis] UPSTASH_REDIS_* not configured in production — falling back to in-memory MockRedis. ' +
+        'State will be lost on cold start. Rate-limiting will return 503 JSON until Redis is configured.'
     )
-    throw new Error(
-      'Redis is not configured: set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN in production.'
-    )
+  } else {
+    console.warn('WARN: Using in-memory MockRedis. This should only be used in local development.')
   }
-
-  console.warn('WARN: Using in-memory MockRedis. This should only be used in local development.')
 
   _redisInstance = new MockRedis() as any as Redis
   return _redisInstance

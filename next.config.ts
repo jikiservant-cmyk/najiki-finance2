@@ -1,8 +1,14 @@
 import type { NextConfig } from "next";
 
+const isNetlify = !!process.env.NETLIFY
+const isVercel = !!process.env.VERCEL
 const nextConfig: NextConfig = {
   distDir: process.env.NODE_ENV === 'development' ? '.next-dev' : '.next',
-  output: "standalone",
+  // Standalone is for Docker/self-hosted (node .next/standalone/server.js).
+  // On Netlify/Vercel the platform provides its own Next.js adapter and
+  // standalone breaks API routes (they return HTML 500 instead of JSON).
+  // Only enable it for explicit self-hosted builds.
+  ...(process.env.OUTPUT_STANDALONE === 'true' ? { output: 'standalone' as const } : {}),
   /* config options here */
   typescript: {
     ignoreBuildErrors: false,

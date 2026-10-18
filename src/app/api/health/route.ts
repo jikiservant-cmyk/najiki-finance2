@@ -49,9 +49,23 @@ export async function GET(request: Request) {
 
   const startedAt = Date.now()
 
+  // `redis.ping` is accessed via a Proxy that calls getRedis() lazily.
+  // If getRedis throws synchronously (e.g. old fail-closed path), that throw
+  // escapes Promise.all and Next.js renders HTML 500 instead of JSON.
+  // Wrap the access in a promise so it is caught by withTimeout and reported
+  // as {ok:false} JSON.
+  const redisPing = (async () => {
+    try {
+      const res = await (redis as any).ping?.()
+      return res ?? 'PONG'
+    } catch (e) {
+      throw e
+    }
+  })()
+
   const [database, cache] = await Promise.all([
-    withTimeout('database', db.$queryRawUnsafe('SELECT 1')),
-    withTimeout('redis', redis.ping?.() ?? Promise.resolve('PONG')),
+    withTimeout('database', db.$queryRawUnsafe('SELECT 1') as Promise<unknown>),
+    withTimeout('redis', redisPing),
   ])
 
   const checks: Record<string, { ok: boolean; detail?: string }> = { database, cache }
