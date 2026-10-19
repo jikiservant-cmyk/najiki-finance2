@@ -25,7 +25,7 @@ export async function GET(request: Request) {
     const app = await db.application.findFirst({ where: { code: 'sacco', isActive: true } })
     if (!app) return NextResponse.json({ error: 'No active sacco application found', hint: 'Seed DB or create via /setup' }, { status: 404 })
 
-    let tenant = null
+    let tenant: Awaited<ReturnType<typeof db.tenant.findFirst>> = null
     if (tenantCode) {
       tenant = await db.tenant.findFirst({ where: { applicationId: app.id, code: tenantCode, isActive: true } })
       if (!tenant) return NextResponse.json({ error: `Tenant ${tenantCode} not found for sacco`, available: (await db.tenant.findMany({ where: { applicationId: app.id }, select: { code: true } })).map(t=>t.code) }, { status: 404 })
