@@ -41,7 +41,9 @@ export class LivePayProvider implements PaymentProvider {
     // No webhookUrl per request — webhook is configured per LivePay account dashboard. Sending extra field can 400.
     // Phone: docs example is "0777123456" (any format accepted per docs, so avoid over-normalizing to 256...)
     // Reference: no spaces, max 30 chars, unique per account
-    const normalizedPhone = String(params.phoneNumber || '').trim().replace(/[\s\-()]/g, '')
+    // Strip + and spaces/dashes/parens — LivePay docs show 0777123456, and SACCO apps
+    // often send +2567... or 2567... — all are valid but + breaks LivePay validation.
+    const normalizedPhone = String(params.phoneNumber || '').trim().replace(/[\s\-()]/g, '').replace(/^\+/, '')
     // For UGX, LivePay example uses 50000 (major units, zero-decimal). Ensure amount is integer.
     const normalizedAmount = params.currency?.toUpperCase() === 'UGX' ? Math.round(Number(params.amount)) : params.amount
     // Enforce reference constraints per docs: max 30, no spaces
