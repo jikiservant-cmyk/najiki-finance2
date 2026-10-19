@@ -14,6 +14,7 @@ import { NextResponse } from 'next/server'
 import { handleCreatePaymentIntent, paymentCorsHeaders } from '@/lib/payment-intent-handler'
 
 export const dynamic = 'force-dynamic'
+export const maxDuration = 30
 
 export function OPTIONS(request: Request) {
   return paymentCorsHeaders(request)
