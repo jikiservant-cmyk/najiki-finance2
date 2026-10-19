@@ -12,7 +12,19 @@ export const maxDuration = 30
 // If this returns LivePay error, no PIN will ever fire for SACCO deposits.
 export async function GET(request: Request) {
   try {
-    await requireSuperAdmin()
+    // Auth: super_admin session OR valid SACCO API key (so you can test with
+    // the same key the SACCO uses without knowing dashboard login).
+    let authed = false
+    try { await requireSuperAdmin(); authed = true } catch {}
+    if (!authed) {
+      const key = request.headers.get('x-api-key') || request.headers.get('authorization')?.replace(/^bearer\s+/i, '').trim() || new URL(request.url).searchParams.get('apiKey')
+      if (key) {
+        const { findApplicationByApiKey } = await import('@/lib/application-auth')
+        const found = await findApplicationByApiKey(key)
+        if (found?.application) authed = true
+      }
+    }
+    if (!authed) return NextResponse.json({ error: 'Unauthorized — login as super_admin in dashboard OR pass ?apiKey=YOUR_SACCO_KEY or Header x-api-key' }, { status: 401 })
 
     const url = new URL(request.url)
     const tenantCode = url.searchParams.get('tenantCode') || url.searchParams.get('tenant') || ''
