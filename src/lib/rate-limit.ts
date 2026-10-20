@@ -68,11 +68,9 @@ export async function checkRateLimit(
   const limiter = getLimiter(name, opts.tokens, opts.window)
   const isProduction = process.env.NODE_ENV === 'production'
   if (!limiter) {
-    // No Redis configured — don't block payments. The limiter is a DoS
-    // protection, not a money-integrity gate. Failing 503 on every deposit
-    // because Upstash wasn't configured left SACCOs unable to collect while
-    // ping (which bypasses rate-limit) looked green — exactly the 503 user saw.
-    return { ok: true }
+    return isProduction
+      ? { ok: false, status: 503, message: 'Service temporarily unavailable' }
+      : { ok: true } // development without Redis
   }
   const timeoutMs = opts.timeoutMs ?? 1000
 
