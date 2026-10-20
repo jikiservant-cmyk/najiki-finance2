@@ -105,6 +105,7 @@ export async function handleCreatePaymentIntent(request: Request) {
     const ipDecision = await checkRateLimit('payments-ip', clientIdentifier(request), {
       tokens: 60,
       window: '1 m',
+      timeoutMs: 3000,
     })
     if (!ipDecision.ok) return rateLimitResponse(ipDecision)
 
@@ -125,7 +126,7 @@ export async function handleCreatePaymentIntent(request: Request) {
       return NextResponse.json({ error: 'Missing or invalid authorization header' }, { status: 401 })
     }
 
-    const keyDecision = await checkRateLimit('payments-key', apiKey, { tokens: 20, window: '1 m' })
+    const keyDecision = await checkRateLimit('payments-key', apiKey, { tokens: 20, window: '1 m', timeoutMs: 3000 })
     if (!keyDecision.ok) return rateLimitResponse(keyDecision)
 
     let rawBody: any
