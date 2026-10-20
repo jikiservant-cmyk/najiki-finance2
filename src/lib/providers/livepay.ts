@@ -29,10 +29,11 @@ export class LivePayProvider implements PaymentProvider {
         throw new Error('Incomplete tenant LivePay credentials')
       }
     } else {
-      this.apiKey = process.env.LIVEPAY_API_KEY || ''
-      this.accountNo = process.env.LIVEPAY_ACCOUNT_NO || ''
-      this.webhookSecret = process.env.LIVEPAY_WEBHOOK_SECRET || ''
-      this.baseUrl = process.env.LIVEPAY_BASE_URL || 'https://livepay.me'
+      const clean = (v?: string) => (v ? v.trim().replace(/^["']+|["']+$/g, '').trim() : '')
+      this.apiKey = clean(process.env.LIVEPAY_API_KEY)
+      this.accountNo = clean(process.env.LIVEPAY_ACCOUNT_NO || process.env.LIVEPAY_ACCOUNT_NUMBER)
+      this.webhookSecret = clean(process.env.LIVEPAY_WEBHOOK_SECRET || process.env.LIVEPAY_SECRET_KEY)
+      this.baseUrl = clean(process.env.LIVEPAY_BASE_URL) || 'https://livepay.me'
     }
   }
 

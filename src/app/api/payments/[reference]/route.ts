@@ -2,10 +2,10 @@ import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
 import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
-import { loadTenantProviderCredentials } from '@/lib/tenant-credentials'
+import { resolveTenantOrPlatformCredentials } from '@/lib/tenant-credentials'
 import { isConfirmedTerminalStatus } from '@/lib/payment-security'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
-import { PLATFORM_FEE_TYPES } from '@/lib/constants'
+import { isPlatformFeeType, resolvePartnerWebhookUrl } from '@/lib/constants'
 import { webhookSecretFromRow, findApplicationByApiKey } from '@/lib/application-auth'
 import { safeJsonObject } from '@/lib/json'
 
@@ -116,15 +116,21 @@ export async function GET(
           // webhook path and both cron pollers use. Polling a tenant's payment
           // under the platform's account checks the wrong account.
           let pollCredentials: any = undefined
-          const isPlatformPayment =
-            paymentIntent.paymentType &&
-            PLATFORM_FEE_TYPES.includes(String(paymentIntent.paymentType.code).toUpperCase())
+          const intentMeta = safeJsonObject(paymentIntent.metadata)
+          const isPlatformPayment = isPlatformFeeType(
+            paymentIntent.paymentType?.code ?? (intentMeta?.paymentTypeCode as string | undefined)
+          )
           if (paymentIntent.tenantId && paymentIntent.providerId && !isPlatformPayment) {
-            pollCredentials = await loadTenantProviderCredentials(paymentIntent.tenantId, paymentIntent.providerId)
-            if (!pollCredentials) {
-              // Keep the intent reconcilable; do not query the platform account.
+            const resolved = await resolveTenantOrPlatformCredentials(
+              paymentIntent.tenantId,
+              paymentIntent.providerId,
+              paymentIntent.tenant?.code
+            )
+            if (!resolved) {
+              // Keep the intent reconcilable; do not query an unconfigured account.
               throw new Error(`Tenant credentials unavailable for payment ${paymentIntent.id}`)
             }
+            pollCredentials = resolved.credentials
           }
           const providerClient = getPaymentProvider(paymentIntent.provider.code, pollCredentials)
           if (providerClient.checkPaymentStatus) {
@@ -161,7 +167,7 @@ export async function GET(
                   providerPaymentId: statusResult.providerPaymentId || paymentIntent.providerPaymentId || '',
                   failureReason: statusResult.failureReason,
                   applicationId: application.id,
-                  webhookUrl: `${application.baseUrl}${application.webhookPath}`,
+                  webhookUrl: resolvePartnerWebhookUrl(application),
                   webhookSecret: webhookSecretFromRow(application),
                   externalEntityId: paymentIntent.externalEntityId,
                   tenantId: paymentIntent.tenantId,

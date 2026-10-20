@@ -22,7 +22,7 @@ import { db } from '@/lib/db'
 import { getAvailableProviders, getPaymentProvider } from '@/lib/providers'
 import { createWebhookLog, getPaymentByReference } from '@/lib/data'
 import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
-import { loadTenantProviderCredentials } from '@/lib/tenant-credentials'
+import { resolveTenantOrPlatformCredentials } from '@/lib/tenant-credentials'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
 import { computeWebhookEventHash } from '@/lib/webhook-hash'
 import { webhookSecretFromRow } from '@/lib/application-auth'
@@ -31,7 +31,7 @@ import { buildSignatureUrlCandidates } from '@/lib/webhook-url'
 import { readTextWithLimit } from '@/lib/request-body'
 import { safeJsonObject } from '@/lib/json'
 import { decideWebhookLogAction } from '@/lib/webhook-dedupe'
-import { PLATFORM_FEE_TYPES } from '@/lib/constants'
+import { isPlatformFeeType, resolvePartnerWebhookUrl } from '@/lib/constants'
 
 /** Providers retry with at-least-once semantics; 64 KB is far above any real payload. */
 const MAX_WEBHOOK_BYTES = 64 * 1024
@@ -106,17 +106,26 @@ export async function POST(
         select: {
           tenantId: true,
           providerId: true,
+          metadata: true,
+          tenant: { select: { code: true } },
           paymentType: { select: { code: true } },
         },
       })
-      const isPlatformPayment =
-        intent?.paymentType && PLATFORM_FEE_TYPES.includes(String(intent.paymentType.code).toUpperCase())
+      const intentMeta = safeJsonObject(intent?.metadata)
+      const isPlatformPayment = isPlatformFeeType(
+        intent?.paymentType?.code ?? (intentMeta?.paymentTypeCode as string | undefined)
+      )
       if (intent?.tenantId && !isPlatformPayment) {
-        customCredentials = await loadTenantProviderCredentials(intent.tenantId, intent.providerId)
-        if (!customCredentials) {
+        const resolved = await resolveTenantOrPlatformCredentials(
+          intent.tenantId,
+          intent.providerId,
+          intent.tenant?.code
+        )
+        if (!resolved) {
           console.error(`[Webhook] Tenant credentials unavailable for ${tentativeReference}; refusing platform fallback`)
           return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
         }
+        customCredentials = resolved.credentials
       }
     }
 
@@ -370,9 +379,11 @@ export async function POST(
         providerPaymentId: parsedWebhook.providerPaymentId || '',
         failureReason: parsedWebhook.failureReason,
         applicationId: fullPaymentIntent.applicationId,
-        webhookUrl: `${fullPaymentIntent.application.baseUrl}${fullPaymentIntent.application.webhookPath}`,
+        webhookUrl: resolvePartnerWebhookUrl(fullPaymentIntent.application),
         webhookSecret: webhookSecretFromRow(fullPaymentIntent.application),
         externalEntityId: fullPaymentIntent.externalEntityId,
+        tenantId: fullPaymentIntent.tenantId,
+        tenantCode: fullPaymentIntent.tenant?.code ?? null,
         metadata: (() => {
           try {
             return safeJsonObject(fullPaymentIntent.metadata)

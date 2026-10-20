@@ -16,6 +16,7 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { redis } from '@/lib/redis'
+import { isUpstashRateLimitConfigured } from '@/lib/rate-limit'
 
 export const dynamic = 'force-dynamic'
 
@@ -49,17 +50,24 @@ export async function GET(request: Request) {
 
   const startedAt = Date.now()
 
-  // `redis.ping` is accessed via a Proxy that calls getRedis() lazily.
-  // If getRedis throws synchronously (e.g. old fail-closed path), that throw
-  // escapes Promise.all and Next.js renders HTML 500 instead of JSON.
-  // Wrap the access in a promise so it is caught by withTimeout and reported
-  // as {ok:false} JSON.
+  const strictRedis =
+    process.env.NODE_ENV === 'production' &&
+    String(process.env.ENFORCE_REDIS_RATELIMIT || '').trim().toLowerCase() === 'true'
+
   const redisPing = (async () => {
+    if (!isUpstashRateLimitConfigured()) {
+      if (strictRedis) {
+        throw new Error('Upstash Redis required by ENFORCE_REDIS_RATELIMIT=true')
+      }
+      return 'IN_MEMORY_FALLBACK'
+    }
     try {
       const res = await (redis as any).ping?.()
       return res ?? 'PONG'
     } catch (e) {
-      throw e
+      if (strictRedis) throw e
+      console.warn('[health] Upstash Redis ping failed; falling back to in-memory limiter:', e)
+      return 'IN_MEMORY_FALLBACK'
     }
   })()
 
