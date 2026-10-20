@@ -3,9 +3,9 @@ import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
 import { completePayment, enqueueWebhookNotification } from '@/lib/payments'
 import { verifyCronRequest } from '@/lib/qstash-verify'
-import { loadTenantProviderCredentials } from '@/lib/tenant-credentials'
+import { resolveTenantOrPlatformCredentials } from '@/lib/tenant-credentials'
 import { isConfirmedTerminalStatus } from '@/lib/payment-security'
-import { PLATFORM_FEE_TYPES } from '@/lib/constants'
+import { isPlatformFeeType, resolvePartnerWebhookUrl } from '@/lib/constants'
 import { webhookSecretFromRow } from '@/lib/application-auth'
 import { safeJsonObject } from '@/lib/json'
 
@@ -50,14 +50,22 @@ async function handleSync(request: Request) {
 
     for (const payment of pendingPayments) {
       try {
-        const isPlatformPayment = payment.paymentType && PLATFORM_FEE_TYPES.includes(payment.paymentType.code.toUpperCase())
+        const intentMeta = safeJsonObject(payment.metadata)
+        const isPlatformPayment = isPlatformFeeType(
+          payment.paymentType?.code ?? (intentMeta?.paymentTypeCode as string | undefined)
+        )
 
         let customCredentials: any = undefined
         if (payment.tenantId && !isPlatformPayment) {
-          customCredentials = await loadTenantProviderCredentials(payment.tenantId, payment.providerId)
-          if (!customCredentials) {
+          const resolved = await resolveTenantOrPlatformCredentials(
+            payment.tenantId,
+            payment.providerId,
+            payment.tenant?.code
+          )
+          if (!resolved) {
             throw new Error(`Tenant credentials unavailable for payment ${payment.id}; refusing platform fallback`)
           }
+          customCredentials = resolved.credentials
         }
 
         const providerClient = getPaymentProvider(payment.provider.code, customCredentials)
@@ -94,7 +102,7 @@ async function handleSync(request: Request) {
                 providerPaymentId: result.providerPaymentId || payment.providerPaymentId || '',
                 failureReason: result.failureReason,
                 applicationId: payment.applicationId,
-                webhookUrl: `${payment.application.baseUrl}${payment.application.webhookPath}`,
+                webhookUrl: resolvePartnerWebhookUrl(payment.application),
                 webhookSecret: webhookSecretFromRow(payment.application),
                 externalEntityId: payment.externalEntityId,
                 tenantId: payment.tenantId,

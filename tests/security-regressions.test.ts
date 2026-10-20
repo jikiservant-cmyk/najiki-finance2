@@ -111,7 +111,7 @@ test('development auth bypass requires an explicit opt-in and cannot run in prod
   assert.equal(allowInsecureDevAuth('test', 'true'), false)
 })
 
-test('a missing production rate limiter fails closed', async () => {
+test('production rate limiter enforces in-memory sliding window when Redis is missing, and fails closed with ENFORCE_REDIS_RATELIMIT=true', async () => {
   const file = path.resolve('src/lib/rate-limit.ts')
   const code = ts.transpileModule(fs.readFileSync(file, 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
@@ -128,18 +128,35 @@ test('a missing production rate limiter fails closed', async () => {
     nodeEnv: process.env.NODE_ENV,
     url: process.env.UPSTASH_REDIS_REST_URL,
     token: process.env.UPSTASH_REDIS_REST_TOKEN,
+    enforce: process.env.ENFORCE_REDIS_RATELIMIT,
   }
   try {
     process.env.NODE_ENV = 'production'
     delete process.env.UPSTASH_REDIS_REST_URL
     delete process.env.UPSTASH_REDIS_REST_TOKEN
-    const decision = await loaded.exports.checkRateLimit('local-test', 'anonymous', { tokens: 10, window: '1 m' })
-    assert.deepEqual(decision, { ok: false, status: 503, message: 'Service temporarily unavailable' })
+    delete process.env.ENFORCE_REDIS_RATELIMIT
+    loaded.exports.resetMemoryRateLimits()
+
+    // Default: enforces sliding-window rate limit in memory instead of 503-blocking payments
+    const first = await loaded.exports.checkRateLimit('local-test', 'anonymous', { tokens: 2, window: '1 m' })
+    const second = await loaded.exports.checkRateLimit('local-test', 'anonymous', { tokens: 2, window: '1 m' })
+    const third = await loaded.exports.checkRateLimit('local-test', 'anonymous', { tokens: 2, window: '1 m' })
+    assert.deepEqual(first, { ok: true })
+    assert.deepEqual(second, { ok: true })
+    assert.equal(third.ok, false)
+    assert.equal(third.status, 429)
+    assert.equal(third.message, 'Too many requests')
+
+    // Explicit strict mode: fails closed with 503 when distributed Redis is mandatory
+    process.env.ENFORCE_REDIS_RATELIMIT = 'true'
+    const strictDecision = await loaded.exports.checkRateLimit('local-test', 'anonymous', { tokens: 10, window: '1 m' })
+    assert.deepEqual(strictDecision, { ok: false, status: 503, message: 'Service temporarily unavailable' })
   } finally {
     for (const [key, value] of [
       ['NODE_ENV', previous.nodeEnv],
       ['UPSTASH_REDIS_REST_URL', previous.url],
       ['UPSTASH_REDIS_REST_TOKEN', previous.token],
+      ['ENFORCE_REDIS_RATELIMIT', previous.enforce],
     ] as const) {
       if (value === undefined) delete process.env[key]
       else process.env[key] = value

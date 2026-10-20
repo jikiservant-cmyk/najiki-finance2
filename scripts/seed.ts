@@ -61,7 +61,7 @@ async function seed() {
   // === APPLICATIONS ===
   const saccoApiKey = credentials()
   const sacco = await db.application.create({
-    data: { code: 'sacco', name: 'SACCO Platform', baseUrl: 'https://sacco.yourdomain.com', webhookPath: '/api/internal/payment-completed', internalSecretRef: 'SACCO_INTERNAL_SECRET', ...saccoApiKey.data, isActive: true },
+    data: { code: 'sacco', name: 'SACCO Platform', baseUrl: 'https://sacco.yourdomain.com', webhookPath: '/api/webhooks/najiki', internalSecretRef: 'SACCO_INTERNAL_SECRET', ...saccoApiKey.data, isActive: true },
   })
   
   const churchApiKey = credentials()
@@ -97,6 +97,7 @@ async function seed() {
   const saccoDeposit = await db.paymentType.create({ data: { applicationId: sacco.id, code: 'deposit', description: 'Member savings deposit' } })
   const saccoLoan = await db.paymentType.create({ data: { applicationId: sacco.id, code: 'loan_repayment', description: 'Loan repayment' } })
   const saccoActivation = await db.paymentType.create({ data: { applicationId: sacco.id, code: 'account_activation', description: 'Account activation fee' } })
+  await db.paymentType.create({ data: { applicationId: sacco.id, code: 'BUY_SMS', description: 'SMS credits top-up (platform fee)' } })
   const churchTithe = await db.paymentType.create({ data: { applicationId: church.id, code: 'tithe', description: 'Tithe payment' } })
   const churchOffering = await db.paymentType.create({ data: { applicationId: church.id, code: 'offering', description: 'General offering' } })
   const schoolTuition = await db.paymentType.create({ data: { applicationId: school.id, code: 'tuition', description: 'Tuition fee' } })

@@ -9,17 +9,38 @@ export const PLATFORM_FEE_TYPES = [
   'PLATFORM_FEE'
 ]
 
+/** True when a payment type code represents a platform fee rather than a tenant collection. */
+export function isPlatformFeeType(code: string | null | undefined): boolean {
+  if (!code) return false
+  return PLATFORM_FEE_TYPES.includes(String(code).trim().toUpperCase())
+}
+
 /**
- * Applications whose tenants MUST transact on their own provider credentials.
+ * Resolve the outbound webhook URL for a partner application.
  *
- * SACCOs are regulated cooperatives: each one's collections must land in its
- * own provider account, never commingled with other tenants' money or the
- * platform's. A payment for one of these tenants is REFUSED when no active
- * per-tenant credentials are configured — the platform's global credentials
- * are never a fallback for them. Platform-fee payments (SMS purchases,
- * activation fees, subscriptions — see PLATFORM_FEE_TYPES) are exempt: they
- * are platform revenue by definition and settle on the platform's own LivePay
- * account (the "platform wallet").
+ * Self-heals the legacy default `/api/internal/payment-completed` path for the
+ * `sacco` (Kunity) application to `/api/webhooks/najiki`, which is Kunity's actual
+ * signed webhook endpoint.
+ */
+export function resolvePartnerWebhookUrl(application: {
+  code?: string | null
+  baseUrl: string
+  webhookPath: string
+}): string {
+  const base = String(application.baseUrl || '').trim().replace(/\/+$/, '')
+  let path = String(application.webhookPath || '').trim()
+  if (
+    String(application.code || '').trim().toLowerCase() === 'sacco' &&
+    (!path || path === '/api/internal/payment-completed' || path === '/api/internal/payment-completed/')
+  ) {
+    path = '/api/webhooks/najiki'
+  }
+  if (path && !path.startsWith('/')) path = `/${path}`
+  return `${base}${path}`
+}
+
+/**
+ * Applications whose tenants MUST transact on configured provider credentials.
  */
 export const TENANT_CREDENTIALS_REQUIRED_APP_CODES = ['sacco']
 

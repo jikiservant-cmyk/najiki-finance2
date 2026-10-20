@@ -1,7 +1,7 @@
 import { db } from './db'
 import { getPaymentProvider } from './providers'
-import { loadTenantProviderCredentials } from './tenant-credentials'
-import { PLATFORM_FEE_TYPES, appRequiresTenantCredentials } from './constants'
+import { resolveTenantOrPlatformCredentials } from './tenant-credentials'
+import { isPlatformFeeType, resolvePartnerWebhookUrl, appRequiresTenantCredentials } from './constants'
 import { toMinorUnits } from './money'
 import { webhookSecretFromRow } from './application-auth'
 import { safeJsonObject } from './json'
@@ -28,7 +28,10 @@ export async function processPayment(data: {
     })
 
     // Define payment types that go to the platform (owner's main account)
-    const isPlatformPayment = payment?.paymentType && PLATFORM_FEE_TYPES.includes(payment.paymentType.code.toUpperCase())
+    const metaObj = safeJsonObject(payment?.metadata)
+    const isPlatformPayment = isPlatformFeeType(
+      payment?.paymentType?.code ?? (metaObj?.paymentTypeCode as string | undefined)
+    )
 
     // Defense in depth (payment creation rejects these): in an app that
     // requires per-tenant credentials, the money unit is the tenant — a
@@ -50,10 +53,15 @@ export async function processPayment(data: {
     // Platform payments use the default global credentials — that account is
     // the platform wallet, where SMS purchases and platform fees belong.
     if (payment?.tenantId && payment?.providerId && !isPlatformPayment) {
-      customCredentials = await loadTenantProviderCredentials(payment.tenantId, payment.providerId)
-      if (!customCredentials) {
+      const resolved = await resolveTenantOrPlatformCredentials(
+        payment.tenantId,
+        payment.providerId,
+        payment.tenant?.code
+      )
+      if (!resolved) {
         throw new Error(`TENANT_CREDENTIALS_UNAVAILABLE: ${payment.tenant?.code ?? payment.tenantId}`)
       }
+      customCredentials = resolved.credentials
     }
 
     const providerClient = getPaymentProvider(providerCode, customCredentials)
@@ -98,7 +106,7 @@ export async function processPayment(data: {
           providerPaymentId: providerResponse.providerPaymentId || '',
           failureReason: providerResponse.failureReason,
           applicationId: payment.applicationId,
-          webhookUrl: `${payment.application.baseUrl}${payment.application.webhookPath}`,
+          webhookUrl: resolvePartnerWebhookUrl(payment.application),
           webhookSecret: webhookSecretFromRow(payment.application),
           externalEntityId: payment.externalEntityId,
           tenantId: payment.tenantId ?? null,
@@ -187,7 +195,10 @@ export async function completePayment(data: {
     })
 
     // Define payment types that go to the platform (owner's main account)
-    const isPlatformPayment = fullPaymentIntent.paymentType && PLATFORM_FEE_TYPES.includes(fullPaymentIntent.paymentType.code.toUpperCase())
+    const intentMeta = safeJsonObject(fullPaymentIntent.metadata)
+    const isPlatformPayment = isPlatformFeeType(
+      fullPaymentIntent.paymentType?.code ?? (intentMeta?.paymentTypeCode as string | undefined)
+    )
 
     // P0-4 & Phase 1a: Atomic wallet balance credit and immutable ledger entry using Prisma public models
     if (status === 'success' && fullPaymentIntent.tenant && !isPlatformPayment) {
@@ -254,7 +265,7 @@ export async function completePayment(data: {
 
     // P0-7: Write outbound notification ledger record in the transaction
     if (status === 'success' || status === 'failed') {
-      const webhookUrl = `${fullPaymentIntent.application.baseUrl}${fullPaymentIntent.application.webhookPath}`
+      const webhookUrl = resolvePartnerWebhookUrl(fullPaymentIntent.application)
       const notificationPayload = {
         paymentIntentId,
         reference: fullPaymentIntent.reference,

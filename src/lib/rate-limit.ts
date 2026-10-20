@@ -1,14 +1,17 @@
 /**
- * Shared Upstash rate limiter.
+ * Shared rate limiter (Upstash Redis primary + bounded in-process sliding-window fallback).
  *
  * Every route that previously needed a limiter carried its own copy of the
  * `Redis.fromEnv()` + `Promise.race` dance (a silent divergence risk). This
  * module centralises it.
  *
  * Semantics:
- *  - Redis not configured  → allowed (development), warned once.
- *  - Limiter errors/timeouts in production → 503, never "allow" (fail closed).
- *  - Limiter errors in development → allowed, warned.
+ *  - Upstash Redis configured & reachable → distributed sliding-window rate limit across all instances.
+ *  - Upstash Redis not configured or unreachable:
+ *      • Default: falls back seamlessly to a bounded in-memory sliding-window limiter
+ *        enforcing the exact same `tokens` / `window` per instance (returns 429 on abuse,
+ *        never bricks real customer payments with 503 when Redis is unconfigured/cold).
+ *      • `ENFORCE_REDIS_RATELIMIT=true` in production: fails closed with 503.
  */
 
 import { Ratelimit } from '@upstash/ratelimit'
@@ -22,28 +25,116 @@ export type RateLimitDecision =
   | { ok: false; status: number; message: string; retryAfter?: string }
 
 const limiters = new Map<string, Ratelimit>()
+const memoryBuckets = new Map<string, number[]>()
+const MAX_MEMORY_BUCKETS = 10_000
 let warnedMissingRedis = false
 
-function getLimiter(name: string, tokens: number, window: Duration): Ratelimit | null {
-  const cacheKey = `${name}:${tokens}:${window}`
-  const cached = limiters.get(cacheKey)
-  if (cached) return cached
+function cleanEnvValue(raw: string | undefined): string {
+  if (!raw) return ''
+  return raw.trim().replace(/^["']+|["']+$/g, '').trim()
+}
 
-  const url = process.env.UPSTASH_REDIS_REST_URL
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN
-  if (!url || !token) {
+export function parseWindowMs(window: Duration): number {
+  const match = /^(\d+)\s*(s|m|h|d)$/.exec(window.trim())
+  if (!match) return 60_000
+  const amount = Number(match[1])
+  const unit = match[2]
+  switch (unit) {
+    case 's':
+      return amount * 1_000
+    case 'm':
+      return amount * 60_000
+    case 'h':
+      return amount * 3_600_000
+    case 'd':
+      return amount * 86_400_000
+    default:
+      return 60_000
+  }
+}
+
+export function resetMemoryRateLimits(): void {
+  memoryBuckets.clear()
+}
+
+function checkMemoryRateLimit(
+  bucketKey: string,
+  tokens: number,
+  window: Duration,
+  now: number = Date.now()
+): RateLimitDecision {
+  const windowMs = parseWindowMs(window)
+  const cutoff = now - windowMs
+
+  // Bound total in-memory buckets to prevent unbounded growth under spoofed identifiers
+  if (!memoryBuckets.has(bucketKey) && memoryBuckets.size >= MAX_MEMORY_BUCKETS) {
+    for (const [key, timestamps] of memoryBuckets) {
+      const active = timestamps.filter((t) => t > cutoff)
+      if (active.length === 0) {
+        memoryBuckets.delete(key)
+      } else {
+        memoryBuckets.set(key, active)
+      }
+    }
+    if (memoryBuckets.size >= MAX_MEMORY_BUCKETS) {
+      const oldestKey = memoryBuckets.keys().next().value
+      if (oldestKey !== undefined) memoryBuckets.delete(oldestKey)
+    }
+  }
+
+  const existing = memoryBuckets.get(bucketKey) || []
+  const recent = existing.filter((t) => t > cutoff)
+
+  if (recent.length >= tokens) {
+    memoryBuckets.set(bucketKey, recent)
+    const oldest = recent[0] ?? now
+    const retryAfterSec = Math.max(1, Math.ceil((oldest + windowMs - now) / 1000))
+    return {
+      ok: false,
+      status: 429,
+      message: 'Too many requests',
+      retryAfter: String(retryAfterSec),
+    }
+  }
+
+  recent.push(now)
+  memoryBuckets.set(bucketKey, recent)
+  return { ok: true }
+}
+
+export function isUpstashRateLimitConfigured(): boolean {
+  const url = cleanEnvValue(process.env.UPSTASH_REDIS_REST_URL)
+  const token = cleanEnvValue(process.env.UPSTASH_REDIS_REST_TOKEN)
+  return Boolean(url && token && /^https?:\/\//i.test(url))
+}
+
+function getLimiter(name: string, tokens: number, window: Duration): Ratelimit | null {
+  const url = cleanEnvValue(process.env.UPSTASH_REDIS_REST_URL)
+  const token = cleanEnvValue(process.env.UPSTASH_REDIS_REST_TOKEN)
+  if (!url || !token || !/^https?:\/\//i.test(url)) {
     if (!warnedMissingRedis) {
-      console.warn('[rate-limit] UPSTASH_REDIS_REST_URL/TOKEN not configured — rate limiting is disabled')
+      console.warn(
+        '[rate-limit] Valid UPSTASH_REDIS_REST_URL (https://...) / UPSTASH_REDIS_REST_TOKEN not configured — using per-instance sliding-window limiter'
+      )
       warnedMissingRedis = true
     }
     return null
   }
 
+  const cacheKey = `${url}:${name}:${tokens}:${window}`
+  const cached = limiters.get(cacheKey)
+  if (cached) return cached
+
   try {
     const limiter = new Ratelimit({
-      redis: new Redis({ url, token }),
+      redis: new Redis({
+        url,
+        token,
+        retry: { retries: 1, backoff: () => 150 },
+      }),
       limiter: Ratelimit.slidingWindow(tokens, window),
-      analytics: true,
+      // Disable background analytics writes so cold starts perform a single fast atomic pipeline
+      analytics: false,
       prefix: `najiki:ratelimit:${name}`,
     })
     limiters.set(cacheKey, limiter)
@@ -57,7 +148,7 @@ function getLimiter(name: string, tokens: number, window: Duration): Ratelimit |
 /**
  * Consume one token for `identifier` in the `name` bucket.
  *
- * @param name       bucket name, e.g. 'payments-create'
+ * @param name       bucket name, e.g. 'payments-ip'
  * @param identifier usually the API key, session user id or client IP
  */
 export async function checkRateLimit(
@@ -66,12 +157,18 @@ export async function checkRateLimit(
   opts: { tokens: number; window: Duration; timeoutMs?: number }
 ): Promise<RateLimitDecision> {
   const limiter = getLimiter(name, opts.tokens, opts.window)
-  const isProduction = process.env.NODE_ENV === 'production'
+  const strictRedis =
+    process.env.NODE_ENV === 'production' &&
+    cleanEnvValue(process.env.ENFORCE_REDIS_RATELIMIT).toLowerCase() === 'true'
+  const bucketKey = `${name}:${identifier}`
+
   if (!limiter) {
-    return isProduction
-      ? { ok: false, status: 503, message: 'Service temporarily unavailable' }
-      : { ok: true } // development without Redis
+    if (strictRedis) {
+      return { ok: false, status: 503, message: 'Service temporarily unavailable' }
+    }
+    return checkMemoryRateLimit(bucketKey, opts.tokens, opts.window)
   }
+
   const timeoutMs = opts.timeoutMs ?? 3000
 
   try {
@@ -82,7 +179,7 @@ export async function checkRateLimit(
 
     try {
       const { success, reset } = await Promise.race([
-        limiter.limit(`${name}:${identifier}`),
+        limiter.limit(bucketKey),
         timeout,
       ])
 
@@ -99,12 +196,11 @@ export async function checkRateLimit(
       if (timer) clearTimeout(timer)
     }
   } catch (error) {
-    console.error('[rate-limit] check failed:', error)
-    if (isProduction) {
-      // Fail closed: without the limiter we cannot protect the endpoint.
+    console.error('[rate-limit] Upstash check failed, falling back cleanly:', error)
+    if (strictRedis) {
       return { ok: false, status: 503, message: 'Service temporarily unavailable' }
     }
-    return { ok: true }
+    return checkMemoryRateLimit(bucketKey, opts.tokens, opts.window)
   }
 }
 

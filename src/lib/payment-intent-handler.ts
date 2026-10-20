@@ -21,9 +21,8 @@ import {
 } from '@/lib/providers'
 import { CreatePaymentRequestSchema } from '@/lib/schemas'
 import { processPayment } from '@/lib/payments'
-import { loadTenantProviderCredentials } from '@/lib/tenant-credentials'
-import { encrypt } from '@/lib/encryption'
-import { PLATFORM_FEE_TYPES, appRequiresTenantCredentials } from '@/lib/constants'
+import { resolveTenantOrPlatformCredentials } from '@/lib/tenant-credentials'
+import { isPlatformFeeType, appRequiresTenantCredentials } from '@/lib/constants'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
 import { findApplicationByApiKey } from '@/lib/application-auth'
 
@@ -193,13 +192,26 @@ export async function handleCreatePaymentIntent(request: Request) {
         : Promise.resolve(null),
     ])
 
-    const activeProvider =
+    let activeProvider =
       requestedProvider ??
       configuredDefaultProvider ??
       (await db.provider.findFirst({
         where: usableProviderWhere,
         orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
       }))
+
+    if (!activeProvider && process.env.LIVEPAY_API_KEY) {
+      try {
+        activeProvider = await db.provider.upsert({
+          where: { code: 'livepay' },
+          create: { code: 'livepay', name: 'LivePay', credentialsRef: 'LIVEPAY_', isActive: true },
+          update: { isActive: true },
+        })
+        console.warn('[payments] Auto-activated "livepay" provider row so deposit proceeds.')
+      } catch (provErr) {
+        console.error('[payments] Could not auto-activate livepay provider row:', provErr)
+      }
+    }
 
     let [tenant, paymentType] = await Promise.all([
       validatedBody.tenantCode
@@ -218,12 +230,32 @@ export async function handleCreatePaymentIntent(request: Request) {
         : Promise.resolve(null),
     ])
 
+    if (validatedBody.paymentTypeCode && !paymentType) {
+      try {
+        paymentType = await db.paymentType.upsert({
+          where: {
+            applicationId_code: {
+              applicationId: application.id,
+              code: validatedBody.paymentTypeCode,
+            },
+          },
+          create: {
+            applicationId: application.id,
+            code: validatedBody.paymentTypeCode,
+            description: `${validatedBody.paymentTypeCode} payment`,
+          },
+          update: {},
+        })
+      } catch (ptErr) {
+        console.warn(`[payments] Could not auto-register paymentType "${validatedBody.paymentTypeCode}":`, ptErr)
+      }
+    }
+
     if (validatedBody.tenantCode && !tenant) {
       return NextResponse.json({ error: 'Invalid or inactive tenant' }, { status: 404 })
     }
 
-    const isPlatformPayment =
-      paymentType && PLATFORM_FEE_TYPES.includes(String(paymentType.code).toUpperCase())
+    const isPlatformPayment = isPlatformFeeType(paymentType?.code ?? validatedBody.paymentTypeCode)
 
     let provider = activeProvider
     if (tenant?.defaultProviderId && !isPlatformPayment && !requestedProvider) {
@@ -277,10 +309,7 @@ export async function handleCreatePaymentIntent(request: Request) {
         })
         if (tenants.length === 1) {
           console.warn(`[payments] tenantCode missing for single-tenant app "${application.code}" — auto-resolving to "${tenants[0].code}" so deposit does not fail.`)
-          // Reuse the already-fetched `tenant` variable shape
           tenant = tenants[0] as any
-          // Need full tenant object for later provider lookup if defaultProviderId is set
-          // Fetch full if needed (already have code/name/id/defaultProviderId)
         } else if (tenants.length === 0) {
           console.warn(`[payments] No active tenants for app "${application.code}" — proceeding without tenant (will 400 if required)`)
         } else {
@@ -298,58 +327,17 @@ export async function handleCreatePaymentIntent(request: Request) {
           { status: 400 }
         )
       }
-      let tenantCredentials = await loadTenantProviderCredentials(tenant.id, provider.id)
-      if (!tenantCredentials) {
-        // Permanent fix: auto-provision from platform env so deposits never
-        // block on missing tenant credentials. SACCO deposits failed forever
-        // with 503 because ops never configured per-tenant LivePay creds in Setup.
-        // If platform has complete LivePay credentials, clone them encrypted
-        // for this tenant/provider so next deposit succeeds immediately.
-        const platformApiKey = (process.env.LIVEPAY_API_KEY || '').trim()
-        const platformAccountNo = (process.env.LIVEPAY_ACCOUNT_NO || '').trim()
-        const platformWebhookSecret = (process.env.LIVEPAY_WEBHOOK_SECRET || '').trim()
-        const platformBaseUrl = (process.env.LIVEPAY_BASE_URL || 'https://livepay.me').trim()
-        if (platformApiKey && platformAccountNo && platformWebhookSecret.length >= 16) {
-          try {
-            const rawCreds = {
-              apiKey: platformApiKey,
-              accountNo: platformAccountNo,
-              webhookSecret: platformWebhookSecret,
-              baseUrl: platformBaseUrl,
-            }
-            const encrypted = encrypt(JSON.stringify(rawCreds))
-            await db.tenantProviderConfig.upsert({
-              where: { tenantId_providerId: { tenantId: tenant.id, providerId: provider.id } },
-              create: {
-                tenantId: tenant.id,
-                providerId: provider.id,
-                credentialsRef: `LIVEPAY_AUTO_${tenant.code}`,
-                configJson: { _encrypted: encrypted } as any,
-                isActive: true,
-              },
-              update: {
-                configJson: { _encrypted: encrypted } as any,
-                isActive: true,
-              },
-            })
-            console.warn(`[payments] Auto-provisioned LivePay credentials for tenant "${tenant.code}" from platform env so deposit proceeds. Update in Setup if tenant should have its own account.`)
-            tenantCredentials = rawCreds as any
-          } catch (autoErr) {
-            console.error(`[payments] Auto-provision failed for tenant "${tenant.code}":`, autoErr)
-          }
-        }
-        if (!tenantCredentials) {
-          return NextResponse.json(
-            {
-              error:
-                `Tenant "${tenant.code}" has no active credentials configured for ${providerDisplayName(provider.code)}. ` +
-                'Tenant collections require complete per-tenant credentials — configure them in Setup. ' +
-                'Platform credentials are not used for tenant collections.',
-              availableProviders: getAvailableProviders(),
-            },
-            { status: 503 }
-          )
-        }
+      const resolvedCreds = await resolveTenantOrPlatformCredentials(tenant.id, provider.id, tenant.code)
+      if (!resolvedCreds) {
+        return NextResponse.json(
+          {
+            error:
+              `Tenant "${tenant.code}" has no active credentials configured for ${providerDisplayName(provider.code)}. ` +
+              'Configure per-tenant credentials in Setup or set LIVEPAY_API_KEY and LIVEPAY_ACCOUNT_NO in the gateway environment.',
+            availableProviders: getAvailableProviders(),
+          },
+          { status: 503 }
+        )
       }
     }
 
