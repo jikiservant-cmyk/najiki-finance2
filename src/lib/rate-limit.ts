@@ -72,7 +72,7 @@ export async function checkRateLimit(
       ? { ok: false, status: 503, message: 'Service temporarily unavailable' }
       : { ok: true } // development without Redis
   }
-  const timeoutMs = opts.timeoutMs ?? 1000
+  const timeoutMs = opts.timeoutMs ?? 3000
 
   try {
     let timer: ReturnType<typeof setTimeout> | undefined
