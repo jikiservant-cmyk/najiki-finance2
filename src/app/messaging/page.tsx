@@ -99,26 +99,48 @@ function BarChart({ data, maxVal, color, failData }: { data: number[]; maxVal: n
 export default function MessagingDashboard() {
   const [data, setData] = useState<MessagingDashboardData | null>(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
-    fetch('/api/messaging/dashboard').then(r => r.json()).then(d => { setData(d); setLoading(false) }).catch(() => setLoading(false))
+    try {
+      const res = await fetch('/api/messaging/dashboard')
+      const d = await res.json()
+      if (!res.ok || d?.error) {
+        setError(d?.error || 'Failed to fetch messaging data')
+        setData(null)
+      } else {
+        setData(d)
+        setError(null)
+      }
+    } catch (err: any) {
+      setError(err?.message || 'Network error loading messaging dashboard')
+      setData(null)
+    } finally {
+      setLoading(false)
+    }
   }, [])
 
   useEffect(() => { refresh() }, [refresh])
 
-  const safeData = data || {
-    totalSent: 0,
-    totalCost: 0,
-    statusCounts: { delivered: 0, pending: 0, failed: 0, unknown: 0, queued: 0 },
-    deliveryRate: '0',
-    appUsage: [],
-    providerUsage: [],
-    dailyVolume: [],
-    recentMessages: []
+  const safeData = {
+    totalSent: typeof data?.totalSent === 'number' ? data.totalSent : 0,
+    totalCost: typeof data?.totalCost === 'number' ? data.totalCost : 0,
+    statusCounts: {
+      delivered: data?.statusCounts?.delivered ?? 0,
+      pending: data?.statusCounts?.pending ?? 0,
+      failed: data?.statusCounts?.failed ?? 0,
+      unknown: data?.statusCounts?.unknown ?? 0,
+      queued: data?.statusCounts?.queued ?? 0,
+    },
+    deliveryRate: data?.deliveryRate ?? '0',
+    appUsage: Array.isArray(data?.appUsage) ? data.appUsage : [],
+    providerUsage: Array.isArray(data?.providerUsage) ? data.providerUsage : [],
+    dailyVolume: Array.isArray(data?.dailyVolume) ? data.dailyVolume : [],
+    recentMessages: Array.isArray(data?.recentMessages) ? data.recentMessages : [],
   }
 
   const safeStatusCounts = safeData.statusCounts
-  const maxDaily = Array.isArray(safeData.dailyVolume) && safeData.dailyVolume.length > 0 
+  const maxDaily = safeData.dailyVolume.length > 0 
     ? Math.max(...safeData.dailyVolume.map(d => d.volume), 1) 
     : 1
 
@@ -166,6 +188,17 @@ export default function MessagingDashboard() {
           </motion.div>
         </div>
 
+        {error && (
+          <div className="px-6 md:px-16 lg:px-24 mb-4">
+            <div className="p-4 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-200 text-xs font-mono flex items-center justify-between">
+              <span>{error === 'Unauthorized' ? 'Authentication required. Please sign in to view live messaging stats.' : error}</span>
+              <button onClick={refresh} className="px-3 py-1 bg-amber-500/20 hover:bg-amber-500/30 rounded border border-amber-500/40 text-amber-200 transition-colors">
+                Retry
+              </button>
+            </div>
+          </div>
+        )}
+
         {loading ? (
           <div className="px-6 md:px-16 lg:px-24 py-8 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
             {Array.from({ length: 6 }).map((_, i) => (
@@ -179,12 +212,12 @@ export default function MessagingDashboard() {
           <div className="px-6 md:px-16 lg:px-24 py-4 space-y-6">
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 scene-3d">
               {[
-                { label: 'Total Requests', value: safeData.totalSent.toLocaleString(), sub: 'All SMS states', accent: '#38bdf8', delay: 1.6 },
-                { label: 'Delivery Rate', value: `${safeData.deliveryRate}%`, sub: `${safeStatusCounts.delivered} confirmed`, accent: '#34d399', delay: 1.7 },
-                { label: 'Queued', value: String(safeStatusCounts.queued), sub: 'Waiting for provider', delay: 1.8 },
-                { label: 'Pending', value: String(safeStatusCounts.pending), sub: 'In transit', delay: 1.9 },
-                { label: 'Failed', value: String(safeStatusCounts.failed), sub: 'Delivery failed', accent: '#f87171', delay: 2.0 },
-                { label: 'Unknown', value: String(safeStatusCounts.unknown), sub: 'Reconcile manually', accent: '#fbbf24', delay: 2.05 },
+                { label: 'Total Requests', value: (safeData.totalSent ?? 0).toLocaleString(), sub: 'All SMS states', accent: '#38bdf8', delay: 1.6 },
+                { label: 'Delivery Rate', value: `${safeData.deliveryRate}%`, sub: `${safeStatusCounts?.delivered ?? 0} confirmed`, accent: '#34d399', delay: 1.7 },
+                { label: 'Queued', value: String(safeStatusCounts?.queued ?? 0), sub: 'Waiting for provider', delay: 1.8 },
+                { label: 'Pending', value: String(safeStatusCounts?.pending ?? 0), sub: 'In transit', delay: 1.9 },
+                { label: 'Failed', value: String(safeStatusCounts?.failed ?? 0), sub: 'Delivery failed', accent: '#f87171', delay: 2.0 },
+                { label: 'Unknown', value: String(safeStatusCounts?.unknown ?? 0), sub: 'Reconcile manually', accent: '#fbbf24', delay: 2.05 },
                 { label: 'Total Cost', value: fmtCost(safeData.totalCost), sub: 'Estimated spend', accent: '#fbbf24', delay: 2.1 },
               ].map((stat, i) => (
                 <TiltCard key={stat.label} tiltAmount={8}>
@@ -221,7 +254,7 @@ export default function MessagingDashboard() {
                         <div className="flex justify-between items-start">
                           <div>
                             <h4 className="text-xs font-bold text-muted-foreground">{app.name}</h4>
-                            <span className="text-2xl font-black" style={{ color: appColors[app.code] }}>{app.count.toLocaleString()}</span>
+                            <span className="text-2xl font-black" style={{ color: appColors[app.code] }}>{(app.count ?? 0).toLocaleString()}</span>
                           </div>
                           <span className="text-[10px] font-mono text-muted-foreground">{fmtCost(app.cost)}</span>
                         </div>
@@ -250,7 +283,7 @@ export default function MessagingDashboard() {
                       <motion.div key={p.code} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 2.5 + i * 0.1 }}>
                         <div className="flex justify-between mb-1">
                           <span className="text-sm font-mono font-medium">{p.name}</span>
-                          <span className="text-sm font-mono text-muted-foreground">{p.count.toLocaleString()}</span>
+                          <span className="text-sm font-mono text-muted-foreground">{(p.count ?? 0).toLocaleString()}</span>
                         </div>
                         <div className="h-2 bg-foreground/5 rounded-full overflow-hidden mb-1">
                           <motion.div

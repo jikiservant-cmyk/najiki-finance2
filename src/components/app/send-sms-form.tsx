@@ -70,7 +70,7 @@ export function SendSmsForm() {
             >
               <option value="church">Church App (church)</option>
               <option value="school">School Platform (school)</option>
-              <option value="KUNITY">SACCO Platform (KUNITY)</option>
+              <option value="sacco">SACCO Platform (sacco)</option>
               <option value="hospital">Hospital Platform (hospital)</option>
             </select>
           </div>
