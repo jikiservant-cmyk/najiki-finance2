@@ -19,32 +19,33 @@ export class LivePayProvider implements PaymentProvider {
   private baseUrl: string
 
   constructor(config?: Partial<ProviderCredentials>) {
+    const clean = (v?: string) => (v ? v.trim().replace(/^["']+|["']+$/g, '').trim() : '')
+    const cleanKey = (v?: string) => clean(clean(v).replace(/^bearer\s+/i, ''))
+    const cleanUrl = (v?: string) => clean(v).replace(/\/+$/, '') || 'https://livepay.me'
+
     // An explicit tenant config is never supplemented from the platform account.
     if (config) {
-      this.apiKey = config.apiKey || config.api_key || ''
-      this.accountNo = config.accountNo || config.account_number || config.accountNumber || ''
-      this.webhookSecret = config.webhookSecret || config.webhook_secret || ''
-      this.baseUrl = config.baseUrl || config.base_url || 'https://livepay.me'
+      this.apiKey = cleanKey(config.apiKey || config.api_key)
+      this.accountNo = clean(config.accountNo || config.account_number || config.accountNumber)
+      this.webhookSecret = clean(config.webhookSecret || config.webhook_secret)
+      this.baseUrl = cleanUrl(config.baseUrl || config.base_url)
       if (!this.apiKey || !this.accountNo || this.webhookSecret.length < 16) {
         throw new Error('Incomplete tenant LivePay credentials')
       }
     } else {
-      const clean = (v?: string) => (v ? v.trim().replace(/^["']+|["']+$/g, '').trim() : '')
-      this.apiKey = clean(process.env.LIVEPAY_API_KEY)
+      this.apiKey = cleanKey(process.env.LIVEPAY_API_KEY)
       this.accountNo = clean(process.env.LIVEPAY_ACCOUNT_NO || process.env.LIVEPAY_ACCOUNT_NUMBER)
       this.webhookSecret = clean(process.env.LIVEPAY_WEBHOOK_SECRET || process.env.LIVEPAY_SECRET_KEY)
-      this.baseUrl = clean(process.env.LIVEPAY_BASE_URL) || 'https://livepay.me'
+      this.baseUrl = cleanUrl(process.env.LIVEPAY_BASE_URL)
     }
   }
 
   async initiatePayment(params: InitiatePaymentParams): Promise<InitiatePaymentResponse> {
-    // Docs: https://docs.livepay.me/request-money — payload is ONLY accountNumber, phoneNumber, amount, currency, reference, description (+ network for non-UGX)
-    // No webhookUrl per request — webhook is configured per LivePay account dashboard. Sending extra field can 400.
-    // Phone: docs example is "0777123456" (any format accepted per docs, so avoid over-normalizing to 256...)
-    // Reference: no spaces, max 30 chars, unique per account
-    // Strip + and spaces/dashes/parens — LivePay docs show 0777123456, and SACCO apps
-    // often send +2567... or 2567... — all are valid but + breaks LivePay validation.
-    const normalizedPhone = String(params.phoneNumber || '').trim().replace(/[\s\-()]/g, '').replace(/^\+/, '')
+    // Normalize local mobile money formats (e.g. "0772123456" -> "256772123456",
+    // "+256772123456" -> "256772123456") so member deposits match the exact
+    // 12-digit country-prefixed MSISDN format that triggers LivePay PIN prompts.
+    const rawPhone = String(params.phoneNumber || '').trim()
+    const normalizedPhone = normalizePhone(rawPhone).replace(/[\s\-()]/g, '').replace(/^\+/, '')
     // For UGX, LivePay example uses 50000 (major units, zero-decimal). Ensure amount is integer.
     const normalizedAmount = params.currency?.toUpperCase() === 'UGX' ? Math.round(Number(params.amount)) : params.amount
     // Enforce reference constraints per docs: max 30, no spaces
@@ -127,10 +128,12 @@ export class LivePayProvider implements PaymentProvider {
 
   async checkPaymentStatus(reference: string, currency: string = 'UGX', providerPaymentId?: string): Promise<PaymentStatusResponse> {
     try {
+      let safeReference = String(reference || '').trim().replace(/\s+/g, '-')
+      if (safeReference.length > 30) safeReference = safeReference.slice(0, 30)
       const url = new URL(`${this.baseUrl}/api/transaction-status`)
       url.searchParams.append('accountNumber', this.accountNo)
       url.searchParams.append('currency', currency)
-      url.searchParams.append('reference', reference)
+      url.searchParams.append('reference', safeReference)
 
       const response = await fetch(url.toString(), {
         method: 'GET',

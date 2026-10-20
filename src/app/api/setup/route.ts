@@ -12,6 +12,13 @@ import {
 import { encrypt, decrypt } from '@/lib/encryption'
 import { generateApiKey, hashApiKey, apiKeyHint } from '@/lib/api-keys'
 import { summarizeProviderConfig, shouldPreserveStoredSecret } from '@/lib/provider-config-summary'
+import {
+  cleanApiKeyValue,
+  cleanBaseUrlValue,
+  cleanCredentialValue,
+  deriveTenantWebhookSecret,
+  isLegacyAutoProvisionedRef,
+} from '@/lib/tenant-credentials'
 
 // Every write path is validated. These payloads previously went straight from
 // `request.json()` into Prisma, so a typo in the dashboard (or a crafted
@@ -147,10 +154,42 @@ export async function GET() {
           orderBy: { createdAt: 'desc' },
         })
         .then((configs) =>
-          configs.map(({ configJson, ...rest }) => ({
-            ...rest,
-            configSummary: summarizeProviderConfig(configJson),
-          }))
+          configs
+            .filter((cfg) => {
+              if (isLegacyAutoProvisionedRef(cfg.credentialsRef)) {
+                db.tenantProviderConfig.delete({ where: { id: cfg.id } }).catch(() => {})
+                return false
+              }
+              return true
+            })
+            .map(({ configJson, ...rest }) => {
+              const record =
+                configJson && typeof configJson === 'object' && !Array.isArray(configJson)
+                  ? (configJson as Record<string, unknown>)
+                  : {}
+              if (typeof record._encrypted === 'string' && record._encrypted.length > 0) {
+                try {
+                  const decoded = JSON.parse(decrypt(record._encrypted))
+                  const innerSummary = summarizeProviderConfig(decoded)
+                  return {
+                    ...rest,
+                    configSummary: {
+                      ...innerSummary,
+                      encrypted: true,
+                    },
+                  }
+                } catch {
+                  return {
+                    ...rest,
+                    configSummary: summarizeProviderConfig(configJson),
+                  }
+                }
+              }
+              return {
+                ...rest,
+                configSummary: summarizeProviderConfig(configJson),
+              }
+            })
         ),
       db.tenant.findMany({
         include: {
@@ -423,15 +462,27 @@ export async function POST(request: Request) {
           }
         }
 
+        const effectiveApiKey = shouldPreserveStoredSecret(config.apiKey)
+          ? cleanApiKeyValue(preserved.apiKey)
+          : cleanApiKeyValue(config.apiKey)
+        const effectiveAccountNo =
+          cleanCredentialValue(config.accountNo) || cleanCredentialValue(preserved.accountNo)
+        const submittedWebhookSecret = shouldPreserveStoredSecret(config.webhookSecret)
+          ? cleanCredentialValue(preserved.webhookSecret)
+          : cleanCredentialValue(config.webhookSecret)
+        const effectiveWebhookSecret =
+          submittedWebhookSecret.length >= 16
+            ? submittedWebhookSecret
+            : effectiveApiKey && effectiveAccountNo
+              ? deriveTenantWebhookSecret(effectiveApiKey, config.tenantId, effectiveAccountNo)
+              : submittedWebhookSecret
+        const effectiveBaseUrl = cleanBaseUrlValue(config.baseUrl || preserved.baseUrl)
+
         const rawCreds = {
-          apiKey: shouldPreserveStoredSecret(config.apiKey)
-            ? String(preserved.apiKey ?? '')
-            : config.apiKey!.trim(),
-          accountNo: config.accountNo?.trim() || String(preserved.accountNo ?? ''),
-          webhookSecret: shouldPreserveStoredSecret(config.webhookSecret)
-            ? String(preserved.webhookSecret ?? '')
-            : config.webhookSecret!.trim(),
-          baseUrl: config.baseUrl?.trim() || String(preserved.baseUrl ?? 'https://livepay.me'),
+          apiKey: effectiveApiKey,
+          accountNo: effectiveAccountNo,
+          webhookSecret: effectiveWebhookSecret,
+          baseUrl: effectiveBaseUrl,
         }
 
         const configJson = {

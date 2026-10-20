@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { getPaymentProvider } from '@/lib/providers'
 import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
 import { resolveTenantOrPlatformCredentials } from '@/lib/tenant-credentials'
+import { isAuthorizedTenantPoll } from '@/lib/tenant-resolution'
 import { isConfirmedTerminalStatus } from '@/lib/payment-security'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
 import { isPlatformFeeType, resolvePartnerWebhookUrl } from '@/lib/constants'
@@ -96,20 +97,40 @@ export async function GET(
 
     const { searchParams } = new URL(request.url)
     const requestTenantCode = searchParams.get('tenantCode')
+    const parsedIntentMetadata = safeJsonObject(paymentIntent.metadata)
 
-    if (paymentIntent.tenant && paymentIntent.tenant.code !== requestTenantCode) {
-      return NextResponse.json({ error: 'Payment not found (tenant mismatch)' }, { status: 404 })
+    if (paymentIntent.tenant) {
+      let authorized = isAuthorizedTenantPoll({
+        intentTenant: paymentIntent.tenant,
+        requestedTenantCode: requestTenantCode,
+        intentMetadata: parsedIntentMetadata,
+      })
+      if (!authorized) {
+        const activeTenantCount = await db.tenant.count({
+          where: { applicationId: application.id, isActive: true },
+        })
+        authorized = isAuthorizedTenantPoll({
+          intentTenant: paymentIntent.tenant,
+          requestedTenantCode: requestTenantCode,
+          intentMetadata: parsedIntentMetadata,
+          activeTenantCount,
+        })
+      }
+      if (!authorized) {
+        return NextResponse.json({ error: 'Payment not found (tenant mismatch)' }, { status: 404 })
+      }
     }
 
     let currentStatus = paymentIntent.status
     let currentFailureReason = paymentIntent.failureReason
     let completedAt = paymentIntent.completedAt
 
-    // If still processing, see if we should poll the provider (max once every 15s)
+    // If still processing, poll the provider (throttled to max once every 5s so
+    // member deposits settle immediately after PIN confirmation even before inbound webhook retries)
     if (paymentIntent.status === 'processing' && paymentIntent.provider?.code) {
       const secondsSinceUpdate = (Date.now() - paymentIntent.updatedAt.getTime()) / 1000
       
-      if (secondsSinceUpdate > 15) {
+      if (secondsSinceUpdate >= 5) {
         try {
           // Pen-test finding (F-A): poll with the TENANT's own credentials for
           // tenant-collected payments — the same rule the creation path, the

@@ -22,6 +22,7 @@ import {
 import { CreatePaymentRequestSchema } from '@/lib/schemas'
 import { processPayment } from '@/lib/payments'
 import { resolveTenantOrPlatformCredentials } from '@/lib/tenant-credentials'
+import { resolveTenantForApplication } from '@/lib/tenant-resolution'
 import { isPlatformFeeType, appRequiresTenantCredentials } from '@/lib/constants'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
 import { findApplicationByApiKey } from '@/lib/application-auth'
@@ -213,16 +214,8 @@ export async function handleCreatePaymentIntent(request: Request) {
       }
     }
 
-    let [tenant, paymentType] = await Promise.all([
-      validatedBody.tenantCode
-        ? db.tenant.findFirst({
-            where: {
-              applicationId: application.id,
-              code: validatedBody.tenantCode,
-              isActive: true,
-            },
-          })
-        : Promise.resolve(null),
+    const [tenantLookup, fetchedPaymentType] = await Promise.all([
+      resolveTenantForApplication(application.id, validatedBody.tenantCode),
       validatedBody.paymentTypeCode
         ? db.paymentType.findFirst({
             where: { applicationId: application.id, code: validatedBody.paymentTypeCode },
@@ -230,6 +223,14 @@ export async function handleCreatePaymentIntent(request: Request) {
         : Promise.resolve(null),
     ])
 
+    let tenant = tenantLookup.resolved?.tenant ?? null
+    if (tenant && tenantLookup.resolved && tenantLookup.resolved.matchedBy !== 'exact-code') {
+      console.warn(
+        `[payments] Resolved tenant "${tenant.code}" (matchedBy=${tenantLookup.resolved.matchedBy}) for requested tenantCode="${validatedBody.tenantCode ?? ''}"`
+      )
+    }
+
+    let paymentType = fetchedPaymentType
     if (validatedBody.paymentTypeCode && !paymentType) {
       try {
         paymentType = await db.paymentType.upsert({
@@ -252,7 +253,13 @@ export async function handleCreatePaymentIntent(request: Request) {
     }
 
     if (validatedBody.tenantCode && !tenant) {
-      return NextResponse.json({ error: 'Invalid or inactive tenant' }, { status: 404 })
+      return NextResponse.json(
+        {
+          error: `Invalid or inactive tenant "${validatedBody.tenantCode}".`,
+          availableTenants: tenantLookup.tenants.map((t) => t.code),
+        },
+        { status: 404 }
+      )
     }
 
     const isPlatformPayment = isPlatformFeeType(paymentType?.code ?? validatedBody.paymentTypeCode)
@@ -298,22 +305,18 @@ export async function handleCreatePaymentIntent(request: Request) {
       )
     }
 
+    let credentialSource = isPlatformPayment ? 'platform-fee' : 'none'
+
     // Per-tenant credential enforcement
-    // Auto-resolve single-tenant SACCOs that omit tenantCode: don't 400
-    // forever — pick the only active tenant so deposits succeed.
     if (!isPlatformPayment && (tenant || appRequiresTenantCredentials(application.code))) {
       if (!tenant && appRequiresTenantCredentials(application.code)) {
-        const tenants = await db.tenant.findMany({
-          where: { applicationId: application.id, isActive: true },
-          select: { id: true, code: true, name: true, defaultProviderId: true },
-        })
-        if (tenants.length === 1) {
-          console.warn(`[payments] tenantCode missing for single-tenant app "${application.code}" — auto-resolving to "${tenants[0].code}" so deposit does not fail.`)
-          tenant = tenants[0] as any
-        } else if (tenants.length === 0) {
+        if (tenantLookup.tenants.length === 1) {
+          console.warn(`[payments] tenantCode missing for single-tenant app "${application.code}" — auto-resolving to "${tenantLookup.tenants[0].code}" so deposit does not fail.`)
+          tenant = tenantLookup.tenants[0]
+        } else if (tenantLookup.tenants.length === 0) {
           console.warn(`[payments] No active tenants for app "${application.code}" — proceeding without tenant (will 400 if required)`)
         } else {
-          console.warn(`[payments] tenantCode missing for multi-tenant app "${application.code}" (${tenants.length} tenants) — returning 400. SACCO must send tenantCode.`)
+          console.warn(`[payments] tenantCode missing for multi-tenant app "${application.code}" (${tenantLookup.tenants.length} tenants) — returning 400. SACCO must send tenantCode.`)
         }
       }
       if (!tenant) {
@@ -339,9 +342,15 @@ export async function handleCreatePaymentIntent(request: Request) {
           { status: 503 }
         )
       }
+      credentialSource = resolvedCreds.source
     }
 
     const reference = generateReference(validatedBody.applicationCode, validatedBody.paymentTypeCode)
+    const intentMetadata = {
+      ...(validatedBody.metadata ?? {}),
+      ...(validatedBody.tenantCode ? { requestedTenantCode: validatedBody.tenantCode } : {}),
+      credentialSource,
+    }
 
     let paymentIntent: any
     try {
@@ -358,7 +367,7 @@ export async function handleCreatePaymentIntent(request: Request) {
           phoneNumber: validatedBody.phoneNumber,
           providerId: provider.id,
           status: 'pending',
-          metadata: JSON.stringify(validatedBody.metadata ?? {}),
+          metadata: JSON.stringify(intentMetadata),
         },
       })
     } catch (e: any) {
@@ -415,32 +424,35 @@ export async function handleCreatePaymentIntent(request: Request) {
     const finalFailure = (updatedIntent as any)?.failureReason || null
     const finalProviderId = (updatedIntent as any)?.providerPaymentId || null
 
-    // If LivePay failed to send PIN (e.g. invalid phone/account), surface it
-    // so SACCO 200 doesn't look like success with no PIN. Kunity logs 200 but
-    // user never gets prompt because gateway silently stored failed.
+    // Surface provider rejection with an explicit non-2xx status so partner apps
+    // never display a fake "waiting for PIN prompt" screen when no PIN was sent.
     if (finalStatus === 'failed') {
-      console.error(`[payments] LivePay failed for ${reference} phone=${String(validatedBody.phoneNumber).slice(0,4)}**** reason=${finalFailure}`)
+      console.error(`[payments] LivePay failed for ${reference} source=${credentialSource} phone=${String(validatedBody.phoneNumber).slice(0,4)}**** reason=${finalFailure}`)
       return NextResponse.json(
         {
+          error: finalFailure
+            ? `Payment provider rejected collection: ${finalFailure}`
+            : 'Payment provider rejected collection request.',
           paymentId: paymentIntent.id,
           reference: paymentIntent.reference,
           status: finalStatus,
+          credentialSource,
           failureReason: finalFailure,
           providerPaymentId: finalProviderId,
-          hint: 'PIN not sent — check phone format (2567..., 12 digits), LivePay account, and NEXTAUTH_URL webhook',
+          hint: 'PIN not sent — verify SACCO LivePay Account Number + API Key in Setup and phone number.',
         },
-        { status: 200 } // keep 200 so SACCO doesn't treat as gateway 500, but include failureReason
+        { status: 422 }
       )
     }
 
-    // Log success/processing for ops — helps debug 200 but no PIN (check Vercel logs for [LivePay] collect-money)
-    console.log(`[payments] Created ${reference} status=${finalStatus} provider=${provider.code} providerPaymentId=${finalProviderId || 'none'} webhook=${webhookUrl}`)
+    console.log(`[payments] Created ${reference} status=${finalStatus} provider=${provider.code} credentialSource=${credentialSource} providerPaymentId=${finalProviderId || 'none'} webhook=${webhookUrl}`)
 
     return NextResponse.json(
       {
         paymentId: paymentIntent.id,
         reference: paymentIntent.reference,
         status: finalStatus,
+        credentialSource,
         providerPaymentId: finalProviderId,
         failureReason: finalFailure,
       },
