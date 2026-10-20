@@ -448,6 +448,37 @@ export default function SetupPage() {
     }
   }
 
+  async function handleTestTenantPin(tenantCode: string, tenantName?: string) {
+    const phone = window.prompt(
+      `Enter Ugandan Mobile Money number to test PIN prompt for "${tenantName || tenantCode}":`,
+      '07'
+    )
+    if (!phone || !phone.trim()) return
+    try {
+      setStatusMessage({
+        type: 'success',
+        text: `Sending UGX 1,000 test PIN prompt via "${tenantName || tenantCode}" credentials...`,
+      })
+      const res = await fetch(
+        `/api/debug/livepay-ping?tenantCode=${encodeURIComponent(tenantCode)}&phone=${encodeURIComponent(phone.trim())}&amount=1000`
+      )
+      const data = await res.json()
+      if (res.ok && data.ok) {
+        setStatusMessage({
+          type: 'success',
+          text: `PIN prompt sent via ${data.credentialSource} account (${data.livepayAccount}) — check ${phone.trim()} for USSD prompt!`,
+        })
+      } else {
+        setStatusMessage({
+          type: 'error',
+          text: `PIN test failed (source: ${data.credentialSource || 'unknown'}, account: ${data.livepayAccount || 'N/A'}): ${data.result?.failureReason || data.error || 'Unknown error'}`,
+        })
+      }
+    } catch (err: any) {
+      setStatusMessage({ type: 'error', text: err.message || 'Error testing LivePay PIN prompt' })
+    }
+  }
+
   function resetConfigForm() {
     setEditingConfigId(null)
     setConfigTenantId('')
@@ -1165,6 +1196,16 @@ export default function SetupPage() {
                             </div>
 
                             <div className="flex items-center gap-2">
+                              {cfg.tenant?.code && (
+                                <Button
+                                  size="sm"
+                                  variant="secondary"
+                                  className="h-8 text-xs gap-1"
+                                  onClick={() => handleTestTenantPin(cfg.tenant!.code, cfg.tenant?.name)}
+                                >
+                                  <ArrowRight className="w-3.5 h-3.5" /> Test PIN
+                                </Button>
+                              )}
                               <Button
                                 size="sm"
                                 variant="outline"

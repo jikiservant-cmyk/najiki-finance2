@@ -6,6 +6,7 @@ import Module from 'node:module'
 import ts from 'typescript'
 import { isPlatformFeeType, resolvePartnerWebhookUrl } from '../src/lib/constants.ts'
 import { parseTenantProviderCredentials } from '../src/lib/payment-security.ts'
+import { normalizePhone } from '../src/lib/phone.ts'
 
 function loadTsModule<T>(relPath: string, stubs: Record<string, unknown> = {}): T {
   const file = path.resolve(relPath)
@@ -238,5 +239,163 @@ test('resolvePartnerWebhookUrl self-heals legacy sacco webhook path while preser
       webhookPath: '/api/internal/payment-completed',
     }),
     'https://church.example.org/api/internal/payment-completed'
+  )
+})
+
+test('SACCO credentials saved without optional webhookSecret load directly and never overwrite tenant_provider_configs', async () => {
+  let deleteCalledWith: any = null
+  const tenantCredsMod = loadTsModule<{
+    loadTenantProviderCredentials: (tenantId: string, providerId: string) => Promise<any>
+    resolveTenantOrPlatformCredentials: (
+      tenantId: string,
+      providerId: string,
+      tenantCode?: string | null
+    ) => Promise<{ source: string; credentials: any } | null>
+  }>('src/lib/tenant-credentials.ts', {
+    './db': {
+      db: {
+        tenantProviderConfig: {
+          findFirst: async () => ({
+            id: 'auto-row-1',
+            credentialsRef: 'LIVEPAY_AUTO_OLD',
+            configJson: {
+              apiKey: 'stale-auto-key',
+              accountNo: 'STALE_ACC',
+              webhookSecret: 'stale-webhook-secret-1234',
+            },
+          }),
+          findMany: async () => [
+            {
+              id: 'sacco-row-real',
+              credentialsRef: null,
+              configJson: {
+                _encrypted: JSON.stringify({
+                  apiKey: 'Bearer "lp_live_sacco_real_key"',
+                  accountNo: ' "SACCO_ACC_999" ',
+                  webhookSecret: '', // left blank in Setup UI ("Webhook Secret (Optional)")
+                  baseUrl: 'https://livepay.me/',
+                }),
+              },
+            },
+          ],
+          delete: async (args: any) => {
+            deleteCalledWith = args
+            return {}
+          },
+        },
+      },
+    },
+    './encryption': {
+      decrypt: (s: string) => s,
+    },
+    './payment-security': { parseTenantProviderCredentials },
+  })
+
+  const resolved = await tenantCredsMod.resolveTenantOrPlatformCredentials('tenant-1', 'prov-1', 'k-unity-sacco')
+  assert.equal(resolved?.source, 'tenant')
+  assert.equal(resolved?.credentials?.apiKey, 'lp_live_sacco_real_key')
+  assert.equal(resolved?.credentials?.accountNo, 'SACCO_ACC_999')
+  assert.equal(resolved?.credentials?.baseUrl, 'https://livepay.me')
+  assert.equal(resolved?.credentials?.webhookSecret.length >= 16, true)
+  assert.deepEqual(deleteCalledWith, { where: { id: 'auto-row-1' } })
+})
+
+test('LivePayProvider normalizes member 07XXXXXXXX deposit phone numbers to 2567XXXXXXXX like BUY_SMS', async () => {
+  const { LivePayProvider } = loadTsModule<{ LivePayProvider: any }>('src/lib/providers/livepay.ts', {
+    '@/lib/phone': { normalizePhone },
+  })
+
+  let capturedBody: any = null
+  let capturedAuthHeader: string | null = null
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (_url: any, init: any) => {
+    capturedAuthHeader = init?.headers?.Authorization ?? null
+    capturedBody = JSON.parse(init.body)
+    return new Response(
+      JSON.stringify({ success: true, internal_reference: 'LP-TX-001' }),
+      { status: 200, headers: { 'content-type': 'application/json' } }
+    )
+  }
+
+  try {
+    const provider = new LivePayProvider({
+      apiKey: 'Bearer lp_live_sacco_key',
+      accountNo: 'SACCO_ACC_999',
+      webhookSecret: 'lpwhsec_0123456789abcdef',
+      baseUrl: 'https://livepay.me/',
+    })
+
+    const res = await provider.initiatePayment({
+      amount: 5000,
+      currency: 'UGX',
+      phoneNumber: '0772123456',
+      reference: 'SACCO-DEP-TEST-001',
+      description: 'Member deposit',
+    })
+
+    assert.equal(res.success, true)
+    assert.equal(res.status, 'processing')
+    assert.equal(capturedAuthHeader, 'Bearer lp_live_sacco_key')
+    assert.equal(capturedBody.accountNumber, 'SACCO_ACC_999')
+    assert.equal(capturedBody.phoneNumber, '256772123456')
+    assert.equal(capturedBody.amount, 5000)
+    assert.equal(capturedBody.currency, 'UGX')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('matchTenantCandidate and isAuthorizedTenantPoll handle exact codes, slugs, and single-SACCO UUID bridges without cross-tenant leaks', () => {
+  const resolution = loadTsModule<{
+    matchTenantCandidate: (tenants: any[], code?: string | null) => any
+    isAuthorizedTenantPoll: (params: any) => boolean
+  }>('src/lib/tenant-resolution.ts', {
+    './db': { db: {} },
+  })
+
+  const singleTenant = [
+    { id: 'cm_tenant_1', code: 'k-unity-sacco', name: 'K-Unity SACCO', defaultProviderId: null },
+  ]
+  const multiTenants = [
+    ...singleTenant,
+    { id: 'cm_tenant_2', code: 'st-jude-sacco', name: 'St Jude SACCO', defaultProviderId: null },
+  ]
+
+  // Single-tenant SACCO: bridges Kunity organization UUID and slug variations
+  assert.equal(
+    resolution.matchTenantCandidate(singleTenant, '550e8400-e29b-41d4-a716-446655440000')?.matchedBy,
+    'single-tenant-org-uuid'
+  )
+  assert.equal(
+    resolution.matchTenantCandidate(singleTenant, 'k_unity_sacco')?.tenant.id,
+    'cm_tenant_1'
+  )
+
+  // Multi-tenant SACCO: matches slug/id accurately, refuses unknown UUID cross-tenant fallback
+  assert.equal(
+    resolution.matchTenantCandidate(multiTenants, 'st_jude_sacco')?.tenant.id,
+    'cm_tenant_2'
+  )
+  assert.equal(
+    resolution.matchTenantCandidate(multiTenants, '550e8400-e29b-41d4-a716-446655440000'),
+    null
+  )
+
+  // Poll authorization mirrors creation rules while blocking cross-tenant snooping
+  assert.equal(
+    resolution.isAuthorizedTenantPoll({
+      intentTenant: singleTenant[0],
+      requestedTenantCode: '550e8400-e29b-41d4-a716-446655440000',
+      activeTenantCount: 1,
+    }),
+    true
+  )
+  assert.equal(
+    resolution.isAuthorizedTenantPoll({
+      intentTenant: multiTenants[0],
+      requestedTenantCode: 'st-jude-sacco',
+      activeTenantCount: 2,
+    }),
+    false
   )
 })

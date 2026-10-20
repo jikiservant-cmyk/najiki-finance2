@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server'
 import { requireSuperAdmin } from '@/lib/auth'
 import { getPaymentProvider } from '@/lib/providers'
-import { loadTenantProviderCredentials } from '@/lib/tenant-credentials'
+import { resolveTenantOrPlatformCredentials } from '@/lib/tenant-credentials'
+import { resolveTenantForApplication } from '@/lib/tenant-resolution'
 import { db } from '@/lib/db'
 
 export const dynamic = 'force-dynamic'
@@ -37,33 +38,34 @@ export async function GET(request: Request) {
     const app = await db.application.findFirst({ where: { code: 'sacco', isActive: true } })
     if (!app) return NextResponse.json({ error: 'No active sacco application found', hint: 'Seed DB or create via /setup' }, { status: 404 })
 
-    let tenant: Awaited<ReturnType<typeof db.tenant.findFirst>> = null
-    if (tenantCode) {
-      tenant = await db.tenant.findFirst({ where: { applicationId: app.id, code: tenantCode, isActive: true } })
-      if (!tenant) return NextResponse.json({ error: `Tenant ${tenantCode} not found for sacco`, available: (await db.tenant.findMany({ where: { applicationId: app.id }, select: { code: true } })).map(t=>t.code) }, { status: 404 })
-    } else {
-      const all = await db.tenant.findMany({ where: { applicationId: app.id, isActive: true } })
-      if (all.length === 1) tenant = all[0]
-      else return NextResponse.json({ error: 'tenantCode required for multi-tenant sacco', tenants: all.map(t=>t.code) }, { status: 400 })
+    const tenantLookup = await resolveTenantForApplication(app.id, tenantCode)
+    const tenant = tenantLookup.resolved?.tenant ?? null
+    if (!tenant) {
+      return NextResponse.json(
+        {
+          error: tenantCode
+            ? `Tenant "${tenantCode}" not found for sacco`
+            : 'tenantCode required for multi-tenant sacco',
+          available: tenantLookup.tenants.map((t) => t.code),
+        },
+        { status: tenantCode ? 404 : 400 }
+      )
     }
 
     const livepayProvider = await db.provider.findFirst({ where: { code: 'livepay', isActive: true } })
     if (!livepayProvider) return NextResponse.json({ error: 'LivePay provider not active', hint: 'Check providers table' }, { status: 503 })
 
-    // Try tenant creds first, then platform env
-    let creds: any = null
-    try { creds = await loadTenantProviderCredentials(tenant.id, livepayProvider.id) } catch {}
-    const platformHas = !!process.env.LIVEPAY_API_KEY && !!process.env.LIVEPAY_ACCOUNT_NO && (process.env.LIVEPAY_WEBHOOK_SECRET||'').length >= 16
-    const source = creds ? 'tenant' : (platformHas ? 'platform-env' : 'none')
+    // Resolve using the exact same credential loader used by POST /api/payments
+    const resolved = await resolveTenantOrPlatformCredentials(tenant.id, livepayProvider.id, tenant.code)
 
-    if (!creds && !platformHas) {
+    if (!resolved) {
       return NextResponse.json({
         error: `No LivePay credentials for tenant ${tenant.code}`,
-        hint: 'Configure in Setup → tenant_provider_configs or set LIVEPAY_API_KEY/ACCOUNT_NO/WEBHOOK_SECRET in Vercel',
+        hint: 'Configure in Setup → tenant_provider_configs or set LIVEPAY_API_KEY/ACCOUNT_NO in Netlify',
         env: {
           hasApiKey: !!process.env.LIVEPAY_API_KEY,
           hasAccountNo: !!process.env.LIVEPAY_ACCOUNT_NO,
-          hasWebhookSecret: (process.env.LIVEPAY_WEBHOOK_SECRET||'').length >= 16,
+          hasWebhookSecret: (process.env.LIVEPAY_WEBHOOK_SECRET || '').length >= 16,
           baseUrl: process.env.LIVEPAY_BASE_URL || 'https://livepay.me',
           nextAuthUrl: process.env.NEXTAUTH_URL || 'NOT SET (will fallback to host)',
         },
@@ -72,7 +74,9 @@ export async function GET(request: Request) {
       }, { status: 503 })
     }
 
-    const provider = getPaymentProvider('livepay', creds || undefined)
+    const creds = resolved.credentials
+    const source = resolved.source
+    const provider = getPaymentProvider('livepay', creds)
 
     // Dry-run: we actually call LivePay collect-money — this WILL trigger PIN if phone is real
     // Use small amount to avoid charging; LivePay will still validate account/phone
