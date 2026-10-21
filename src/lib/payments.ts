@@ -75,6 +75,29 @@ export async function processPayment(data: {
       webhookUrl,
     })
 
+    const isTerminalOnInitiate =
+      providerResponse.status === 'success' || providerResponse.status === 'failed'
+    const initiateWebhookUrl = payment ? resolvePartnerWebhookUrl(payment.application) : webhookUrl
+    const initiatePaymentType =
+      payment?.paymentType?.code ?? (metaObj?.paymentTypeCode as string | undefined) ?? null
+    const initiateNotifPayload = payment
+      ? {
+          paymentIntentId,
+          reference,
+          status: providerResponse.status,
+          amount: Number(amount),
+          currency,
+          providerPaymentId: providerResponse.providerPaymentId || '',
+          failureReason: providerResponse.failureReason || null,
+          externalEntityId: payment.externalEntityId,
+          tenantId: payment.tenantId ?? null,
+          tenantCode: payment.tenant?.code ?? null,
+          paymentType: initiatePaymentType,
+          paymentTypeCode: initiatePaymentType,
+          metadata: safeJsonObject(payment.metadata),
+        }
+      : null
+
     await db.$transaction([
       db.paymentIntent.update({
         where: { id: paymentIntentId },
@@ -93,27 +116,43 @@ export async function processPayment(data: {
           note: `PAYMENT_INITIATED | Webhook URL: ${webhookUrl}`,
         },
       }),
+      ...(isTerminalOnInitiate && payment && initiateNotifPayload
+        ? [
+            db.internalNotification.create({
+              data: {
+                paymentIntentId,
+                applicationId: payment.applicationId,
+                url: initiateWebhookUrl,
+                payload: JSON.stringify(initiateNotifPayload),
+                status: 'pending',
+                attemptCount: 0,
+                maxAttempts: 5,
+                nextRetryAt: new Date(),
+              },
+            }),
+          ]
+        : []),
     ])
 
-    if (providerResponse.status === 'success' || providerResponse.status === 'failed') {
-      if (payment) {
-        await enqueueWebhookNotification({
-          paymentIntentId,
-          reference,
-          status: providerResponse.status,
-          amount,
-          currency,
-          providerPaymentId: providerResponse.providerPaymentId || '',
-          failureReason: providerResponse.failureReason,
-          applicationId: payment.applicationId,
-          webhookUrl: resolvePartnerWebhookUrl(payment.application),
-          webhookSecret: webhookSecretFromRow(payment.application),
-          externalEntityId: payment.externalEntityId,
-          tenantId: payment.tenantId ?? null,
-          tenantCode: payment.tenant?.code ?? null,
-          metadata: safeJsonObject(payment.metadata),
-        })
-      }
+    if (isTerminalOnInitiate && payment) {
+      await enqueueWebhookNotification({
+        paymentIntentId,
+        reference,
+        status: providerResponse.status,
+        amount,
+        currency,
+        providerPaymentId: providerResponse.providerPaymentId || '',
+        failureReason: providerResponse.failureReason,
+        applicationId: payment.applicationId,
+        webhookUrl: initiateWebhookUrl,
+        webhookSecret: webhookSecretFromRow(payment.application),
+        fallbackWebhookSecret: payment.application.apiKey ?? null,
+        externalEntityId: payment.externalEntityId,
+        tenantId: payment.tenantId ?? null,
+        tenantCode: payment.tenant?.code ?? null,
+        paymentTypeCode: initiatePaymentType,
+        metadata: safeJsonObject(payment.metadata),
+      })
     }
   } catch (err: any) {
     console.error(`processPayment error for ${paymentIntentId}:`, err)
@@ -266,6 +305,10 @@ export async function completePayment(data: {
     // P0-7: Write outbound notification ledger record in the transaction
     if (status === 'success' || status === 'failed') {
       const webhookUrl = resolvePartnerWebhookUrl(fullPaymentIntent.application)
+      const resolvedPaymentTypeCode =
+        fullPaymentIntent.paymentType?.code ??
+        (intentMeta?.paymentTypeCode as string | undefined) ??
+        null
       const notificationPayload = {
         paymentIntentId,
         reference: fullPaymentIntent.reference,
@@ -277,6 +320,8 @@ export async function completePayment(data: {
         externalEntityId: fullPaymentIntent.externalEntityId,
         tenantId: fullPaymentIntent.tenantId,
         tenantCode: fullPaymentIntent.tenant?.code ?? null,
+        paymentType: resolvedPaymentTypeCode,
+        paymentTypeCode: resolvedPaymentTypeCode,
         metadata: safeJsonObject(fullPaymentIntent.metadata),
       }
 
@@ -417,50 +462,105 @@ export async function recordNotificationFailure(
   }
 }
 
+async function postSignedPartnerWebhook(opts: {
+  url: string
+  payloadString: string
+  primarySecret: string | null | undefined
+  fallbackSecret?: string | null | undefined
+}): Promise<{ ok: boolean; status: number; bodyText: string; usedUrl: string }> {
+  const sendOnce = async (targetUrl: string, secret: string | null | undefined) => {
+    const headers = buildNotificationHeaders(secret, opts.payloadString)
+    const res = await safeFetch(targetUrl, {
+      method: 'POST',
+      headers,
+      body: opts.payloadString,
+      signal: AbortSignal.timeout(10_000),
+    })
+    const bodyText = res.ok ? '' : await res.text().catch(() => '')
+    return { ok: res.ok, status: res.status, bodyText, usedUrl: targetUrl }
+  }
+
+  let targetUrl = opts.url
+  let attempt = await sendOnce(targetUrl, opts.primarySecret)
+
+  // Self-heal legacy `/api/internal/payment-completed` path if partner app
+  // exposes `/api/webhooks/najiki` instead (e.g. ChurchOS / Kunity).
+  if (
+    !attempt.ok &&
+    (attempt.status === 404 || attempt.status === 405) &&
+    /\/api\/internal\/payment-completed\/?$/i.test(targetUrl)
+  ) {
+    const healedUrl = targetUrl.replace(/\/api\/internal\/payment-completed\/?$/i, '/api/webhooks/najiki')
+    await validateSafeUrl(healedUrl)
+    targetUrl = healedUrl
+    attempt = await sendOnce(targetUrl, opts.primarySecret)
+  }
+
+  // Partner verifiers fall back to `NAJIKI_API_KEY` when `NAJIKI_WEBHOOK_SECRET`
+  // has not been set in their deployment env. If the dedicated secret received
+  // 401/403 and we hold the verified application key, sign with it immediately.
+  if (
+    !attempt.ok &&
+    (attempt.status === 401 || attempt.status === 403) &&
+    opts.fallbackSecret &&
+    opts.fallbackSecret !== opts.primarySecret
+  ) {
+    console.warn(
+      `[Webhook] Primary webhook secret rejected (${attempt.status}) at ${targetUrl}; retrying with application fallback secret.`
+    )
+    attempt = await sendOnce(targetUrl, opts.fallbackSecret)
+  }
+
+  return attempt
+}
+
 /**
  * Deliver a single queued InternalNotification row (used by the cron retry
- * worker). Returns whether the delivery succeeded.
+ * worker and live reconciliation). Returns whether the delivery succeeded.
  */
-export async function deliverQueuedNotification(row: {
-  id: string
-  url: string
-  payload: string
-  applicationId: string
-}): Promise<{ success: boolean; error?: string; statusCode?: number }> {
+export async function deliverQueuedNotification(
+  row: {
+    id: string
+    url: string
+    payload: string
+    applicationId: string
+  },
+  opts: { fallbackSecret?: string | null } = {}
+): Promise<{ success: boolean; error?: string; statusCode?: number }> {
   const application = await db.application.findUnique({
     where: { id: row.applicationId },
-    select: { apiKey: true, webhookSecretEncrypted: true },
+    select: { code: true, baseUrl: true, webhookPath: true, apiKey: true, webhookSecretEncrypted: true },
   })
 
+  const effectiveUrl = application ? resolvePartnerWebhookUrl(application) : row.url
+
   try {
-    await validateSafeUrl(row.url)
+    await validateSafeUrl(effectiveUrl)
   } catch (urlErr: any) {
     return { success: false, error: `Unsafe webhook URL: ${urlErr?.message}`, statusCode: 0 }
   }
 
-  // The signing secret, not the API key: they are separate credentials, so
-  // recovering one does not compromise the other.
-  const headers = buildNotificationHeaders(application ? webhookSecretFromRow(application) : null, row.payload)
+  const primarySecret = application ? webhookSecretFromRow(application) : null
+  const fallbackSecret = opts.fallbackSecret || application?.apiKey || null
 
   try {
-    const res = await safeFetch(row.url, {
-      method: 'POST',
-      headers,
-      body: row.payload,
-      signal: AbortSignal.timeout(10_000),
+    const res = await postSignedPartnerWebhook({
+      url: effectiveUrl,
+      payloadString: row.payload,
+      primarySecret,
+      fallbackSecret,
     })
 
     if (res.ok) {
       return { success: true, statusCode: res.status }
     }
 
-    const body = await res.text().catch(() => '')
     // 4xx responses (except 408/429) are permanent — retrying won't help.
     const permanent = isPermanentHttpFailure(res.status)
     return {
       success: false,
       statusCode: res.status,
-      error: `HTTP ${res.status}${body ? `: ${body.slice(0, 300)}` : ''}${permanent ? ' (permanent)' : ''}`,
+      error: `HTTP ${res.status}${res.bodyText ? `: ${res.bodyText.slice(0, 300)}` : ''}${permanent ? ' (permanent)' : ''}`,
     }
   } catch (err: any) {
     return {
@@ -482,10 +582,13 @@ export async function enqueueWebhookNotification(data: {
   webhookUrl: string
   /** Outbound signing secret — see `webhookSecretFromRow`. */
   webhookSecret: string | null
+  /** Optional secondary secret (verified application API key) if partner uses legacy verifier fallback. */
+  fallbackWebhookSecret?: string | null
   externalEntityId?: string | null
   /** Tenant attribution, so partners can credit the right tenant (pen-test F-D). */
   tenantId?: string | null
   tenantCode?: string | null
+  paymentTypeCode?: string | null
   metadata: any
 }) {
   // P1-4: Reject SSRF / private targets before enqueuing or delivering
@@ -500,6 +603,9 @@ export async function enqueueWebhookNotification(data: {
     return
   }
 
+  const resolvedPaymentType =
+    data.paymentTypeCode ?? (data.metadata?.paymentTypeCode as string | undefined) ?? null
+
   const payloadObject = {
     paymentIntentId: data.paymentIntentId,
     reference: data.reference,
@@ -507,70 +613,85 @@ export async function enqueueWebhookNotification(data: {
     amount: data.amount,
     currency: data.currency,
     providerPaymentId: data.providerPaymentId,
-    failureReason: data.failureReason,
-    externalEntityId: data.externalEntityId,
+    failureReason: data.failureReason ?? null,
+    externalEntityId: data.externalEntityId ?? null,
     tenantId: data.tenantId ?? null,
     tenantCode: data.tenantCode ?? null,
-    metadata: data.metadata,
+    paymentType: resolvedPaymentType,
+    paymentTypeCode: resolvedPaymentType,
+    metadata: data.metadata ?? {},
   }
 
   const payloadString = JSON.stringify(payloadObject)
 
-  // P1-5: Replay protection with timestamped signature. Built by the shared
-  // helper rather than inline — the two copies had already drifted apart, and
-  // a signature only one of them could produce is a partner-side outage.
-  const headers = buildNotificationHeaders(data.webhookSecret, payloadString)
-
-  // 1. Primary path: Use Upstash QStash with 5 automatic retries and exponential backoff
-  try {
-    const client = getQStashClient()
-    if (client) {
-      await client.publishJSON({
-        url: data.webhookUrl,
-        body: payloadObject,
-        headers,
-        retries: 5, // QStash native retries with exponential backoff
-      })
-      console.log(`[QStash] Webhook successfully enqueued for ${data.webhookUrl}`)
-      // QStash owns delivery + retries from here. Recorded as 'dispatched',
-      // NOT 'delivered': we have no delivery receipt, and previously marking
-      // these delivered made the dashboard green while a partner could have
-      // received nothing at all. `recordNotificationDispatched` also stops our
-      // own cron from retrying it a second time.
-      await recordNotificationDispatched(data.paymentIntentId)
-      return
-    } else {
-      console.warn('[QStash] QSTASH_TOKEN not configured, using direct safeFetch fallback.')
-    }
-  } catch (err: any) {
-    console.error('[QStash] Failed to enqueue webhook via QStash, falling back to direct dispatch:', err)
-  }
-
-  // 2. Resilient fallback: Direct delivery via safeFetch (with SSRF protection & placeholder prevention)
+  // 1. Primary path: Deliver synchronously via safeFetch first so partner wallets
+  // (e.g. Kunity savings & SMS balances) settle sub-second with an exact HMAC
+  // signature and fresh timestamp, before returning from polling/webhook routes.
   try {
     console.log(`[Webhook] Delivering directly via safeFetch to ${data.webhookUrl}...`)
-    const res = await safeFetch(data.webhookUrl, {
-      method: 'POST',
-      headers,
-      body: payloadString,
-      signal: AbortSignal.timeout(10_000),
+    const res = await postSignedPartnerWebhook({
+      url: data.webhookUrl,
+      payloadString,
+      primarySecret: data.webhookSecret,
+      fallbackSecret: data.fallbackWebhookSecret,
     })
-    console.log(`[Webhook] Direct delivery response status: ${res.status}`)
+    console.log(`[Webhook] Direct delivery response status: ${res.status} (${res.usedUrl})`)
     if (res.ok) {
       await recordNotificationDelivered(data.paymentIntentId, res.status)
-    } else {
-      const body = await res.text().catch(() => '')
-      const permanent = isPermanentHttpFailure(res.status)
+      return
+    }
+
+    const permanent = isPermanentHttpFailure(res.status)
+    if (permanent) {
       await recordNotificationFailure(
         data.paymentIntentId,
-        `HTTP ${res.status}${body ? `: ${body.slice(0, 300)}` : ''}`,
-        { permanent, statusCode: res.status }
+        `HTTP ${res.status}${res.bodyText ? `: ${res.bodyText.slice(0, 300)}` : ''}`,
+        { permanent: true, statusCode: res.status }
       )
+      return
     }
+
+    // Transient HTTP failure (408 / 429 / 5xx) — try QStash background retry or cron backoff.
+    try {
+      const client = getQStashClient()
+      if (client) {
+        const headers = buildNotificationHeaders(data.webhookSecret, payloadString)
+        await client.publishJSON({
+          url: res.usedUrl,
+          body: payloadObject,
+          headers,
+          retries: 3,
+        })
+        await recordNotificationDispatched(data.paymentIntentId)
+        return
+      }
+    } catch (qstashErr) {
+      console.warn('[QStash] Fallback enqueue failed; using DB backoff worker:', qstashErr)
+    }
+
+    await recordNotificationFailure(
+      data.paymentIntentId,
+      `HTTP ${res.status}${res.bodyText ? `: ${res.bodyText.slice(0, 300)}` : ''}`,
+      { permanent: false, statusCode: res.status }
+    )
   } catch (directErr: any) {
     console.error('[Webhook] Direct safeFetch delivery error:', directErr)
-    // Transient error → schedule a backoff retry through the cron worker
-    // instead of dropping the notification on the floor.
+    try {
+      const client = getQStashClient()
+      if (client) {
+        const headers = buildNotificationHeaders(data.webhookSecret, payloadString)
+        await client.publishJSON({
+          url: data.webhookUrl,
+          body: payloadObject,
+          headers,
+          retries: 3,
+        })
+        await recordNotificationDispatched(data.paymentIntentId)
+        return
+      }
+    } catch (qstashErr) {
+      console.warn('[QStash] Fallback enqueue after network error failed:', qstashErr)
+    }
     await recordNotificationFailure(
       data.paymentIntentId,
       directErr instanceof Error ? directErr.message : 'Unknown direct delivery error'

@@ -1,14 +1,13 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { getPaymentProvider } from '@/lib/providers'
-import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
-import { resolveTenantOrPlatformCredentials } from '@/lib/tenant-credentials'
 import { isAuthorizedTenantPoll } from '@/lib/tenant-resolution'
-import { isConfirmedTerminalStatus } from '@/lib/payment-security'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
-import { isPlatformFeeType, resolvePartnerWebhookUrl } from '@/lib/constants'
-import { webhookSecretFromRow, findApplicationByApiKey } from '@/lib/application-auth'
+import { findApplicationByApiKey } from '@/lib/application-auth'
 import { safeJsonObject } from '@/lib/json'
+import {
+  flushPendingNotificationsForPayment,
+  reconcileSinglePaymentById,
+} from '@/lib/reconcile-payments'
 
 export const dynamic = 'force-dynamic'
 
@@ -124,89 +123,30 @@ export async function GET(
     let currentStatus = paymentIntent.status
     let currentFailureReason = paymentIntent.failureReason
     let completedAt = paymentIntent.completedAt
+    let currentProviderPaymentId = paymentIntent.providerPaymentId
 
-    // If still processing, poll the provider (throttled to max once every 5s so
-    // member deposits settle immediately after PIN confirmation even before inbound webhook retries)
-    if (paymentIntent.status === 'processing' && paymentIntent.provider?.code) {
-      const secondsSinceUpdate = (Date.now() - paymentIntent.updatedAt.getTime()) / 1000
-      
-      if (secondsSinceUpdate >= 5) {
+    if (paymentIntent.status === 'success' || paymentIntent.status === 'failed') {
+      await flushPendingNotificationsForPayment(paymentIntent.id, {
+        fallbackWebhookSecret: apiKey,
+      })
+    } else if (
+      (paymentIntent.status === 'processing' || paymentIntent.status === 'pending') &&
+      paymentIntent.provider?.code
+    ) {
+      const lastPollTime = paymentIntent.lastPolledAt?.getTime() ?? 0
+      const msSincePoll = Date.now() - lastPollTime
+
+      if (msSincePoll >= 2_500) {
         try {
-          // Pen-test finding (F-A): poll with the TENANT's own credentials for
-          // tenant-collected payments — the same rule the creation path, the
-          // webhook path and both cron pollers use. Polling a tenant's payment
-          // under the platform's account checks the wrong account.
-          let pollCredentials: any = undefined
-          const intentMeta = safeJsonObject(paymentIntent.metadata)
-          const isPlatformPayment = isPlatformFeeType(
-            paymentIntent.paymentType?.code ?? (intentMeta?.paymentTypeCode as string | undefined)
-          )
-          if (paymentIntent.tenantId && paymentIntent.providerId && !isPlatformPayment) {
-            const resolved = await resolveTenantOrPlatformCredentials(
-              paymentIntent.tenantId,
-              paymentIntent.providerId,
-              paymentIntent.tenant?.code
-            )
-            if (!resolved) {
-              // Keep the intent reconcilable; do not query an unconfigured account.
-              throw new Error(`Tenant credentials unavailable for payment ${paymentIntent.id}`)
-            }
-            pollCredentials = resolved.credentials
-          }
-          const providerClient = getPaymentProvider(paymentIntent.provider.code, pollCredentials)
-          if (providerClient.checkPaymentStatus) {
-            const statusResult = await providerClient.checkPaymentStatus(
-              paymentIntent.reference,
-              paymentIntent.currency,
-              paymentIntent.providerPaymentId || undefined
-            )
-
-            // If status changed to success or failed, update the DB
-            if (isConfirmedTerminalStatus(statusResult, {
-              amount: Number(paymentIntent.amount),
-              currency: paymentIntent.currency,
-              providerPaymentId: paymentIntent.providerPaymentId,
-            })) {
-              const { intent: updatedIntent, wasAlreadyProcessed } = await completePayment({
-                paymentIntentId: paymentIntent.id,
-                status: statusResult.status,
-                providerPaymentId: statusResult.providerPaymentId,
-                failureReason: statusResult.failureReason,
-                amount: Number(paymentIntent.amount),
-                currency: paymentIntent.currency,
-                rawProviderResponse: JSON.stringify(statusResult),
-                note: 'STATUS_SYNC_FROM_API',
-              })
-
-              if (!wasAlreadyProcessed) {
-                await enqueueWebhookNotification({
-                  paymentIntentId: paymentIntent.id,
-                  reference: paymentIntent.reference,
-                  status: statusResult.status,
-                  amount: Number(paymentIntent.amount),
-                  currency: paymentIntent.currency,
-                  providerPaymentId: statusResult.providerPaymentId || paymentIntent.providerPaymentId || '',
-                  failureReason: statusResult.failureReason,
-                  applicationId: application.id,
-                  webhookUrl: resolvePartnerWebhookUrl(application),
-                  webhookSecret: webhookSecretFromRow(application),
-                  externalEntityId: paymentIntent.externalEntityId,
-                  tenantId: paymentIntent.tenantId,
-                  tenantCode: paymentIntent.tenant?.code ?? null,
-                  metadata: safeJsonObject(paymentIntent.metadata),
-                })
-              }
-
-              currentStatus = updatedIntent.status
-              currentFailureReason = updatedIntent.failureReason
-              completedAt = updatedIntent.completedAt
-            } else {
-               // Just touch updatedAt to reset the 15s throttle
-               await db.paymentIntent.update({
-                 where: { id: paymentIntent.id },
-                 data: { updatedAt: new Date() }
-               })
-            }
+          const reconciled = await reconcileSinglePaymentById(paymentIntent.id, {
+            note: 'STATUS_SYNC_FROM_API',
+            fallbackWebhookSecret: apiKey,
+          })
+          if (reconciled) {
+            currentStatus = reconciled.status
+            currentFailureReason = reconciled.failureReason
+            completedAt = reconciled.completedAt
+            currentProviderPaymentId = reconciled.providerPaymentId
           }
         } catch (pollError) {
           console.error('[Payment API] Error polling provider status:', pollError)
@@ -223,7 +163,7 @@ export async function GET(
       phoneNumber:      paymentIntent.phoneNumber,
       externalEntityId: paymentIntent.externalEntityId,
       provider:         paymentIntent.provider,
-      providerPaymentId: paymentIntent.providerPaymentId,
+      providerPaymentId: currentProviderPaymentId,
       application:      paymentIntent.application,
       tenant:           paymentIntent.tenant,
       paymentType:      paymentIntent.paymentType,

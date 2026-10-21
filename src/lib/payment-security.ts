@@ -3,15 +3,28 @@ import type { PaymentStatusResponse, ProviderCredentials } from './providers/typ
 /** A provider transport/API error is never evidence that a payment failed. */
 export function isConfirmedTerminalStatus(
   result: PaymentStatusResponse | null | undefined,
-  expected?: { amount: number; currency: string; providerPaymentId?: string | null }
+  expected?: {
+    amount: number
+    currency: string
+    providerPaymentId?: string | null
+    reference?: string | null
+  }
 ): boolean {
   if (result?.success !== true || (result.status !== 'success' && result.status !== 'failed')) return false
   if (!expected) return true
   if (result.amount !== undefined &&
       (!Number.isFinite(Number(result.amount)) || Math.abs(Number(result.amount) - expected.amount) > 0.001)) return false
   if (result.currency && result.currency.toUpperCase() !== expected.currency.toUpperCase()) return false
-  if (expected.providerPaymentId && result.providerPaymentId &&
-      expected.providerPaymentId !== result.providerPaymentId) return false
+  const storedIdIsPlaceholderRef =
+    Boolean(expected.reference) && expected.providerPaymentId === expected.reference
+  if (
+    expected.providerPaymentId &&
+    !storedIdIsPlaceholderRef &&
+    result.providerPaymentId &&
+    expected.providerPaymentId !== result.providerPaymentId
+  ) {
+    return false
+  }
   return true
 }
 

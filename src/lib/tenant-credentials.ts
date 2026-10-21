@@ -114,10 +114,23 @@ export async function loadTenantProviderCredentials(
 
       if (!apiKey || !accountNo) continue
 
+      const platformApiKey = cleanApiKeyValue(process.env.LIVEPAY_API_KEY)
+      const platformAccountNo = cleanCredentialValue(
+        process.env.LIVEPAY_ACCOUNT_NO || process.env.LIVEPAY_ACCOUNT_NUMBER
+      )
+      const platformWebhookSecret = cleanCredentialValue(
+        process.env.LIVEPAY_WEBHOOK_SECRET || process.env.LIVEPAY_SECRET_KEY
+      )
+      const matchesPlatformAccount =
+        (Boolean(platformApiKey) && apiKey === platformApiKey) ||
+        (Boolean(platformAccountNo) && accountNo === platformAccountNo)
+
       const webhookSecret =
         explicitSecret.length >= 16
           ? explicitSecret
-          : deriveTenantWebhookSecret(apiKey, tenantId, accountNo)
+          : matchesPlatformAccount && platformWebhookSecret.length >= 16
+            ? platformWebhookSecret
+            : deriveTenantWebhookSecret(apiKey, tenantId, accountNo)
 
       const parsed = parseTenantProviderCredentials({
         apiKey,

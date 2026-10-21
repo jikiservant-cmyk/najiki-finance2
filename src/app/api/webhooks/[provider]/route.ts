@@ -32,6 +32,10 @@ import { readTextWithLimit } from '@/lib/request-body'
 import { safeJsonObject } from '@/lib/json'
 import { decideWebhookLogAction } from '@/lib/webhook-dedupe'
 import { isPlatformFeeType, resolvePartnerWebhookUrl } from '@/lib/constants'
+import {
+  flushPendingNotificationsForPayment,
+  reconcileSinglePaymentById,
+} from '@/lib/reconcile-payments'
 
 /** Providers retry with at-least-once semantics; 64 KB is far above any real payload. */
 const MAX_WEBHOOK_BYTES = 64 * 1024
@@ -88,8 +92,16 @@ export async function POST(
       parsedBody = null
     }
 
+    const nestedData =
+      parsedBody?.data && typeof parsedBody.data === 'object'
+        ? (parsedBody.data as Record<string, unknown>)
+        : null
     const tentativeReference =
-      (parsedBody?.customer_reference as string) || (parsedBody?.reference as string) || null
+      (parsedBody?.customer_reference as string) ||
+      (parsedBody?.reference as string) ||
+      (nestedData?.customer_reference as string) ||
+      (nestedData?.reference as string) ||
+      null
 
     const provider = await db.provider.findFirst({
       where: { code: normalizedProvider, isActive: true },
@@ -100,10 +112,14 @@ export async function POST(
     }
 
     let customCredentials: any = undefined
+    let matchedIntentForWakeup: { id: string; status: string; lastPolledAt: Date | null } | null = null
     if (tentativeReference) {
       const intent = await db.paymentIntent.findUnique({
         where: { reference: tentativeReference },
         select: {
+          id: true,
+          status: true,
+          lastPolledAt: true,
           tenantId: true,
           providerId: true,
           metadata: true,
@@ -111,6 +127,13 @@ export async function POST(
           paymentType: { select: { code: true } },
         },
       })
+      if (intent) {
+        matchedIntentForWakeup = {
+          id: intent.id,
+          status: intent.status,
+          lastPolledAt: intent.lastPolledAt,
+        }
+      }
       const intentMeta = safeJsonObject(intent?.metadata)
       const isPlatformPayment = isPlatformFeeType(
         intent?.paymentType?.code ?? (intentMeta?.paymentTypeCode as string | undefined)
@@ -147,12 +170,30 @@ export async function POST(
 
     // ── 3. Verify BEFORE writing anything ──────────────────────────────────
     if (!isValidSignature) {
+      // Out-of-band authenticated verification: when a tenant saved API credentials
+      // in `/setup` without configuring `Webhook Secret`, never trust the unverified
+      // webhook body — instead query the provider directly using our own encrypted
+      // `apiKey` to verify whether the payment genuinely reached a terminal status.
+      if (
+        matchedIntentForWakeup &&
+        (matchedIntentForWakeup.status === 'processing' || matchedIntentForWakeup.status === 'pending') &&
+        Date.now() - (matchedIntentForWakeup.lastPolledAt?.getTime() ?? 0) >= 3_000
+      ) {
+        try {
+          const verified = await reconcileSinglePaymentById(matchedIntentForWakeup.id, {
+            note: 'WEBHOOK_WAKEUP_VERIFIED_BY_PROVIDER_POLL',
+          })
+          if (verified && (verified.status === 'success' || verified.status === 'failed')) {
+            return NextResponse.json({ success: true, verifiedViaProviderPoll: true })
+          }
+        } catch (wakeupErr) {
+          console.warn('[Webhook] Out-of-band provider verification check failed:', wakeupErr)
+        }
+      }
+
       console.warn(
         `[Webhook] Rejected ${normalizedProvider} delivery: signature verification failed (bodyHash=${rawBody.length}b)`
       )
-      // Intentionally NOT persisted: a caller who can write `processed` rows
-      // pre-verification can suppress the genuine delivery that follows.
-      // Rejected attempts are visible in logs and counted by the alerts worker.
       return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
     }
 
@@ -247,7 +288,12 @@ export async function POST(
 
     const fullPaymentIntent = await db.paymentIntent.findUnique({
       where: { id: paymentIntent.id },
-      include: { application: true, tenant: true, provider: { select: { code: true } } },
+      include: {
+        application: true,
+        tenant: true,
+        paymentType: true,
+        provider: { select: { code: true } },
+      },
     })
 
     if (!fullPaymentIntent) {
@@ -347,6 +393,9 @@ export async function POST(
         where: { id: webhookLog.id },
         data: { paymentIntentId: paymentIntent.id, processed: true },
       })
+      await flushPendingNotificationsForPayment(paymentIntent.id, {
+        fallbackWebhookSecret: fullPaymentIntent.application.apiKey ?? null,
+      })
       return NextResponse.json({ success: true, duplicate: true })
     }
 
@@ -370,6 +419,13 @@ export async function POST(
 
     // Create completion event for webhook delivery
     if (!wasAlreadyProcessed && (normalizedStatus === 'success' || normalizedStatus === 'failed')) {
+      const parsedMeta = (() => {
+        try {
+          return safeJsonObject(fullPaymentIntent.metadata)
+        } catch {
+          return {}
+        }
+      })()
       await enqueueWebhookNotification({
         paymentIntentId: paymentIntent.id,
         reference: paymentIntent.reference,
@@ -381,16 +437,15 @@ export async function POST(
         applicationId: fullPaymentIntent.applicationId,
         webhookUrl: resolvePartnerWebhookUrl(fullPaymentIntent.application),
         webhookSecret: webhookSecretFromRow(fullPaymentIntent.application),
+        fallbackWebhookSecret: fullPaymentIntent.application.apiKey ?? null,
         externalEntityId: fullPaymentIntent.externalEntityId,
         tenantId: fullPaymentIntent.tenantId,
         tenantCode: fullPaymentIntent.tenant?.code ?? null,
-        metadata: (() => {
-          try {
-            return safeJsonObject(fullPaymentIntent.metadata)
-          } catch {
-            return {}
-          }
-        })(),
+        paymentTypeCode:
+          fullPaymentIntent.paymentType?.code ??
+          (parsedMeta?.paymentTypeCode as string | undefined) ??
+          null,
+        metadata: parsedMeta,
       })
     }
 

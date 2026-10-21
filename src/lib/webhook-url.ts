@@ -14,6 +14,15 @@ export function buildSignatureUrlCandidates(request: Request): string[] {
   const configured = (process.env.NEXTAUTH_URL || '').replace(/\/+$/, '')
   if (configured) urls.push(`${configured}${path}`)
 
+  const publicBase = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '')
+  if (publicBase) urls.push(`${publicBase}${path}`)
+
+  const netlifySite = (process.env.URL || '').replace(/\/+$/, '')
+  if (netlifySite) urls.push(`${netlifySite}${path}`)
+
+  const netlifyPrime = (process.env.DEPLOY_PRIME_URL || '').replace(/\/+$/, '')
+  if (netlifyPrime) urls.push(`${netlifyPrime}${path}`)
+
   const vercel = (process.env.VERCEL_URL || '').replace(/\/+$/, '')
   if (vercel) urls.push(`https://${vercel}${path}`)
 

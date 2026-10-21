@@ -80,6 +80,7 @@ async function handleSync(request: Request) {
               amount: Number(payment.amount),
               currency: payment.currency,
               providerPaymentId: payment.providerPaymentId,
+              reference: payment.reference,
             })) {
             const completion = await completePayment({
               paymentIntentId: payment.id,
@@ -93,6 +94,10 @@ async function handleSync(request: Request) {
             })
 
             if (!completion.wasAlreadyProcessed) {
+              const resolvedPaymentTypeCode =
+                payment.paymentType?.code ??
+                (intentMeta?.paymentTypeCode as string | undefined) ??
+                null
               await enqueueWebhookNotification({
                 paymentIntentId: payment.id,
                 reference: payment.reference,
@@ -104,10 +109,12 @@ async function handleSync(request: Request) {
                 applicationId: payment.applicationId,
                 webhookUrl: resolvePartnerWebhookUrl(payment.application),
                 webhookSecret: webhookSecretFromRow(payment.application),
+                fallbackWebhookSecret: payment.application.apiKey ?? null,
                 externalEntityId: payment.externalEntityId,
                 tenantId: payment.tenantId,
                 tenantCode: payment.tenant?.code ?? null,
-                metadata: safeJsonObject(payment.metadata),
+                paymentTypeCode: resolvedPaymentTypeCode,
+                metadata: intentMeta,
               })
             }
 
@@ -136,6 +143,10 @@ async function handleSync(request: Request) {
       { status: 500 }
     )
   }
+}
+
+export async function GET(request: Request) {
+  return handleSync(request)
 }
 
 export async function POST(request: Request) {
