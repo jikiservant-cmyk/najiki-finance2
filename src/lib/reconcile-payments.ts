@@ -10,15 +10,20 @@ import {
 import { resolveTenantOrPlatformCredentials } from './tenant-credentials'
 import { isConfirmedTerminalStatus } from './payment-security'
 import { isPlatformFeeType, resolvePartnerWebhookUrl } from './constants'
-import { webhookSecretFromRow } from './application-auth'
+import { fallbackSigningSecretsFromRow, webhookSecretFromRow } from './application-auth'
 import { safeJsonObject } from './json'
 
 export interface ReconcileSingleResult {
+  paymentIntentId?: string
+  reference?: string
   status: string
   failureReason: string | null
   completedAt: Date | null
   providerPaymentId: string | null
   transitioned: boolean
+  providerHttpStatus?: number
+  providerFailureReason?: string
+  rawProviderStatus?: unknown
 }
 
 /**
@@ -28,7 +33,7 @@ export interface ReconcileSingleResult {
  */
 export async function flushPendingNotificationsForPayment(
   paymentIntentId: string,
-  opts: { fallbackWebhookSecret?: string | null } = {}
+  opts: { fallbackWebhookSecret?: string | null; fallbackWebhookSecrets?: string[] } = {}
 ): Promise<number> {
   try {
     const rows = await db.internalNotification.findMany({
@@ -44,9 +49,14 @@ export async function flushPendingNotificationsForPayment(
     for (const row of rows) {
       const outcome = await deliverQueuedNotification(row, {
         fallbackSecret: opts.fallbackWebhookSecret ?? null,
+        fallbackSecrets: opts.fallbackWebhookSecrets,
       })
       if (outcome.success) {
-        await recordNotificationDelivered(paymentIntentId, outcome.statusCode ?? 200)
+        await recordNotificationDelivered(
+          paymentIntentId,
+          outcome.statusCode ?? 200,
+          outcome.responseBody
+        )
         delivered++
       } else {
         const permanent = Boolean(outcome.error?.includes('(permanent)'))
@@ -90,8 +100,11 @@ export async function reconcileSinglePaymentById(
   if (payment.status === 'success' || payment.status === 'failed') {
     await flushPendingNotificationsForPayment(payment.id, {
       fallbackWebhookSecret: opts.fallbackWebhookSecret ?? payment.application?.apiKey ?? null,
+      fallbackWebhookSecrets: fallbackSigningSecretsFromRow(payment.application),
     })
     return {
+      paymentIntentId: payment.id,
+      reference: payment.reference,
       status: payment.status,
       failureReason: payment.failureReason,
       completedAt: payment.completedAt,
@@ -190,6 +203,7 @@ export async function reconcileSinglePaymentById(
         webhookUrl: resolvePartnerWebhookUrl(payment.application),
         webhookSecret: webhookSecretFromRow(payment.application),
         fallbackWebhookSecret: opts.fallbackWebhookSecret ?? payment.application.apiKey ?? null,
+        fallbackWebhookSecrets: fallbackSigningSecretsFromRow(payment.application),
         externalEntityId: payment.externalEntityId,
         tenantId: payment.tenantId,
         tenantCode: payment.tenant?.code ?? null,
@@ -199,24 +213,35 @@ export async function reconcileSinglePaymentById(
     } else {
       await flushPendingNotificationsForPayment(payment.id, {
         fallbackWebhookSecret: opts.fallbackWebhookSecret ?? payment.application.apiKey ?? null,
+        fallbackWebhookSecrets: fallbackSigningSecretsFromRow(payment.application),
       })
     }
 
     return {
+      paymentIntentId: payment.id,
+      reference: payment.reference,
       status: completion.intent.status,
       failureReason: completion.intent.failureReason,
       completedAt: completion.intent.completedAt,
       providerPaymentId: completion.intent.providerPaymentId,
       transitioned: !completion.wasAlreadyProcessed,
+      providerHttpStatus: statusResult.httpStatus,
+      providerFailureReason: statusResult.failureReason,
+      rawProviderStatus: statusResult.raw ?? statusResult,
     }
   }
 
   return {
+    paymentIntentId: payment.id,
+    reference: payment.reference,
     status: payment.status,
     failureReason: payment.failureReason,
     completedAt: payment.completedAt,
     providerPaymentId: payment.providerPaymentId,
     transitioned: false,
+    providerHttpStatus: statusResult.httpStatus,
+    providerFailureReason: statusResult.failureReason,
+    rawProviderStatus: statusResult.raw ?? statusResult,
   }
 }
 
@@ -232,7 +257,12 @@ export async function reconcileProcessingPayments(
     minPollIntervalMs?: number
     budgetMs?: number
   } = {}
-): Promise<{ polled: number; transitioned: number; retriedNotifications: number }> {
+): Promise<{
+  polled: number
+  transitioned: number
+  retriedNotifications: number
+  details: ReconcileSingleResult[]
+}> {
   const limit = opts.limit ?? 12
   const minAgeMs = opts.minAgeMs ?? 5_000
   const minPollIntervalMs = opts.minPollIntervalMs ?? 10_000
@@ -242,6 +272,7 @@ export async function reconcileProcessingPayments(
   let polled = 0
   let transitioned = 0
   let retriedNotifications = 0
+  const details: ReconcileSingleResult[] = []
 
   try {
     const createdCutoff = new Date(Date.now() - minAgeMs)
@@ -252,7 +283,9 @@ export async function reconcileProcessingPayments(
       where: {
         status: { in: ['processing', 'pending'] },
         createdAt: { lte: createdCutoff, gte: fourteenDaysAgo },
-        OR: [{ lastPolledAt: null }, { lastPolledAt: { lte: pollCutoff } }],
+        ...(minPollIntervalMs > 0
+          ? { OR: [{ lastPolledAt: null }, { lastPolledAt: { lte: pollCutoff } }] }
+          : {}),
       },
       select: { id: true },
       orderBy: [{ lastPolledAt: { sort: 'asc', nulls: 'first' } }, { createdAt: 'desc' }],
@@ -266,7 +299,10 @@ export async function reconcileProcessingPayments(
         const res = await reconcileSinglePaymentById(item.id, {
           note: 'AUTO_RECONCILE_SWEEP',
         })
-        if (res?.transitioned) transitioned++
+        if (res) {
+          details.push(res)
+          if (res.transitioned) transitioned++
+        }
       } catch (itemErr) {
         console.warn(`[reconcile] Error polling ${item.id}:`, itemErr)
       }
@@ -288,7 +324,11 @@ export async function reconcileProcessingPayments(
         try {
           const outcome = await deliverQueuedNotification(row)
           if (outcome.success) {
-            await recordNotificationDelivered(row.paymentIntentId, outcome.statusCode ?? 200)
+            await recordNotificationDelivered(
+              row.paymentIntentId,
+              outcome.statusCode ?? 200,
+              outcome.responseBody
+            )
           } else {
             const permanent = Boolean(outcome.error?.includes('(permanent)'))
             await recordNotificationFailure(
@@ -306,5 +346,5 @@ export async function reconcileProcessingPayments(
     console.warn('[reconcile] Sweep warning:', err)
   }
 
-  return { polled, transitioned, retriedNotifications }
+  return { polled, transitioned, retriedNotifications, details }
 }

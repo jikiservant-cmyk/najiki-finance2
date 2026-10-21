@@ -3,7 +3,7 @@ import { getPaymentProvider } from './providers'
 import { resolveTenantOrPlatformCredentials } from './tenant-credentials'
 import { isPlatformFeeType, resolvePartnerWebhookUrl, appRequiresTenantCredentials } from './constants'
 import { toMinorUnits } from './money'
-import { webhookSecretFromRow } from './application-auth'
+import { fallbackSigningSecretsFromRow, webhookSecretFromRow } from './application-auth'
 import { safeJsonObject } from './json'
 
 export async function processPayment(data: {
@@ -393,7 +393,8 @@ export { buildNotificationHeaders }
  */
 export async function recordNotificationDelivered(
   paymentIntentId: string,
-  statusCode: number
+  statusCode: number,
+  responseBody?: string | null
 ): Promise<void> {
   await db.internalNotification.updateMany({
     where: { paymentIntentId, status: { in: ['pending', 'failed_retrying'] } },
@@ -401,7 +402,7 @@ export async function recordNotificationDelivered(
       status: 'delivered',
       lastAttemptAt: new Date(),
       lastResponseStatus: statusCode,
-      lastResponseBody: null,
+      lastResponseBody: responseBody ? responseBody.slice(0, 2000) : null,
     },
   })
 }
@@ -467,6 +468,7 @@ async function postSignedPartnerWebhook(opts: {
   payloadString: string
   primarySecret: string | null | undefined
   fallbackSecret?: string | null | undefined
+  fallbackSecrets?: Array<string | null | undefined>
 }): Promise<{ ok: boolean; status: number; bodyText: string; usedUrl: string }> {
   const sendOnce = async (targetUrl: string, secret: string | null | undefined) => {
     const headers = buildNotificationHeaders(secret, opts.payloadString)
@@ -476,7 +478,7 @@ async function postSignedPartnerWebhook(opts: {
       body: opts.payloadString,
       signal: AbortSignal.timeout(10_000),
     })
-    const bodyText = res.ok ? '' : await res.text().catch(() => '')
+    const bodyText = await res.text().catch(() => '')
     return { ok: res.ok, status: res.status, bodyText, usedUrl: targetUrl }
   }
 
@@ -496,19 +498,24 @@ async function postSignedPartnerWebhook(opts: {
     attempt = await sendOnce(targetUrl, opts.primarySecret)
   }
 
-  // Partner verifiers fall back to `NAJIKI_API_KEY` when `NAJIKI_WEBHOOK_SECRET`
-  // has not been set in their deployment env. If the dedicated secret received
-  // 401/403 and we hold the verified application key, sign with it immediately.
-  if (
-    !attempt.ok &&
-    (attempt.status === 401 || attempt.status === 403) &&
-    opts.fallbackSecret &&
-    opts.fallbackSecret !== opts.primarySecret
-  ) {
-    console.warn(
-      `[Webhook] Primary webhook secret rejected (${attempt.status}) at ${targetUrl}; retrying with application fallback secret.`
+  // Partner verifiers fall back to `NAJIKI_API_KEY` or `internalSecretRef` when
+  // `NAJIKI_WEBHOOK_SECRET` has not been set in their deployment env. Try each
+  // distinct candidate secret if the primary secret received 401/403.
+  if (!attempt.ok && (attempt.status === 401 || attempt.status === 403)) {
+    const tried = new Set<string>(opts.primarySecret ? [opts.primarySecret] : [])
+    const candidates = [opts.fallbackSecret, ...(opts.fallbackSecrets ?? [])].filter(
+      (s): s is string => typeof s === 'string' && s.trim().length > 0 && !tried.has(s)
     )
-    attempt = await sendOnce(targetUrl, opts.fallbackSecret)
+    for (const candidate of candidates) {
+      tried.add(candidate)
+      console.warn(
+        `[Webhook] Primary webhook secret rejected (${attempt.status}) at ${targetUrl}; retrying with application fallback secret.`
+      )
+      attempt = await sendOnce(targetUrl, candidate)
+      if (attempt.ok || (attempt.status !== 401 && attempt.status !== 403)) {
+        break
+      }
+    }
   }
 
   return attempt
@@ -525,11 +532,18 @@ export async function deliverQueuedNotification(
     payload: string
     applicationId: string
   },
-  opts: { fallbackSecret?: string | null } = {}
-): Promise<{ success: boolean; error?: string; statusCode?: number }> {
+  opts: { fallbackSecret?: string | null; fallbackSecrets?: string[] } = {}
+): Promise<{ success: boolean; error?: string; statusCode?: number; responseBody?: string }> {
   const application = await db.application.findUnique({
     where: { id: row.applicationId },
-    select: { code: true, baseUrl: true, webhookPath: true, apiKey: true, webhookSecretEncrypted: true },
+    select: {
+      code: true,
+      baseUrl: true,
+      webhookPath: true,
+      internalSecretRef: true,
+      apiKey: true,
+      webhookSecretEncrypted: true,
+    },
   })
 
   const effectiveUrl = application ? resolvePartnerWebhookUrl(application) : row.url
@@ -541,18 +555,22 @@ export async function deliverQueuedNotification(
   }
 
   const primarySecret = application ? webhookSecretFromRow(application) : null
-  const fallbackSecret = opts.fallbackSecret || application?.apiKey || null
+  const extraFallbacks = [
+    ...(opts.fallbackSecrets ?? []),
+    ...fallbackSigningSecretsFromRow(application),
+  ]
 
   try {
     const res = await postSignedPartnerWebhook({
       url: effectiveUrl,
       payloadString: row.payload,
       primarySecret,
-      fallbackSecret,
+      fallbackSecret: opts.fallbackSecret || application?.apiKey || null,
+      fallbackSecrets: extraFallbacks,
     })
 
     if (res.ok) {
-      return { success: true, statusCode: res.status }
+      return { success: true, statusCode: res.status, responseBody: res.bodyText }
     }
 
     // 4xx responses (except 408/429) are permanent — retrying won't help.
@@ -560,7 +578,8 @@ export async function deliverQueuedNotification(
     return {
       success: false,
       statusCode: res.status,
-      error: `HTTP ${res.status}${res.bodyText ? `: ${res.bodyText.slice(0, 300)}` : ''}${permanent ? ' (permanent)' : ''}`,
+      responseBody: res.bodyText,
+      error: `HTTP ${res.status}${res.bodyText ? `: ${res.bodyText.slice(0, 500)}` : ''}${permanent ? ' (permanent)' : ''}`,
     }
   } catch (err: any) {
     return {
@@ -584,6 +603,7 @@ export async function enqueueWebhookNotification(data: {
   webhookSecret: string | null
   /** Optional secondary secret (verified application API key) if partner uses legacy verifier fallback. */
   fallbackWebhookSecret?: string | null
+  fallbackWebhookSecrets?: string[]
   externalEntityId?: string | null
   /** Tenant attribution, so partners can credit the right tenant (pen-test F-D). */
   tenantId?: string | null
@@ -634,10 +654,11 @@ export async function enqueueWebhookNotification(data: {
       payloadString,
       primarySecret: data.webhookSecret,
       fallbackSecret: data.fallbackWebhookSecret,
+      fallbackSecrets: data.fallbackWebhookSecrets,
     })
     console.log(`[Webhook] Direct delivery response status: ${res.status} (${res.usedUrl})`)
     if (res.ok) {
-      await recordNotificationDelivered(data.paymentIntentId, res.status)
+      await recordNotificationDelivered(data.paymentIntentId, res.status, res.bodyText)
       return
     }
 
@@ -645,7 +666,7 @@ export async function enqueueWebhookNotification(data: {
     if (permanent) {
       await recordNotificationFailure(
         data.paymentIntentId,
-        `HTTP ${res.status}${res.bodyText ? `: ${res.bodyText.slice(0, 300)}` : ''}`,
+        `HTTP ${res.status}${res.bodyText ? `: ${res.bodyText.slice(0, 500)}` : ''}`,
         { permanent: true, statusCode: res.status }
       )
       return

@@ -71,7 +71,11 @@ async function handleRetry(request: Request) {
       })
 
       if (outcome.success) {
-        await recordNotificationDelivered(row.paymentIntentId, outcome.statusCode ?? 200)
+        await recordNotificationDelivered(
+          row.paymentIntentId,
+          outcome.statusCode ?? 200,
+          outcome.responseBody
+        )
         delivered++
         results.push({
           id: row.id,

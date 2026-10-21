@@ -409,6 +409,9 @@ export async function createWebhookLog(data: {
   signatureHash: string
   verified: boolean
   processed: boolean
+  headersObj?: Record<string, unknown>
+  processingError?: string | null
+  paymentIntentId?: string | null
 }) {
   // Must match the provider that actually sent the webhook. This used to fall
   // back to "any active provider", which silently attached webhook audit rows
@@ -420,23 +423,33 @@ export async function createWebhookLog(data: {
     throw new Error(`No provider found for webhook: ${data.provider}`)
   }
 
+  const headerString = JSON.stringify({
+    signature: data.signature,
+    eventType: data.eventType,
+    ...(data.headersObj ?? {}),
+  })
+
   // Use upsert to gracefully handle retries of the same webhook delivery
   return db.webhookLog.upsert({
     where: { signatureHash: data.signatureHash },
     update: {
       payload: data.payload,
-      headers: JSON.stringify({ signature: data.signature, eventType: data.eventType }),
+      headers: headerString,
       signatureValid: data.verified,
       processed: data.processed,
       providerId: provider.id,
+      ...(data.processingError !== undefined ? { processingError: data.processingError } : {}),
+      ...(data.paymentIntentId ? { paymentIntentId: data.paymentIntentId } : {}),
     },
     create: {
       payload: data.payload,
-      headers: JSON.stringify({ signature: data.signature, eventType: data.eventType }),
+      headers: headerString,
       signatureHash: data.signatureHash,
       signatureValid: data.verified,
       processed: data.processed,
       providerId: provider.id,
+      ...(data.processingError !== undefined ? { processingError: data.processingError } : {}),
+      ...(data.paymentIntentId ? { paymentIntentId: data.paymentIntentId } : {}),
     },
   })
 }

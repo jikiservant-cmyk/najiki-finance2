@@ -20,8 +20,35 @@
  */
 
 import { db } from './db'
-import { decrypt } from './encryption'
+import { decrypt, encrypt } from './encryption'
 import { hashApiKey, verifyApiKey } from './api-keys'
+
+interface WrappedWebhookSecret {
+  __najiki_v2: 1
+  primary: string
+  fallbackApiKey?: string | null
+}
+
+function unwrapDecryptedSecret(plaintext: string): {
+  primary: string | null
+  fallbackApiKey: string | null
+} {
+  if (plaintext.startsWith('{"__najiki_v2":1,')) {
+    try {
+      const parsed = JSON.parse(plaintext) as WrappedWebhookSecret
+      return {
+        primary: typeof parsed.primary === 'string' && parsed.primary ? parsed.primary : null,
+        fallbackApiKey:
+          typeof parsed.fallbackApiKey === 'string' && parsed.fallbackApiKey
+            ? parsed.fallbackApiKey
+            : null,
+      }
+    } catch {
+      // Fall through to legacy raw string handling
+    }
+  }
+  return { primary: plaintext || null, fallbackApiKey: null }
+}
 
 /**
  * The columns an authenticated caller may need: enough to build a notification
@@ -37,6 +64,7 @@ const APPLICATION_AUTH_SELECT = {
   isActive: true,
   baseUrl: true,
   webhookPath: true,
+  internalSecretRef: true,
   apiKey: true,
   webhookSecretEncrypted: true,
 } as const
@@ -49,6 +77,7 @@ export interface ApplicationAuthResult {
     isActive: boolean
     baseUrl: string
     webhookPath: string
+    internalSecretRef?: string | null
     apiKey: string | null
     webhookSecretEncrypted: string | null
   }
@@ -87,6 +116,32 @@ export async function findApplicationByApiKey(
   })
 
   if (byHash) {
+    // Seal the verified partner API key alongside the primary webhook secret
+    // inside AES-256-GCM `webhookSecretEncrypted` so async provider callbacks
+    // (Hop 1 -> Hop 2) can still authenticate to partner deployments that only
+    // configured `NAJIKI_API_KEY` (without `NAJIKI_WEBHOOK_SECRET`).
+    if (byHash.webhookSecretEncrypted && typeof (db.application as any).update === 'function') {
+      try {
+        const unwrapped = unwrapDecryptedSecret(decrypt(byHash.webhookSecretEncrypted))
+        if (unwrapped.primary && unwrapped.fallbackApiKey !== apiKey) {
+          const wrapped: WrappedWebhookSecret = {
+            __najiki_v2: 1,
+            primary: unwrapped.primary,
+            fallbackApiKey: apiKey,
+          }
+          const sealed = encrypt(JSON.stringify(wrapped))
+          byHash.webhookSecretEncrypted = sealed
+          db.application
+            .update({
+              where: { id: byHash.id },
+              data: { webhookSecretEncrypted: sealed },
+            })
+            .catch(() => {})
+        }
+      } catch {
+        // Ignore if test mock encryption differs
+      }
+    }
     return { application: byHash, usedLegacyPlaintextKey: false }
   }
 
@@ -129,7 +184,7 @@ export async function resolveWebhookSecret(applicationId: string): Promise<strin
 
   if (row.webhookSecretEncrypted) {
     try {
-      return decrypt(row.webhookSecretEncrypted)
+      return unwrapDecryptedSecret(decrypt(row.webhookSecretEncrypted)).primary
     } catch (error) {
       // Never fall back to a different secret on a decryption failure: partners
       // verify signatures, and signing with the wrong key would make every
@@ -156,13 +211,49 @@ export function webhookSecretFromRow(row: {
 }): string | null {
   if (row.webhookSecretEncrypted) {
     try {
-      return decrypt(row.webhookSecretEncrypted)
+      return unwrapDecryptedSecret(decrypt(row.webhookSecretEncrypted)).primary
     } catch (error) {
       console.error('[auth] Could not decrypt a webhook secret; refusing to sign.', error)
       return null
     }
   }
   return row.apiKey ?? null
+}
+
+/**
+ * Secondary candidate signing secrets when a partner deployment verifies outbound
+ * notifications with `NAJIKI_API_KEY` or `internalSecretRef` instead of the
+ * auto-generated `NAJIKI_WEBHOOK_SECRET`.
+ */
+export function fallbackSigningSecretsFromRow(row?: {
+  webhookSecretEncrypted?: string | null
+  apiKey?: string | null
+  internalSecretRef?: string | null
+} | null): string[] {
+  if (!row) return []
+  const candidates: string[] = []
+
+  if (row.webhookSecretEncrypted) {
+    try {
+      const unwrapped = unwrapDecryptedSecret(decrypt(row.webhookSecretEncrypted))
+      if (unwrapped.fallbackApiKey) candidates.push(unwrapped.fallbackApiKey)
+    } catch {
+      // ignore decryption failure
+    }
+  }
+
+  if (row.apiKey && row.apiKey.trim()) {
+    candidates.push(row.apiKey.trim())
+  }
+
+  const ref = row.internalSecretRef?.trim()
+  if (ref) {
+    const envVal = process.env[ref]?.trim()
+    if (envVal) candidates.push(envVal)
+    candidates.push(ref)
+  }
+
+  return Array.from(new Set(candidates))
 }
 
 /** Exposed for tests and for callers that already hold a hash. */
