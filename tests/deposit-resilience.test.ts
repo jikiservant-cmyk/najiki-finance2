@@ -662,3 +662,82 @@ test('enqueueWebhookNotification delivers synchronously with exact HMAC, retries
   }
 })
 
+test('LivePayProvider tunnels outbound requests through LIVEPAY_PROXY_URL HTTP CONNECT static-IP proxy', async () => {
+  const http = await import('node:http')
+  const net = await import('node:net')
+  const { LivePayProvider } = loadTsModule<{ LivePayProvider: any }>('src/lib/providers/livepay.ts', {
+    '@/lib/phone': { normalizePhone },
+  })
+
+  // 1. Mock LivePay HTTP origin server
+  let originSawAuth = ''
+  const originServer = http.createServer((req, res) => {
+    originSawAuth = String(req.headers.authorization || '')
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(
+      JSON.stringify({
+        success: true,
+        internal_reference: 'LP-STATIC-IP-001',
+        status: 'Successful',
+        amount: 2500,
+        currency: 'UGX',
+      })
+    )
+  })
+  await new Promise<void>((resolve) => originServer.listen(0, '127.0.0.1', () => resolve()))
+  const originPort = (originServer.address() as any).port
+
+  // 2. Local HTTP CONNECT static-IP tunnel proxy requiring Basic credentials
+  let proxyConnects = 0
+  let proxyAuthHeader = ''
+  const proxyServer = http.createServer()
+  proxyServer.on('connect', (req, clientSocket, head) => {
+    proxyConnects++
+    proxyAuthHeader = String(req.headers['proxy-authorization'] || '')
+    const [host, portStr] = String(req.url || '').split(':')
+    const upstream = net.connect(Number(portStr), host, () => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+      if (head && head.length > 0) upstream.write(head)
+      upstream.pipe(clientSocket)
+      clientSocket.pipe(upstream)
+    })
+  })
+  await new Promise<void>((resolve) => proxyServer.listen(0, '127.0.0.1', () => resolve()))
+  const proxyPort = (proxyServer.address() as any).port
+
+  const prevProxy = process.env.LIVEPAY_PROXY_URL
+  process.env.LIVEPAY_PROXY_URL = `"http://staticuser:staticpass@127.0.0.1:${proxyPort}"`
+  try {
+    const provider = new LivePayProvider({
+      apiKey: 'lp_live_static_key',
+      accountNo: 'LP260099',
+      webhookSecret: 'lpwhsec_0123456789abcdef',
+      baseUrl: `http://127.0.0.1:${originPort}`,
+    })
+
+    const init = await provider.initiatePayment({
+      amount: 2500,
+      currency: 'UGX',
+      phoneNumber: '0744827730',
+      reference: 'SACCO-DEP-STATIC-1',
+    })
+    assert.equal(init.success, true)
+    assert.equal(init.providerPaymentId, 'LP-STATIC-IP-001')
+
+    const polled = await provider.checkPaymentStatus('SACCO-DEP-STATIC-1', 'UGX')
+    assert.equal(polled.status, 'success')
+    assert.equal(proxyConnects, 2)
+    assert.equal(
+      proxyAuthHeader,
+      `Basic ${Buffer.from('staticuser:staticpass').toString('base64')}`
+    )
+    assert.equal(originSawAuth, 'Bearer lp_live_static_key')
+  } finally {
+    if (prevProxy === undefined) delete process.env.LIVEPAY_PROXY_URL
+    else process.env.LIVEPAY_PROXY_URL = prevProxy
+    proxyServer.close()
+    originServer.close()
+  }
+})
+
+
