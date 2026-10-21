@@ -133,7 +133,19 @@ export default function TransactionsPage() {
                       <td className="text-xs font-mono text-foreground/40 p-3 pr-4">{p.phoneNumber || '—'}</td>
                       <td className="text-xs font-mono text-foreground/40 p-3 pr-4">{p.externalEntityId || '—'}</td>
                       <td className="text-xs font-mono text-foreground/40 p-3 pr-4">{fmtDate(p.createdAt)}</td>
-                      <td className="p-3"><span className={`text-[10px] font-mono tracking-wider px-2 py-0.5 rounded-sm ${statusColors[p.status] || ''}`}>{p.status}</span></td>
+                      <td className="p-3">
+                        <div className="flex flex-col items-start gap-1">
+                          <span className={`text-[10px] font-mono tracking-wider px-2 py-0.5 rounded-sm ${statusColors[p.status] || ''}`}>{p.status}</span>
+                          {p.failureReason && (
+                            <span
+                              title={p.failureReason}
+                              className="text-[10px] font-mono text-red-400/80 max-w-[260px] truncate"
+                            >
+                              {p.failureReason}
+                            </span>
+                          )}
+                        </div>
+                      </td>
                     </motion.tr>
                   ))}
                 </tbody>

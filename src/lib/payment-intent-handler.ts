@@ -391,7 +391,11 @@ export async function handleCreatePaymentIntent(request: Request) {
     // will never callback to. That doesn't block PIN, but breaks confirmation.
     const host = request.headers.get('x-forwarded-host') || request.headers.get('host') || 'localhost:3000'
     const protocol = request.headers.get('x-forwarded-proto') || 'https'
-    let rawAppBaseUrl = process.env.NEXTAUTH_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '')
+    let rawAppBaseUrl =
+      process.env.NEXTAUTH_URL ||
+      process.env.PUBLIC_BASE_URL ||
+      process.env.URL ||
+      (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '')
     if (!rawAppBaseUrl) {
       rawAppBaseUrl = `${protocol}://${host}`
       if (process.env.NODE_ENV === 'production') {

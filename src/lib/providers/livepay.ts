@@ -95,10 +95,19 @@ export class LivePayProvider implements PaymentProvider {
       console.log(`[LivePay] collect-money response status=${response.status} success=${data?.success} ref=${params.reference} data=${JSON.stringify(data).slice(0,500)}`)
 
       if (response.ok && data.success) {
-        // LivePay accepted — PIN should be sent within seconds
+        const tx = data?.data && typeof data.data === 'object' ? data.data : data
+        // LivePay accepted — PIN should be sent within seconds.
+        // Only store LivePay's own transaction identifier (`internal_reference` /
+        // `transactionId`), never our customer `reference`, so subsequent status
+        // polls match LivePay's real `internal_reference` cleanly.
         return {
           success: true,
-          providerPaymentId: data.internal_reference || data.transactionId || data.reference,
+          providerPaymentId:
+            tx?.internal_reference ||
+            tx?.transactionId ||
+            data.internal_reference ||
+            data.transactionId ||
+            undefined,
           status: 'processing',
           metadata: data,
         }
@@ -144,31 +153,64 @@ export class LivePayProvider implements PaymentProvider {
         signal: AbortSignal.timeout(10_000),
       })
 
-      const data = await response.json()
+      let data: any = null
+      try {
+        const text = await response.text()
+        data = text ? JSON.parse(text) : {}
+      } catch {
+        return {
+          success: false,
+          status: 'pending',
+          failureReason: `Status check returned non-JSON (HTTP ${response.status})`,
+        }
+      }
 
-      if (response.ok && data.success) {
-        const statusString = String(data.status || '').toLowerCase()
+      if (response.ok && data?.success) {
+        const tx =
+          (data?.data && typeof data.data === 'object' ? data.data : null) ||
+          (data?.transaction && typeof data.transaction === 'object' ? data.transaction : null) ||
+          data
+        const statusString = String(tx?.status ?? data?.status ?? '').trim().toLowerCase()
         let status: PaymentStatusResponse['status'] = 'pending'
 
-        if (statusString === 'success' || statusString === 'completed') {
+        if (['success', 'successful', 'completed', 'paid', 'approved'].includes(statusString)) {
           status = 'success'
-        } else if (statusString === 'failed' || statusString === 'failure') {
+        } else if (
+          ['failed', 'failure', 'declined', 'cancelled', 'canceled', 'expired', 'rejected'].includes(
+            statusString
+          )
+        ) {
           status = 'failed'
         }
+
+        const rawAmount = tx?.amount ?? data?.amount
+        const parsedAmount =
+          rawAmount !== undefined && rawAmount !== null && rawAmount !== ''
+            ? Number(rawAmount)
+            : undefined
 
         return {
           success: true,
           status,
-          amount: data.amount,
-          currency: data.currency || currency,
-          providerPaymentId: data.internal_reference || providerPaymentId,
+          amount: parsedAmount !== undefined && Number.isFinite(parsedAmount) ? parsedAmount : rawAmount,
+          currency: tx?.currency || data?.currency || currency,
+          providerPaymentId:
+            tx?.internal_reference ||
+            tx?.transactionId ||
+            data?.internal_reference ||
+            data?.transactionId ||
+            providerPaymentId,
+          failureReason:
+            status === 'failed'
+              ? tx?.message || tx?.failure_reason || data?.message || 'Payment declined or expired'
+              : undefined,
         }
       }
 
       return {
         success: false,
         status: 'pending',
-        failureReason: data.message || 'Status check failed',
+        failureReason: data?.message || data?.error || 'Status check failed',
       }
     } catch (error) {
       console.error('[LivePay] Error checking payment status:', error)
@@ -242,12 +284,16 @@ export class LivePayProvider implements PaymentProvider {
       }
 
       const webhookPayload = JSON.parse(payload)
+      const txPayload =
+        webhookPayload?.data && typeof webhookPayload.data === 'object'
+          ? webhookPayload.data
+          : webhookPayload
       const params = {
-        amount: String(webhookPayload.amount || ''),
-        currency: webhookPayload.currency || '',
-        customer_reference: webhookPayload.customer_reference || '',
-        internal_reference: webhookPayload.internal_reference || '',
-        status: webhookPayload.status || '',
+        amount: String(txPayload.amount ?? webhookPayload.amount ?? ''),
+        currency: txPayload.currency ?? webhookPayload.currency ?? '',
+        customer_reference: txPayload.customer_reference ?? webhookPayload.customer_reference ?? '',
+        internal_reference: txPayload.internal_reference ?? webhookPayload.internal_reference ?? '',
+        status: txPayload.status ?? webhookPayload.status ?? '',
       }
       const sortedKeys = Object.keys(params).sort() as Array<keyof typeof params>
       
@@ -266,11 +312,17 @@ export class LivePayProvider implements PaymentProvider {
         possibleWebhookUrls.push(candidate.endsWith('/') ? candidate.slice(0, -1) : `${candidate}/`)
       }
 
-      const nextAuthUrl = process.env.NEXTAUTH_URL
-      if (nextAuthUrl) {
-        const fallbackUrl = `${nextAuthUrl.replace(/\/$/, '')}/api/webhooks/livepay`
-        possibleWebhookUrls.push(fallbackUrl)
-        possibleWebhookUrls.push(`${fallbackUrl}/`)
+      for (const envOrigin of [
+        process.env.NEXTAUTH_URL,
+        process.env.PUBLIC_BASE_URL,
+        process.env.URL,
+        process.env.DEPLOY_PRIME_URL,
+      ]) {
+        if (envOrigin) {
+          const fallbackUrl = `${envOrigin.replace(/\/$/, '')}/api/webhooks/livepay`
+          possibleWebhookUrls.push(fallbackUrl)
+          possibleWebhookUrls.push(`${fallbackUrl}/`)
+        }
       }
 
       const vercelUrl = process.env.VERCEL_URL
@@ -322,23 +374,40 @@ export class LivePayProvider implements PaymentProvider {
   }
 
   async parseWebhookPayload(payload: any): Promise<ParsedWebhook> {
-    const statusString = String(payload.status || '').toLowerCase()
+    const tx =
+      (payload?.data && typeof payload.data === 'object' ? payload.data : null) ||
+      (payload?.transaction && typeof payload.transaction === 'object' ? payload.transaction : null) ||
+      payload
+    const statusString = String(tx?.status ?? payload?.status ?? '').trim().toLowerCase()
     
     let status: ParsedWebhook['status'] = 'pending'
-    if (statusString === 'success' || statusString === 'successful') {
+    if (['success', 'successful', 'completed', 'paid', 'approved'].includes(statusString)) {
       status = 'success'
-    } else if (statusString === 'failed' || statusString === 'failure') {
+    } else if (
+      ['failed', 'failure', 'declined', 'cancelled', 'canceled', 'expired', 'rejected'].includes(
+        statusString
+      )
+    ) {
       status = 'failed'
     }
 
+    const rawAmount = tx?.amount ?? payload?.amount
+    const parsedAmount =
+      rawAmount !== undefined && rawAmount !== null && rawAmount !== ''
+        ? Number(rawAmount)
+        : rawAmount
+
     return {
-      reference: payload.customer_reference,
-      providerPaymentId: payload.internal_reference,
+      reference: tx?.customer_reference || tx?.reference || payload?.customer_reference || payload?.reference,
+      providerPaymentId: tx?.internal_reference || tx?.transactionId || payload?.internal_reference || payload?.transactionId,
       status,
-      amount: payload.amount,
-      currency: payload.currency,
+      amount: typeof parsedAmount === 'number' && Number.isFinite(parsedAmount) ? parsedAmount : rawAmount,
+      currency: tx?.currency || payload?.currency,
       metadata: payload,
-      failureReason: status === 'failed' ? 'Payment failed' : undefined,
+      failureReason:
+        status === 'failed'
+          ? tx?.message || tx?.failure_reason || payload?.message || 'Payment failed'
+          : undefined,
     }
   }
 }

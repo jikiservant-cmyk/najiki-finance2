@@ -5,8 +5,10 @@ import path from 'node:path'
 import Module from 'node:module'
 import ts from 'typescript'
 import { isPlatformFeeType, resolvePartnerWebhookUrl } from '../src/lib/constants.ts'
-import { parseTenantProviderCredentials } from '../src/lib/payment-security.ts'
+import { isConfirmedTerminalStatus, parseTenantProviderCredentials } from '../src/lib/payment-security.ts'
 import { normalizePhone } from '../src/lib/phone.ts'
+import { buildSignatureUrlCandidates } from '../src/lib/webhook-url.ts'
+import { verifyNotificationSignature } from '../src/lib/notification-signature.ts'
 
 function loadTsModule<T>(relPath: string, stubs: Record<string, unknown> = {}): T {
   const file = path.resolve(relPath)
@@ -399,3 +401,264 @@ test('matchTenantCandidate and isAuthorizedTenantPoll handle exact codes, slugs,
     false
   )
 })
+
+test('LivePayProvider checkPaymentStatus handles "Successful", nested data envelopes, and avoids reference collision', async () => {
+  const { LivePayProvider } = loadTsModule<{ LivePayProvider: any }>('src/lib/providers/livepay.ts', {
+    '@/lib/phone': { normalizePhone },
+  })
+
+  const originalFetch = globalThis.fetch
+  try {
+    const provider = new LivePayProvider({
+      apiKey: 'lp_live_key_test',
+      accountNo: 'LP999888',
+      webhookSecret: 'lpwhsec_0123456789abcdef',
+      baseUrl: 'https://livepay.me',
+    })
+
+    // 1. initiatePayment when LivePay echoes customer `reference` without `internal_reference` yet
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({ success: true, reference: 'SACCO-DEP-LEGACY-01', status: 'Pending' }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+
+    const init = await provider.initiatePayment({
+      amount: 10000,
+      currency: 'UGX',
+      phoneNumber: '0744827730',
+      reference: 'SACCO-DEP-LEGACY-01',
+      description: 'Savings deposit',
+    })
+    assert.equal(init.success, true)
+    assert.equal(init.status, 'processing')
+    assert.equal(init.providerPaymentId, undefined)
+
+    // 2. checkPaymentStatus when LivePay returns nested `{ success: true, data: { status: "Successful", internal_reference: "LP-777" } }`
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          success: true,
+          data: {
+            status: 'Successful',
+            amount: '10000',
+            currency: 'UGX',
+            internal_reference: 'LP-777',
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+
+    const polled = await provider.checkPaymentStatus('SACCO-DEP-LEGACY-01', 'UGX')
+    assert.equal(polled.success, true)
+    assert.equal(polled.status, 'success')
+    assert.equal(polled.amount, 10000)
+    assert.equal(polled.providerPaymentId, 'LP-777')
+
+    // Confirm both freshly created intents AND existing stuck DB rows where `providerPaymentId === reference` settle cleanly
+    assert.equal(
+      isConfirmedTerminalStatus(polled, {
+        amount: 10000,
+        currency: 'UGX',
+        providerPaymentId: undefined,
+        reference: 'SACCO-DEP-LEGACY-01',
+      }),
+      true
+    )
+    assert.equal(
+      isConfirmedTerminalStatus(polled, {
+        amount: 10000,
+        currency: 'UGX',
+        providerPaymentId: 'SACCO-DEP-LEGACY-01',
+        reference: 'SACCO-DEP-LEGACY-01',
+      }),
+      true
+    )
+    // Genuine provider ID mismatch is still strictly rejected
+    assert.equal(
+      isConfirmedTerminalStatus(polled, {
+        amount: 10000,
+        currency: 'UGX',
+        providerPaymentId: 'LP-OTHER-999',
+        reference: 'SACCO-DEP-LEGACY-01',
+      }),
+      false
+    )
+
+    // 3. Declined / Cancelled statuses map to terminal 'failed'
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          success: true,
+          transaction: { status: 'Cancelled', amount: 10000, currency: 'UGX', message: 'User cancelled PIN prompt' },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    const declined = await provider.checkPaymentStatus('SACCO-DEP-LEGACY-02', 'UGX')
+    assert.equal(declined.status, 'failed')
+    assert.equal(declined.failureReason, 'User cancelled PIN prompt')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('tenant config using platform LivePay credentials inherits LIVEPAY_WEBHOOK_SECRET and Netlify URL is in signature candidates', async () => {
+  const prev = {
+    nodeEnv: process.env.NODE_ENV,
+    nextAuthUrl: process.env.NEXTAUTH_URL,
+    netlifyUrl: process.env.URL,
+    apiKey: process.env.LIVEPAY_API_KEY,
+    accountNo: process.env.LIVEPAY_ACCOUNT_NO,
+    webhookSecret: process.env.LIVEPAY_WEBHOOK_SECRET,
+  }
+  try {
+    process.env.NODE_ENV = 'production'
+    delete process.env.NEXTAUTH_URL
+    process.env.URL = 'https://najiki.netlify.app/'
+    process.env.LIVEPAY_API_KEY = 'platform_live_api_key'
+    process.env.LIVEPAY_ACCOUNT_NO = 'PLATFORM_ACC_001'
+    process.env.LIVEPAY_WEBHOOK_SECRET = 'real_platform_webhook_secret_123456'
+
+    const candidates = buildSignatureUrlCandidates(
+      new Request('https://najiki.netlify.app/api/webhooks/livepay', { method: 'POST' })
+    )
+    assert.deepEqual(candidates, ['https://najiki.netlify.app/api/webhooks/livepay'])
+
+    const tenantCredsMod = loadTsModule<{
+      resolveTenantOrPlatformCredentials: (
+        tenantId: string,
+        providerId: string,
+        tenantCode?: string | null
+      ) => Promise<{ source: string; credentials: any } | null>
+    }>('src/lib/tenant-credentials.ts', {
+      './db': {
+        db: {
+          tenantProviderConfig: {
+            findFirst: async () => ({
+              id: 'kun-sac-cfg',
+              credentialsRef: null,
+              configJson: {
+                _encrypted: JSON.stringify({
+                  apiKey: 'platform_live_api_key',
+                  accountNo: 'PLATFORM_ACC_001',
+                  webhookSecret: '',
+                  baseUrl: 'https://livepay.me',
+                }),
+              },
+            }),
+          },
+        },
+      },
+      './encryption': { decrypt: (s: string) => s },
+      './payment-security': { parseTenantProviderCredentials },
+    })
+
+    const resolved = await tenantCredsMod.resolveTenantOrPlatformCredentials('t-kunsac', 'prov-lp', 'kun-sac')
+    assert.equal(resolved?.source, 'tenant')
+    assert.equal(resolved?.credentials?.webhookSecret, 'real_platform_webhook_secret_123456')
+  } finally {
+    for (const [k, v] of [
+      ['NODE_ENV', prev.nodeEnv],
+      ['NEXTAUTH_URL', prev.nextAuthUrl],
+      ['URL', prev.netlifyUrl],
+      ['LIVEPAY_API_KEY', prev.apiKey],
+      ['LIVEPAY_ACCOUNT_NO', prev.accountNo],
+      ['LIVEPAY_WEBHOOK_SECRET', prev.webhookSecret],
+    ] as const) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
+
+test('enqueueWebhookNotification delivers synchronously with exact HMAC, retries fallback API key on 401, and self-heals legacy 404 path', async () => {
+  const deliveries: Array<{ url: string; headers: Record<string, string>; body: string }> = []
+  let deliveredCount = 0
+
+  const paymentsMod = loadTsModule<{
+    enqueueWebhookNotification: (data: any) => Promise<void>
+  }>('src/lib/payments.ts', {
+    './db': {
+      db: {
+        internalNotification: {
+          updateMany: async () => {
+            deliveredCount++
+            return { count: 1 }
+          },
+          findMany: async () => [],
+        },
+      },
+    },
+    './providers': { getPaymentProvider: () => ({}) },
+    './tenant-credentials': { resolveTenantOrPlatformCredentials: async () => null },
+    './constants': { isPlatformFeeType, resolvePartnerWebhookUrl, appRequiresTenantCredentials: () => false },
+    './money': { toMinorUnits: (a: number) => BigInt(a) },
+    './application-auth': { webhookSecretFromRow: () => 'primary_whsec_unused_by_partner_env' },
+    './json': { safeJsonObject: (v: any) => v || {} },
+    '@upstash/qstash': {
+      Client: class FakeQStash {
+        async publishJSON() {
+          throw new Error('QStash must NOT be called before synchronous direct delivery attempts')
+        }
+      },
+    },
+    './safe-fetch': {
+      validateSafeUrl: async () => {},
+      safeFetch: async (url: string, init: any) => {
+        deliveries.push({ url, headers: init.headers, body: init.body })
+        // Simulate ChurchOS returning 404 on legacy /api/internal/payment-completed
+        if (url.endsWith('/api/internal/payment-completed')) {
+          return new Response('Not Found', { status: 404 })
+        }
+        // Simulate partner verifying with NAJIKI_API_KEY because NAJIKI_WEBHOOK_SECRET was unset
+        const ok = verifyNotificationSignature({
+          secret: 'njk_live_partner_api_key_fallback',
+          payloadString: init.body,
+          timestamp: init.headers['X-Najiki-Timestamp'],
+          signature: init.headers['X-Najiki-Signature'],
+        })
+        return ok
+          ? new Response(JSON.stringify({ success: true }), { status: 200 })
+          : new Response(JSON.stringify({ error: 'Invalid signature' }), { status: 401 })
+      },
+    },
+    './notification-signature': loadTsModule('src/lib/notification-signature.ts'),
+    './backoff': loadTsModule('src/lib/backoff.ts'),
+  })
+
+  const prevQstash = process.env.QSTASH_TOKEN
+  process.env.QSTASH_TOKEN = 'qstash_present_in_env'
+  try {
+    await paymentsMod.enqueueWebhookNotification({
+      paymentIntentId: 'pi_test_1',
+      reference: 'SACCO-DEP-LIVE-01',
+      status: 'success',
+      amount: 5000,
+      currency: 'UGX',
+      providerPaymentId: 'LP-LIVE-01',
+      applicationId: 'app_sacco',
+      webhookUrl: 'https://partner.example.org/api/internal/payment-completed',
+      webhookSecret: 'primary_whsec_not_copied_to_partner',
+      fallbackWebhookSecret: 'njk_live_partner_api_key_fallback',
+      externalEntityId: '0345696a-004c-4aca-9ab9-f8d1a589877f',
+      tenantId: 't_kunsac',
+      tenantCode: 'kun-sac',
+      paymentTypeCode: 'deposit',
+      metadata: { memberId: '0345696a-004c-4aca-9ab9-f8d1a589877f', paymentTypeCode: 'deposit' },
+    })
+
+    assert.equal(deliveredCount, 1)
+    assert.equal(deliveries.length, 3)
+    assert.equal(deliveries[0].url, 'https://partner.example.org/api/internal/payment-completed')
+    assert.equal(deliveries[1].url, 'https://partner.example.org/api/webhooks/najiki')
+    assert.equal(deliveries[2].url, 'https://partner.example.org/api/webhooks/najiki')
+    const sentPayload = JSON.parse(deliveries[2].body)
+    assert.equal(sentPayload.paymentType, 'deposit')
+    assert.equal(sentPayload.paymentTypeCode, 'deposit')
+    assert.equal(sentPayload.status, 'success')
+  } finally {
+    if (prevQstash === undefined) delete process.env.QSTASH_TOKEN
+    else process.env.QSTASH_TOKEN = prevQstash
+  }
+})
+
