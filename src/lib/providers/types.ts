@@ -67,6 +67,8 @@ export interface PaymentStatusResponse {
   currency?: string
   providerPaymentId?: string
   failureReason?: string
+  httpStatus?: number
+  raw?: Record<string, any>
 }
 
 export interface ParsedWebhook {

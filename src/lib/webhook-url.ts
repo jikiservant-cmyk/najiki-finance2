@@ -9,7 +9,8 @@
  */
 export function buildSignatureUrlCandidates(request: Request): string[] {
   const urls: string[] = []
-  const path = new URL(request.url).pathname
+  const reqUrl = new URL(request.url)
+  const path = reqUrl.pathname
 
   const configured = (process.env.NEXTAUTH_URL || '').replace(/\/+$/, '')
   if (configured) urls.push(`${configured}${path}`)
@@ -25,6 +26,10 @@ export function buildSignatureUrlCandidates(request: Request): string[] {
 
   const vercel = (process.env.VERCEL_URL || '').replace(/\/+$/, '')
   if (vercel) urls.push(`https://${vercel}${path}`)
+
+  if (reqUrl.protocol === 'https:') {
+    urls.push(`${reqUrl.origin}${path}`)
+  }
 
   if (process.env.NODE_ENV !== 'production') {
     const host = request.headers.get('x-forwarded-host') || request.headers.get('host')

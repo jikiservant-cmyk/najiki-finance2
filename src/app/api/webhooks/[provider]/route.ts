@@ -17,6 +17,7 @@
 // identifier could pre-seed the hash and cause the genuine webhook to be
 // acknowledged as a duplicate and never processed.
 
+import crypto from 'crypto'
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getAvailableProviders, getPaymentProvider } from '@/lib/providers'
@@ -25,7 +26,7 @@ import { enqueueWebhookNotification, completePayment } from '@/lib/payments'
 import { resolveTenantOrPlatformCredentials } from '@/lib/tenant-credentials'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
 import { computeWebhookEventHash } from '@/lib/webhook-hash'
-import { webhookSecretFromRow } from '@/lib/application-auth'
+import { fallbackSigningSecretsFromRow, webhookSecretFromRow } from '@/lib/application-auth'
 import { redactPhoneNumbersInText } from '@/lib/redact'
 import { buildSignatureUrlCandidates } from '@/lib/webhook-url'
 import { readTextWithLimit } from '@/lib/request-body'
@@ -168,8 +169,19 @@ export async function POST(
       publicUrl.slice(1)
     )
 
-    // ── 3. Verify BEFORE writing anything ──────────────────────────────────
+    // ── 3. Verify BEFORE processing unverified payload fields ───────────────
+    const safeInboundHeaders = {
+      requestUrl: request.url,
+      userAgent: request.headers.get('user-agent') || null,
+      contentType: request.headers.get('content-type') || null,
+      xWebhookSignature: signature || null,
+    }
+    const sanitizedPayload = redactPhoneNumbersInText(rawBody)
+
     if (!isValidSignature) {
+      let verifiedByPollStatus: string | null = null
+      let pollDiagError: string | null = null
+
       // Out-of-band authenticated verification: when a tenant saved API credentials
       // in `/setup` without configuring `Webhook Secret`, never trust the unverified
       // webhook body — instead query the provider directly using our own encrypted
@@ -177,18 +189,51 @@ export async function POST(
       if (
         matchedIntentForWakeup &&
         (matchedIntentForWakeup.status === 'processing' || matchedIntentForWakeup.status === 'pending') &&
-        Date.now() - (matchedIntentForWakeup.lastPolledAt?.getTime() ?? 0) >= 3_000
+        Date.now() - (matchedIntentForWakeup.lastPolledAt?.getTime() ?? 0) >= 1_000
       ) {
         try {
           const verified = await reconcileSinglePaymentById(matchedIntentForWakeup.id, {
             note: 'WEBHOOK_WAKEUP_VERIFIED_BY_PROVIDER_POLL',
           })
           if (verified && (verified.status === 'success' || verified.status === 'failed')) {
-            return NextResponse.json({ success: true, verifiedViaProviderPoll: true })
+            verifiedByPollStatus = verified.status
+          } else if (verified?.providerFailureReason) {
+            pollDiagError = verified.providerFailureReason
           }
-        } catch (wakeupErr) {
+        } catch (wakeupErr: any) {
+          pollDiagError = wakeupErr instanceof Error ? wakeupErr.message : String(wakeupErr)
           console.warn('[Webhook] Out-of-band provider verification check failed:', wakeupErr)
         }
+      }
+
+      // Record an explicit audit log row using a unique non-deduping `unverified:<uuid>`
+      // signatureHash so operators inspecting `/api/webhooks` see the exact raw payload,
+      // headers, and verification result while never pre-seeding real event hashes.
+      await createWebhookLog({
+        provider: normalizedProvider,
+        eventType: verifiedByPollStatus
+          ? 'WEBHOOK_VERIFIED_VIA_PROVIDER_API'
+          : 'WEBHOOK_SIGNATURE_INVALID',
+        payload: sanitizedPayload,
+        signature,
+        signatureHash: `unverified:${crypto.randomUUID()}`,
+        verified: false,
+        processed: Boolean(verifiedByPollStatus),
+        headersObj: safeInboundHeaders,
+        paymentIntentId: matchedIntentForWakeup?.id ?? null,
+        processingError: verifiedByPollStatus
+          ? `HMAC signature did not match tenant secret; verified & settled (${verifiedByPollStatus}) directly via authenticated LivePay API status check`
+          : `Invalid HMAC signature${!signature ? ' (missing X-Webhook-Signature header)' : ' (verify Webhook Secret in /setup matches LivePay portal)'}${pollDiagError ? ` | poll=${pollDiagError}` : ''}`,
+      }).catch((logErr) => {
+        console.warn('[Webhook] Could not persist unverified webhook audit row:', logErr)
+      })
+
+      if (verifiedByPollStatus) {
+        return NextResponse.json({
+          success: true,
+          verifiedViaProviderPoll: true,
+          status: verifiedByPollStatus,
+        })
       }
 
       console.warn(
@@ -209,8 +254,6 @@ export async function POST(
       // Genuinely finished — acknowledge so the provider stops retrying.
       return NextResponse.json({ success: true, duplicate: true })
     }
-
-    const sanitizedPayload = redactPhoneNumbersInText(rawBody)
 
     // An existing-but-unfinished row is RESUMED, not duplicated.
     //
@@ -233,6 +276,7 @@ export async function POST(
           signatureHash,
           verified: true,
           processed: false,
+          headersObj: safeInboundHeaders,
         })
       } catch (logError: any) {
         if (logError?.code !== 'P2002') throw logError
@@ -395,6 +439,7 @@ export async function POST(
       })
       await flushPendingNotificationsForPayment(paymentIntent.id, {
         fallbackWebhookSecret: fullPaymentIntent.application.apiKey ?? null,
+        fallbackWebhookSecrets: fallbackSigningSecretsFromRow(fullPaymentIntent.application),
       })
       return NextResponse.json({ success: true, duplicate: true })
     }
@@ -438,6 +483,7 @@ export async function POST(
         webhookUrl: resolvePartnerWebhookUrl(fullPaymentIntent.application),
         webhookSecret: webhookSecretFromRow(fullPaymentIntent.application),
         fallbackWebhookSecret: fullPaymentIntent.application.apiKey ?? null,
+        fallbackWebhookSecrets: fallbackSigningSecretsFromRow(fullPaymentIntent.application),
         externalEntityId: fullPaymentIntent.externalEntityId,
         tenantId: fullPaymentIntent.tenantId,
         tenantCode: fullPaymentIntent.tenant?.code ?? null,

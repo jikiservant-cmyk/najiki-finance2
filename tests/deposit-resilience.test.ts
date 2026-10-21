@@ -740,4 +740,114 @@ test('LivePayProvider tunnels outbound requests through LIVEPAY_PROXY_URL HTTP C
   }
 })
 
+test('LivePay official 3-field HMAC webhook signature + flat /api/transaction-status payload verify and settle cleanly', async () => {
+  const nodeCrypto = await import('node:crypto')
+  const { LivePayProvider } = loadTsModule<{ LivePayProvider: any }>('src/lib/providers/livepay.ts', {
+    '@/lib/phone': { normalizePhone },
+  })
+
+  const secret = 'dpal_webhook_secret_oct21_2026_real'
+  const webhookUrl = 'https://najiki.netlify.app/api/webhooks/livepay'
+  const provider = new LivePayProvider({
+    apiKey: 'lp_live_dpal_key',
+    accountNo: 'LP26000001',
+    webhookSecret: secret,
+    baseUrl: 'https://livepay.me',
+  })
+
+  // Official docs.livepay.me flat webhook payload + 3-param HMAC (customer_reference, internal_reference, status)
+  const payloadObj = {
+    status: 'Success',
+    message: 'Collection successful',
+    customer_reference: 'SACCO-DEP-5EE72A17-76A9CC3E9C',
+    internal_reference: 'LP26998877',
+    provider_transaction_id: 'MTN-998877',
+    msisdn: '+256744827730',
+    amount: 5000,
+    currency: 'UGX',
+    provider: 'MTN',
+    charge: 150,
+    completed_at: '2026-10-21T14:40:00Z',
+  }
+  const rawBody = JSON.stringify(payloadObj)
+  const tsNow = String(Math.floor(Date.now() / 1000))
+  const officialStringToSign =
+    `${webhookUrl}${tsNow}` +
+    `customer_reference${payloadObj.customer_reference}` +
+    `internal_reference${payloadObj.internal_reference}` +
+    `status${payloadObj.status}`
+  const sigHex = nodeCrypto.createHmac('sha256', secret).update(officialStringToSign, 'utf8').digest('hex')
+
+  const valid = await provider.validateWebhookSignature(
+    rawBody,
+    `t=${tsNow},v=${sigHex}`,
+    { 'x-webhook-signature': `t=${tsNow},v=${sigHex}` },
+    webhookUrl
+  )
+  assert.equal(valid, true)
+
+  // Tampered status must fail closed
+  const tamperedValid = await provider.validateWebhookSignature(
+    JSON.stringify({ ...payloadObj, customer_reference: 'SACCO-DEP-OTHER' }),
+    `t=${tsNow},v=${sigHex}`,
+    { 'x-webhook-signature': `t=${tsNow},v=${sigHex}` },
+    webhookUrl
+  )
+  assert.equal(tamperedValid, false)
+
+  // Parsed webhook preserves exact reference, internal_reference, amount, currency, and normalized status
+  const parsed = await provider.parseWebhookPayload(payloadObj)
+  assert.equal(parsed.status, 'success')
+  assert.equal(parsed.reference, 'SACCO-DEP-5EE72A17-76A9CC3E9C')
+  assert.equal(parsed.providerPaymentId, 'LP26998877')
+  assert.equal(parsed.amount, 5000)
+  assert.equal(parsed.currency, 'UGX')
+
+  // Flat HTTP 200 `/api/transaction-status` WITHOUT `success: true` AND internal_reference fallback both work
+  const originalFetch = globalThis.fetch
+  try {
+    let calls = 0
+    globalThis.fetch = async (input: any) => {
+      calls++
+      const u = new URL(String(input))
+      const queriedRef = u.searchParams.get('reference')
+      if (queriedRef === 'SACCO-DEP-5EE72A17-76A9CC3E9C') {
+        return new Response(JSON.stringify({ message: 'Not found by customer reference' }), {
+          status: 404,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      assert.equal(queriedRef, 'LP26998877')
+      return new Response(JSON.stringify(payloadObj), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+
+    const statusRes = await provider.checkPaymentStatus(
+      'SACCO-DEP-5EE72A17-76A9CC3E9C',
+      'UGX',
+      'LP26998877'
+    )
+    assert.equal(calls, 2)
+    assert.equal(statusRes.success, true)
+    assert.equal(statusRes.status, 'success')
+    assert.equal(statusRes.amount, 5000)
+    assert.equal(statusRes.currency, 'UGX')
+    assert.equal(statusRes.providerPaymentId, 'LP26998877')
+    assert.equal(
+      isConfirmedTerminalStatus(statusRes, {
+        amount: 5000,
+        currency: 'UGX',
+        providerPaymentId: 'LP26998877',
+        reference: 'SACCO-DEP-5EE72A17-76A9CC3E9C',
+      }),
+      true
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+
 

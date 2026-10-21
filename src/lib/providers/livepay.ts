@@ -382,38 +382,85 @@ export class LivePayProvider implements PaymentProvider {
     try {
       let safeReference = String(reference || '').trim().replace(/\s+/g, '-')
       if (safeReference.length > 30) safeReference = safeReference.slice(0, 30)
-      const url = new URL(`${this.baseUrl}/api/transaction-status`)
-      url.searchParams.append('accountNumber', this.accountNo)
-      url.searchParams.append('currency', currency)
-      url.searchParams.append('reference', safeReference)
 
-      const response = await livePayFetch(url.toString(), {
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${this.apiKey}`,
-        },
-        signal: AbortSignal.timeout(10_000),
-      })
+      const queryByReference = async (refParam: string) => {
+        const url = new URL(`${this.baseUrl}/api/transaction-status`)
+        url.searchParams.append('accountNumber', this.accountNo)
+        url.searchParams.append('currency', currency)
+        url.searchParams.append('reference', refParam)
 
+        const response = await livePayFetch(url.toString(), {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${this.apiKey}`,
+          },
+          signal: AbortSignal.timeout(10_000),
+        })
+
+        const text = await response.text()
+        const parsed = text ? JSON.parse(text) : {}
+        return { response, data: parsed }
+      }
+
+      let response: Response
       let data: any = null
       try {
-        const text = await response.text()
-        data = text ? JSON.parse(text) : {}
-      } catch {
-        return {
-          success: false,
-          status: 'pending',
-          failureReason: `Status check returned non-JSON (HTTP ${response.status})`,
+        const first = await queryByReference(safeReference)
+        response = first.response
+        data = first.data
+      } catch (firstErr: any) {
+        if (firstErr instanceof SyntaxError) {
+          return {
+            success: false,
+            status: 'pending',
+            failureReason: 'Status check returned non-JSON',
+          }
+        }
+        throw firstErr
+      }
+
+      const extractStatusString = (body: any): string => {
+        const txObj =
+          (body?.data && typeof body.data === 'object' ? body.data : null) ||
+          (body?.transaction && typeof body.transaction === 'object' ? body.transaction : null) ||
+          body
+        return String(txObj?.status ?? body?.status ?? '').trim().toLowerCase()
+      }
+
+      let statusString = extractStatusString(data)
+      const isOkPayload = (res: Response, body: any, st: string) =>
+        res.ok && body && body.success !== false && (Boolean(body.success) || st.length > 0)
+
+      // If querying by customer_reference returned 404 / not-found (not a 5xx outage)
+      // and we also know LivePay's `internal_reference` (`providerPaymentId`), query by
+      // `providerPaymentId` as well because some LivePay accounts index `/transaction-status`
+      // on `internal_reference`.
+      const cleanProviderId = String(providerPaymentId || '').trim()
+      if (
+        !isOkPayload(response, data, statusString) &&
+        response.status < 500 &&
+        cleanProviderId &&
+        cleanProviderId !== safeReference
+      ) {
+        try {
+          const second = await queryByReference(cleanProviderId)
+          const secondStatus = extractStatusString(second.data)
+          if (isOkPayload(second.response, second.data, secondStatus)) {
+            response = second.response
+            data = second.data
+            statusString = secondStatus
+          }
+        } catch {
+          // Keep primary response diagnostics if fallback lookup fails.
         }
       }
 
-      if (response.ok && data?.success) {
+      if (isOkPayload(response, data, statusString)) {
         const tx =
           (data?.data && typeof data.data === 'object' ? data.data : null) ||
           (data?.transaction && typeof data.transaction === 'object' ? data.transaction : null) ||
           data
-        const statusString = String(tx?.status ?? data?.status ?? '').trim().toLowerCase()
         let status: PaymentStatusResponse['status'] = 'pending'
 
         if (['success', 'successful', 'completed', 'paid', 'approved'].includes(statusString)) {
@@ -440,20 +487,26 @@ export class LivePayProvider implements PaymentProvider {
           providerPaymentId:
             tx?.internal_reference ||
             tx?.transactionId ||
+            tx?.provider_transaction_id ||
             data?.internal_reference ||
             data?.transactionId ||
+            data?.provider_transaction_id ||
             providerPaymentId,
           failureReason:
             status === 'failed'
               ? tx?.message || tx?.failure_reason || data?.message || 'Payment declined or expired'
               : undefined,
+          httpStatus: response.status,
+          raw: data,
         }
       }
 
       return {
         success: false,
         status: 'pending',
-        failureReason: data?.message || data?.error || 'Status check failed',
+        failureReason: data?.message || data?.error || `Status check failed (HTTP ${response.status})`,
+        httpStatus: response.status,
+        raw: data,
       }
     } catch (error) {
       console.error('[LivePay] Error checking payment status:', error)
@@ -531,14 +584,23 @@ export class LivePayProvider implements PaymentProvider {
         webhookPayload?.data && typeof webhookPayload.data === 'object'
           ? webhookPayload.data
           : webhookPayload
-      const params = {
-        amount: String(txPayload.amount ?? webhookPayload.amount ?? ''),
-        currency: txPayload.currency ?? webhookPayload.currency ?? '',
-        customer_reference: txPayload.customer_reference ?? webhookPayload.customer_reference ?? '',
-        internal_reference: txPayload.internal_reference ?? webhookPayload.internal_reference ?? '',
-        status: txPayload.status ?? webhookPayload.status ?? '',
+
+      // Official LivePay specification (https://docs.livepay.me/webhooks):
+      //   sorted_params = { customer_reference, internal_reference, status } sorted alphabetically.
+      //   Note: `amount` and `currency` are NOT included in LivePay's signature string
+      //   (amount & currency are separately verified against the stored PaymentIntent in DB).
+      const officialParams: Record<string, string> = {
+        customer_reference: String(txPayload.customer_reference ?? webhookPayload.customer_reference ?? ''),
+        internal_reference: String(txPayload.internal_reference ?? webhookPayload.internal_reference ?? ''),
+        status: String(txPayload.status ?? webhookPayload.status ?? ''),
       }
-      const sortedKeys = Object.keys(params).sort() as Array<keyof typeof params>
+      // Also support legacy 5-key simulator signatures so existing simulation & unit tests remain valid.
+      const legacyParams: Record<string, string> = {
+        amount: String(txPayload.amount ?? webhookPayload.amount ?? ''),
+        currency: String(txPayload.currency ?? webhookPayload.currency ?? ''),
+        ...officialParams,
+      }
+      const paramSets: Array<Record<string, string>> = [officialParams, legacyParams]
       
       // Candidate webhook URLs. The URL is part of the signed string, so the
       // caller passes the canonical origin first and env-configured origins
@@ -585,22 +647,30 @@ export class LivePayProvider implements PaymentProvider {
         return false
       }
 
+      const normalizedReceived = receivedSignature.toLowerCase()
+      const receivedBuffer = Buffer.from(normalizedReceived, 'utf8')
+
       for (const webhookUrl of uniqueUrls) {
-        let stringToSign = `${webhookUrl}${timestamp}`
-        for (const key of sortedKeys) {
-          stringToSign += `${key}${params[key]}`
-        }
+        for (const paramSet of paramSets) {
+          const sortedKeys = Object.keys(paramSet).sort()
+          let stringToSign = `${webhookUrl}${timestamp}`
+          for (const key of sortedKeys) {
+            stringToSign += `${key}${paramSet[key]}`
+          }
 
-        const expectedSignature = crypto
-          .createHmac('sha256', this.webhookSecret || '')
-          .update(stringToSign)
-          .digest('hex')
+          const expectedSignature = crypto
+            .createHmac('sha256', this.webhookSecret || '')
+            .update(stringToSign, 'utf8')
+            .digest('hex')
 
-        const receivedBuffer = Buffer.from(receivedSignature)
-        const expectedBuffer = Buffer.from(expectedSignature)
-        
-        if (receivedBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(receivedBuffer, expectedBuffer)) {
-          return true
+          const expectedBuffer = Buffer.from(expectedSignature, 'utf8')
+
+          if (
+            receivedBuffer.length === expectedBuffer.length &&
+            crypto.timingSafeEqual(receivedBuffer, expectedBuffer)
+          ) {
+            return true
+          }
         }
       }
 
@@ -642,7 +712,13 @@ export class LivePayProvider implements PaymentProvider {
 
     return {
       reference: tx?.customer_reference || tx?.reference || payload?.customer_reference || payload?.reference,
-      providerPaymentId: tx?.internal_reference || tx?.transactionId || payload?.internal_reference || payload?.transactionId,
+      providerPaymentId:
+        tx?.internal_reference ||
+        tx?.transactionId ||
+        tx?.provider_transaction_id ||
+        payload?.internal_reference ||
+        payload?.transactionId ||
+        payload?.provider_transaction_id,
       status,
       amount: typeof parsedAmount === 'number' && Number.isFinite(parsedAmount) ? parsedAmount : rawAmount,
       currency: tx?.currency || payload?.currency,
