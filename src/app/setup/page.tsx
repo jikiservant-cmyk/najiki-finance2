@@ -469,9 +469,11 @@ export default function SetupPage() {
           text: `PIN prompt sent via ${data.credentialSource} account (${data.livepayAccount}) — check ${phone.trim()} for USSD prompt!`,
         })
       } else {
+        const reason = data.result?.failureReason || data.error || 'Unknown error'
+        const extraHint = data.detectedOutboundIp ? ` — ${data.hint}` : ''
         setStatusMessage({
           type: 'error',
-          text: `PIN test failed (source: ${data.credentialSource || 'unknown'}, account: ${data.livepayAccount || 'N/A'}): ${data.result?.failureReason || data.error || 'Unknown error'}`,
+          text: `PIN test failed (source: ${data.credentialSource || 'unknown'}, account: ${data.livepayAccount || 'N/A'}): ${reason}${extraHint}`,
         })
       }
     } catch (err: any) {

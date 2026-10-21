@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { requireSuperAdmin } from '@/lib/auth'
 import { getPaymentProvider } from '@/lib/providers'
+import { resolveLivePayProxyUrl } from '@/lib/providers/livepay'
 import { resolveTenantOrPlatformCredentials } from '@/lib/tenant-credentials'
 import { resolveTenantForApplication } from '@/lib/tenant-resolution'
 import { db } from '@/lib/db'
@@ -91,6 +92,9 @@ export async function GET(request: Request) {
       webhookUrl: `${(process.env.NEXTAUTH_URL || 'https://'+request.headers.get('host'))?.replace(/\/+$/,'')}/api/webhooks/livepay`,
     })
 
+    const ipBlockMatch = /IP\s+([\d.:a-fA-F]+)\s+not allowed/i.exec(result.failureReason || '')
+    const staticProxyActive = Boolean(resolveLivePayProxyUrl())
+
     return NextResponse.json({
       ok: result.success,
       tenant: tenant.code,
@@ -99,6 +103,8 @@ export async function GET(request: Request) {
       credentialSource: source,
       livepayAccount: (creds?.accountNo || process.env.LIVEPAY_ACCOUNT_NO || '').slice(0,4) + '****',
       livepayBaseUrl: creds?.baseUrl || process.env.LIVEPAY_BASE_URL || 'https://livepay.me',
+      staticEgressProxyConfigured: staticProxyActive,
+      detectedOutboundIp: ipBlockMatch ? ipBlockMatch[1] : null,
       nextAuthUrl: process.env.NEXTAUTH_URL || null,
       hostedAt: request.headers.get('host'),
       request: { amount, currency, phone: phone.slice(0,4)+'****'+phone.slice(-2), reference },
@@ -106,7 +112,11 @@ export async function GET(request: Request) {
       willPinFire: result.success && result.status === 'processing',
       hint: result.success
         ? 'LivePay accepted → PIN should fire within 5s to phone. Check phone for USSD *165# prompt.'
-        : `LivePay rejected: ${result.failureReason} — fix that and PIN will fire. Common: Account number does not match API key owner, Reference already used, Amount must be at least X, Invalid phone.`,
+        : ipBlockMatch
+          ? staticProxyActive
+            ? `Static proxy outbound IP ${ipBlockMatch[1]} is not yet added to LivePay IP Whitelist for account ${(creds?.accountNo || process.env.LIVEPAY_ACCOUNT_NO || '').slice(0,4)}****. Add ${ipBlockMatch[1]} once in partners.livepay.me → Developer Portal → IP Whitelist!`
+            : `LivePay account ${(creds?.accountNo || process.env.LIVEPAY_ACCOUNT_NO || '').slice(0,4)}**** blocked dynamic serverless IP ${ipBlockMatch[1]}. Either delete ALL IP entries on that exact LivePay account (LivePay rejects 0.0.0.0/0 CIDR syntax) OR set LIVEPAY_PROXY_URL in Netlify env to a static outbound proxy IP and whitelist that one static IP in LivePay.`
+          : `LivePay rejected: ${result.failureReason} — fix that and PIN will fire. Common: Account number does not match API key owner, Reference already used, Amount must be at least X, Invalid phone.`,
     })
   } catch (error: any) {
     console.error('[debug/livepay-ping] error', error)
