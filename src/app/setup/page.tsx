@@ -21,7 +21,9 @@ import {
   AlertCircle,
   Plus,
   RefreshCw,
-  ArrowRight
+  ArrowRight,
+  Send,
+  ShieldAlert
 } from 'lucide-react'
 
 interface WebhookIssue {
@@ -59,6 +61,29 @@ interface InboundEndpoints {
   origin: string | null
   livepay: string | null
   africastalking: string | null
+}
+
+/**
+ * The outcome of a real signed delivery to the partner, from
+ * `POST /api/setup {type:'sendTestWebhook'}`.
+ */
+interface SelfTestResult {
+  mode: 'valid' | 'invalid'
+  sent: boolean
+  ok: boolean
+  verdict: string
+  url: string
+  statusCode: number
+  latencyMs: number
+  timestamp: number
+  signature: string
+  locallyValid: boolean
+  responseSnippet: string
+  headline: string
+  detail: string
+  nextSteps: string[]
+  payload: string
+  headers: Record<string, string>
 }
 
 interface Tenant {
@@ -161,6 +186,11 @@ export default function SetupPage() {
   const [editAppIsActive, setEditAppIsActive] = useState(true)
   const [revealedSecrets, setRevealedSecrets] = useState<Record<string, string>>({})
   const [revealingId, setRevealingId] = useState<string | null>(null)
+  // Results of real test deliveries, keyed `${appId}:${mode}`. They are the
+  // only evidence that the partner accepts a signature made with OUR secret,
+  // so they stay on screen until the page is reloaded.
+  const [testResults, setTestResults] = useState<Record<string, SelfTestResult>>({})
+  const [testingKey, setTestingKey] = useState<string | null>(null)
 
   // Provider Config Form State
   const [editingConfigId, setEditingConfigId] = useState<string | null>(null)
@@ -388,6 +418,51 @@ export default function SetupPage() {
       text: `New key and signing secret issued for "${appName}". Update the partner app now.`,
     })
     fetchData()
+  }
+
+  /**
+   * Send a real signed request to the partner and show what came back.
+   *
+   * Two modes, and the pair is the test:
+   *   valid   — signed with the stored secret; the endpoint should answer 2xx.
+   *   invalid — signed with a key that is deliberately not this application's;
+   *             a verifying endpoint MUST answer 401/403. A 2xx here means the
+   *             endpoint is not checking, so anyone could post a forged success.
+   */
+  async function handleTestWebhook(appId: string, appName: string, mode: 'valid' | 'invalid') {
+    const key = `${appId}:${mode}`
+    setTestingKey(key)
+    try {
+      const res = await fetch('/api/setup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'sendTestWebhook', data: { id: appId, mode } }),
+      })
+      const payload = await res.json().catch(() => ({}))
+
+      if (!res.ok) {
+        setStatusMessage({ type: 'error', text: payload.error || 'Could not send the test delivery' })
+        return
+      }
+
+      setTestResults((current) => ({ ...current, [key]: payload as SelfTestResult }))
+    } catch (error: any) {
+      setStatusMessage({
+        type: 'error',
+        text: `Test delivery failed in the browser: ${error?.message ?? 'network error'}`,
+      })
+    } finally {
+      setTestingKey(null)
+    }
+  }
+
+  /** The same request as a curl command, so the partner can be handed it. */
+  function replayCommand(result: SelfTestResult) {
+    const headers = Object.entries(result.headers)
+      .filter(([name]) => name !== 'Content-Type')
+      .map(([name, value]) => `-H '${name}: ${value}'`)
+      .join(' ')
+    return `curl -i -X POST '${result.url}' -H 'Content-Type: application/json' ${headers} --data '${result.payload}'`
   }
 
   async function handleCreateProvider(e: React.FormEvent<HTMLFormElement>) {
@@ -1013,6 +1088,108 @@ export default function SetupPage() {
                             </span>
                           </div>
                         )}
+                      </div>
+
+                      {/* ── Does the secret actually work? ──
+                          The only way to know is to send a signed request to the
+                          partner and read its answer. The second button sends a
+                          wrong signature on purpose: if that is accepted too, the
+                          endpoint is not verifying anything. */}
+                      <div className="pt-1">
+                        <Label className="text-xs text-muted-foreground">Test the signing secret</Label>
+                        <div className="flex items-center gap-2 mt-1 flex-wrap">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="gap-1"
+                            disabled={!app.webhookUrl || !app.webhookSecretSet || testingKey === `${app.id}:valid`}
+                            onClick={() => handleTestWebhook(app.id, app.name, 'valid')}
+                          >
+                            <Send className="w-3.5 h-3.5" />
+                            {testingKey === `${app.id}:valid` ? 'Sending…' : 'Send signed test'}
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="gap-1"
+                            disabled={!app.webhookUrl || !app.webhookSecretSet || testingKey === `${app.id}:invalid`}
+                            onClick={() => handleTestWebhook(app.id, app.name, 'invalid')}
+                          >
+                            <ShieldAlert className="w-3.5 h-3.5" />
+                            {testingKey === `${app.id}:invalid` ? 'Sending…' : 'Send bad signature'}
+                          </Button>
+                          <span className="text-[11px] text-muted-foreground">
+                            Sends <code className="font-mono">event=&quot;webhook.test&quot;</code> to the real endpoint.
+                          </span>
+                        </div>
+
+                        {(['valid', 'invalid'] as const).map((mode) => {
+                          const result = testResults[`${app.id}:${mode}`]
+                          if (!result) return null
+                          const tone = result.ok
+                            ? 'border-emerald-500/40 bg-emerald-50 dark:bg-emerald-950/30'
+                            : 'border-destructive/40 bg-destructive/5'
+                          return (
+                            <div key={mode} className={`mt-2 rounded-lg border p-3 text-xs ${tone}`}>
+                              <div className="flex items-start gap-2">
+                                {result.ok ? (
+                                  <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0 text-emerald-600" />
+                                ) : (
+                                  <AlertCircle className="w-4 h-4 mt-0.5 shrink-0 text-destructive" />
+                                )}
+                                <div className="space-y-1 flex-1">
+                                  <p className="font-medium">{result.headline}</p>
+                                  <p className="text-muted-foreground">{result.detail}</p>
+                                  <p className="text-[11px] text-muted-foreground font-mono">
+                                    {mode === 'invalid' ? 'wrong key' : 'real key'}
+                                    {' · '}
+                                    {result.statusCode ? `HTTP ${result.statusCode}` : 'no response'}
+                                    {' · '}
+                                    {result.latencyMs} ms
+                                    {' · '}
+                                    ours verified the signature:{' '}
+                                    {String(result.locallyValid)}
+                                  </p>
+                                  {result.nextSteps?.length > 0 && (
+                                    <ul className="list-disc pl-4 text-[11px] text-muted-foreground space-y-0.5">
+                                      {result.nextSteps.map((step) => (
+                                        <li key={step}>{step}</li>
+                                      ))}
+                                    </ul>
+                                  )}
+                                  {result.responseSnippet && (
+                                    <p className="text-[11px] font-mono break-all text-muted-foreground">
+                                      response: {result.responseSnippet}
+                                    </p>
+                                  )}
+                                  {result.sent && (
+                                    <details className="text-[11px]">
+                                      <summary className="cursor-pointer text-muted-foreground">
+                                        What was sent (headers, body, curl)
+                                      </summary>
+                                      <pre className="mt-1 p-2 rounded bg-muted overflow-x-auto whitespace-pre-wrap break-all">
+{Object.entries(result.headers).map(([name, value]) => `${name}: ${value}`).join('\n')}
+
+{result.payload}
+                                      </pre>
+                                      <Button
+                                        type="button"
+                                        variant="outline"
+                                        size="sm"
+                                        className="gap-1 mt-1"
+                                        onClick={() => copyToClipboard(replayCommand(result))}
+                                      >
+                                        <Copy className="w-3.5 h-3.5" /> Copy curl
+                                      </Button>
+                                    </details>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          )
+                        })}
                       </div>
 
                       {/* ── Edit the endpoint ── */}

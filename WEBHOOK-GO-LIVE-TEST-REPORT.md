@@ -5,10 +5,11 @@
 Round 1 tested every webhook in both directions. Round 2 fixed the three warnings that came
 out of it and verified the QStash cron control plane. Round 3 added the missing dashboard
 interface, so the Church app's endpoints and signing secret can be configured and copied
-without a terminal.
+without a terminal. Round 4 proves the secret works — by sending it a real request and a
+deliberately forged one.
 
 ```
-npm test       275 tests, 275 pass, 0 fail
+npm test       290 tests, 290 pass, 0 fail
 npx eslint .   clean
 tsc --noEmit   clean (12 pre-existing errors in src/lib/data.ts — Prisma client
                cannot be generated in this sandbox; no file touched here is affected)
@@ -21,6 +22,7 @@ tsc --noEmit   clean (12 pre-existing errors in src/lib/data.ts — Prisma clien
 | `tests/webhook-ops.test.ts` | 16 | rate limit, SSRF host normalisation, QStash schedules + signed publish |
 | `tests/cron-workers.test.ts` | 16 | every worker endpoint: auth, retry, reconcile, stall detection |
 | `tests/setup-webhooks.test.ts` | 15 | dashboard config: summary rules, edit, reveal, no secret leakage |
+| `tests/webhook-secret-live.test.ts` | 15 | the signing secret against a real verifier, both ways, plus rotation |
 | rest (14 files) | 181 | pre-existing suites, unchanged |
 
 ---
@@ -67,6 +69,108 @@ even displayed the webhook path it had stored.
    client. It now omits both (and `create` no longer returns the key hash). `webhookPath` is also
    validated as a path, because `https://host/hook` in that field produced
    `https://hosthttps://host/hook` at send time.
+
+---
+
+## 0b. Does the signing secret actually work? — tested, and testable from the browser
+
+A local "sign then verify with the same string" check is worthless here: it proves our code
+agrees with itself. What breaks a go-live is the partner holding a **different** secret, or not
+checking at all. Neither is visible from our side except by sending a request and reading the
+answer.
+
+So Setup → Applications → **Test the signing secret** now sends two real requests to the real
+endpoint, and the pair is the test:
+
+| Button | What it sends | Pass looks like |
+| --- | --- | --- |
+| **Send signed test** | `event: "webhook.test"`, signed with the stored secret | `2xx` — endpoint accepted a signature made with *this* secret |
+| **Send bad signature** | same shape, signed with a key that is not this application's | `401`/`403` — the endpoint verifies |
+
+Each result is classified, not just shown as a status code:
+
+| Verdict | What it means |
+| --- | --- |
+| `accepted` | Secret and path are correct; the partner verified our HMAC |
+| `rejected-as-expected` | Bad key refused — the verifier is live, so `accepted` means something |
+| `signature-rejected` | Partner is verifying with a different secret (typo, stale copy, a rotation it never heard about) |
+| `signature-not-checked` | **Bad key accepted.** The endpoint is not verifying: anyone with the URL can forge a success notification |
+| `endpoint-missing` | 404/405 — wrong path, no verifier was reached |
+| `rate-limited` / `endpoint-error` | Not a secret problem; the partner side is throttling or failing |
+| `unreachable` / `blocked` | No socket, or refused by the placeholder/SSRF guard before one was opened |
+
+The panel also prints the exact headers, body and a **copy curl**, so the same request can be
+replayed or handed to the Church app's developer. The key itself is never in that output — the
+signature is an HMAC over a timestamped body, not a credential.
+
+### What was verified (`tests/webhook-secret-live.test.ts`, 15 tests)
+
+Every case runs against a real HTTP server running an **independent** verifier written from the
+published contract — no code shared with the gateway:
+
+```
+X-Najiki-Timestamp: <ms>
+X-Najiki-Signature: t=<ms>,v=<hex hmac-sha256(secret, `${ms}.${rawBody}`)>
+```
+
+- a delivery signed with the secret the page **reveals** is accepted by that verifier, so "copy
+  this into the Church app" is a true instruction, not an assumption;
+- a **real settlement notification** from `payments.ts` verifies with the same revealed secret —
+  the self-test signs exactly like production;
+- a wrong key is refused, `signature-mismatch`, so the pass is real verification;
+- an endpoint that returns 200 to a wrong key is reported as `signature-not-checked` and **fails**;
+- a partner holding someone else's secret produces `signature-rejected` with the fix in the text;
+- 404/405/429/500/503 are classified separately, and a placeholder host and a missing secret are
+  refused before a socket is opened;
+- **rotation revokes**: after "Rotate secret", a delivery signed with the previous secret is
+  rejected by a verifier holding the new one.
+
+### Testing it yourself, in a browser
+
+1. Setup → Applications → Church app card.
+2. Confirm the **Outbound webhook** line shows the real host (not `church.yourdomain.com`) and the
+   card does not say *Won't deliver*.
+3. Click **Send signed test**. `Accepted — HTTP 200` means the Church app took a correctly signed
+   notification.
+4. Click **Send bad signature**. `Correctly refused — HTTP 401` is the second half of the proof:
+   the endpoint is actually checking.
+5. Put the two together:
+   - accepted + refused → **the secret works**;
+   - accepted + accepted → it does not verify; do not go live;
+   - refused + refused → the partner has a different secret. **Reveal → Copy** and paste it into
+     their `NAJIKI_WEBHOOK_SECRET`, then repeat.
+6. For a partner that is not deployed yet, point the base URL at any temporary endpoint that
+   echoes requests (e.g. a webhook.site URL) and read the outcome: it will report `accepted` but
+   its bad-signature twin will also be `accepted`, which is the correct reading — an echo service
+   verifies nothing.
+
+The Church app should ignore any delivery whose body has `event: "webhook.test"` — these carry no
+`paymentIntentId` and must never credit anything. A minimal verifier for them:
+
+```js
+import crypto from 'crypto'
+
+app.post('/api/webhooks/najiki', express.raw({ type: 'application/json' }), (req, res) => {
+  const raw = req.body.toString('utf8')          // the exact bytes, not re-serialised JSON
+  const header = req.get('X-Najiki-Signature') || ''
+  const m = /^t=(\d+),v=([0-9a-f]{64})$/.exec(header)
+  if (!m) return res.status(401).json({ error: 'malformed signature' })
+  if (Math.abs(Date.now() - Number(m[1])) > 5 * 60 * 1000)
+    return res.status(401).json({ error: 'stale timestamp' })
+
+  const expected = crypto.createHmac('sha256', process.env.NAJIKI_WEBHOOK_SECRET)
+    .update(`${m[1]}.${raw}`).digest('hex')
+  const ok = crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(m[2]))
+  if (!ok) return res.status(401).json({ error: 'bad signature' })
+
+  const event = JSON.parse(raw)
+  if (event.event === 'webhook.test' || event.test === true)
+    return res.status(200).json({ received: true, test: true })   // nothing to credit
+
+  // …credit the payment…
+  res.status(200).json({ received: true })
+})
+```
 
 ---
 
@@ -221,6 +325,10 @@ These are configuration, not code. `npm run webhook:preflight` checks all of the
    *tenant's* secret that must match.
 5. **`NEXTAUTH_URL` = the exact public HTTPS origin** — it is the first element of the signed string.
    Setup → Applications now prints the inbound URLs it produces, so a mismatch is visible there.
+6. **Press both test buttons on the Church app card** (see §0b). You are looking for
+   `Accepted` from the signed test and `Correctly refused` from the bad-signature one. Two
+   `Accepted`s mean the Church app does not verify, and that has to be fixed before the first
+   settlement — not after.
 
 ## 6. Remaining warnings
 

@@ -24,6 +24,7 @@ import {
   describeApplicationWebhook,
   inboundWebhookEndpoints,
 } from '@/lib/application-webhook-status'
+import { runWebhookSelfTest } from '@/lib/webhook-selftest'
 
 // Every write path is validated. These payloads previously went straight from
 // `request.json()` into Prisma, so a typo in the dashboard (or a crafted
@@ -76,6 +77,18 @@ const RotateApplicationSchema = z.object({
  * action, never included in the list payload.
  */
 const RevealWebhookSecretSchema = z.object({ id: Id })
+
+/**
+ * Sending a test delivery to the partner.
+ *
+ * `mode: 'invalid'` signs with a key that is not this application's, to find
+ * out whether the partner verifies at all. Both modes are diagnostic: a 2xx to
+ * `invalid` is a finding, not a success.
+ */
+const SelfTestWebhookSchema = z.object({
+  id: Id,
+  mode: z.enum(['valid', 'invalid']).optional().default('valid'),
+})
 
 const ProviderSchema = z.object({
   code: Code,
@@ -421,6 +434,75 @@ export async function POST(request: Request) {
           note:
             'This is the HMAC key for verifying inbound notifications. Do not put it in a client-side bundle.',
         }
+        break
+      }
+
+      case 'sendTestWebhook': {
+        // "Do the secrets actually work?" cannot be answered by inspecting the
+        // stored value: what breaks a go-live is the partner holding a
+        // different one, or not checking at all. So this sends a real signed
+        // request to the real endpoint and reports what came back.
+        const parsed = SelfTestWebhookSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
+
+        const application = await db.application.findUnique({
+          where: { id: parsed.data.id },
+          select: {
+            id: true,
+            code: true,
+            name: true,
+            baseUrl: true,
+            webhookPath: true,
+            webhookSecretEncrypted: true,
+          },
+        })
+        if (!application) {
+          return NextResponse.json({ error: 'Application not found' }, { status: 404 })
+        }
+
+        let secret: string | null = null
+        try {
+          secret = webhookSecretFromRow(application)
+        } catch {
+          secret = null
+        }
+        if (!secret) {
+          return NextResponse.json(
+            {
+              error:
+                `No usable signing secret for ${application.code}, so there is nothing to sign the ` +
+                'test with. Rotate the webhook secret to create one, then run the test again.',
+            },
+            { status: 400 }
+          )
+        }
+
+        const view = describeApplicationWebhook({
+          code: application.code,
+          baseUrl: application.baseUrl,
+          webhookPath: application.webhookPath,
+          hasWebhookSecret: true,
+        })
+        if (!view.webhookUrl) {
+          return NextResponse.json(
+            { error: 'No webhook URL is configured for this application. Set the base URL first.' },
+            { status: 400 }
+          )
+        }
+
+        const test = await runWebhookSelfTest({
+          applicationCode: application.code,
+          webhookUrl: view.webhookUrl,
+          secret,
+          mode: parsed.data.mode,
+        })
+
+        console.warn(
+          `[setup] webhook self-test (${test.mode}) for ${application.code}: ${test.verdict}` +
+            `${test.statusCode ? ` HTTP ${test.statusCode}` : ''}`
+        )
+
+        result = { id: application.id, code: application.code, ...test }
         break
       }
 
