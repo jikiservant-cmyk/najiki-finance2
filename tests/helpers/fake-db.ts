@@ -95,9 +95,24 @@ function matchesCondition(value: any, condition: any): boolean {
   return value === condition
 }
 
+/**
+ * Prisma's compound-unique selectors arrive as `where: { tenantId_appCode_currency: {...} }`.
+ * Without this, a lookup by compound key silently matched nothing and the caller
+ * took the "wallet does not exist" branch — which, in the ledger tests, hid a
+ * second credit behind a second wallet.
+ */
+const COMPOUND_UNIQUE_KEYS: Record<string, string[]> = {
+  tenantId_appCode_currency: ['tenantId', 'appCode', 'currency'],
+}
+
 function matchesWhere(row: Row, where: Row | undefined): boolean {
   if (!where) return true
   return Object.entries(where).every(([key, condition]) => {
+    const compound = COMPOUND_UNIQUE_KEYS[key]
+    if (compound) {
+      if (!condition || typeof condition !== 'object') return false
+      return compound.every((field) => row[field] === (condition as Row)[field])
+    }
     if (key === 'AND') return (condition as Row[]).every((c) => matchesWhere(row, c))
     if (key === 'OR') return (condition as Row[]).some((c) => matchesWhere(row, c))
     if (key === 'NOT') return !matchesWhere(row, condition as Row)

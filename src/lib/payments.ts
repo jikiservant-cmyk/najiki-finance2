@@ -99,8 +99,14 @@ export async function processPayment(data: {
       : null
 
     await db.$transaction([
-      db.paymentIntent.update({
-        where: { id: paymentIntentId },
+      // Guarded, not unconditional. The provider's answer to *initiate* can
+      // arrive after its own callback has already settled the payment: the
+      // member approves on their phone while our HTTP call is still open. A
+      // plain `update` then wrote "pending" over "success", and the next
+      // callback completed the payment a second time. `updateMany` with the
+      // status guard matches zero rows in that case and changes nothing.
+      db.paymentIntent.updateMany({
+        where: { id: paymentIntentId, status: { notIn: ['success', 'failed'] } },
         data: {
           status: providerResponse.status,
           providerPaymentId: providerResponse.providerPaymentId,
@@ -160,8 +166,10 @@ export async function processPayment(data: {
       || err?.code === 'ETIMEDOUT' || err?.name === 'TimeoutError' || err?.message?.includes('fetch failed')
 
     await db.$transaction([
-      db.paymentIntent.update({
-        where: { id: paymentIntentId },
+      // Same guard as above, and it matters more here: a timeout is exactly
+      // when the callback may already have settled the payment.
+      db.paymentIntent.updateMany({
+        where: { id: paymentIntentId, status: { notIn: ['success', 'failed'] } },
         data: {
           // Ambiguous: leave it reconcilable (processing), do NOT mark failed!
           status: isNetworkAmbiguous ? 'processing' : 'failed',
@@ -246,60 +254,75 @@ export async function completePayment(data: {
       // Currency-aware: UGX has no minor unit, so this is not a x100. See
       // src/lib/money.ts for why a flat x100 credited 100x the real money.
       const amountMinor = toMinorUnits(amount, currency)
-
-      const existingWallet = await tx.walletAccount.findUnique({
-        where: {
-          tenantId_appCode_currency: {
-            tenantId,
-            appCode,
-            currency,
-          },
-        },
-      })
-
-      let walletId: string
-      let balanceAfterMinor: bigint
-
-      if (!existingWallet) {
-        const created = await tx.walletAccount.create({
-          data: {
-            tenantId,
-            appCode,
-            currency,
-            balanceMinor: amountMinor,
-            version: 1,
-          },
-        })
-        walletId = created.id
-        balanceAfterMinor = created.balanceMinor
-      } else {
-        const updated = await tx.walletAccount.update({
-          where: { id: existingWallet.id, version: existingWallet.version },
-          data: {
-            balanceMinor: { increment: amountMinor },
-            version: { increment: 1 },
-          },
-        })
-        walletId = updated.id
-        balanceAfterMinor = updated.balanceMinor
-      }
-
-      // Record immutable ledger entry with idempotency key
       const idempotencyKey = `${paymentIntentId}:payment_in`
-      await tx.ledgerEntry.upsert({
+
+      // The ledger entry — not the intent status — is the authority on whether
+      // the money was already credited. The status guard above stops the normal
+      // duplicate, but if a status ever regresses (an older build, a manual
+      // fix, a restored backup), the balance would be incremented again while
+      // the `upsert` below silently did nothing, leaving the wallet larger than
+      // the sum of its own entries and the tenant paid out money never received.
+      const alreadyCredited = await tx.ledgerEntry.findUnique({
         where: { idempotencyKey },
-        create: {
-          walletId,
-          paymentIntentId,
-          direction: 'credit',
-          amountMinor,
-          currency,
-          entryType: 'payment_in',
-          idempotencyKey,
-          balanceAfterMinor,
-        },
-        update: {},
+        select: { id: true },
       })
+
+      if (!alreadyCredited) {
+        const existingWallet = await tx.walletAccount.findUnique({
+          where: {
+            tenantId_appCode_currency: {
+              tenantId,
+              appCode,
+              currency,
+            },
+          },
+        })
+
+        let walletId: string
+        let balanceAfterMinor: bigint
+
+        if (!existingWallet) {
+          const created = await tx.walletAccount.create({
+            data: {
+              tenantId,
+              appCode,
+              currency,
+              balanceMinor: amountMinor,
+              version: 1,
+            },
+          })
+          walletId = created.id
+          balanceAfterMinor = created.balanceMinor
+        } else {
+          const updated = await tx.walletAccount.update({
+            where: { id: existingWallet.id, version: existingWallet.version },
+            data: {
+              balanceMinor: { increment: amountMinor },
+              version: { increment: 1 },
+            },
+          })
+          walletId = updated.id
+          balanceAfterMinor = updated.balanceMinor
+        }
+
+        // `create`, not `upsert`. Two concurrent completions can both find no
+        // entry; the unique key on `idempotencyKey` then rejects the loser and
+        // rolls back its whole transaction, including the balance increment.
+        // An `upsert { update: {} }` would have let that increment commit with no
+        // entry to account for it.
+        await tx.ledgerEntry.create({
+          data: {
+            walletId,
+            paymentIntentId,
+            direction: 'credit',
+            amountMinor,
+            currency,
+            entryType: 'payment_in',
+            idempotencyKey,
+            balanceAfterMinor,
+          },
+        })
+      }
     }
 
     // P0-7: Write outbound notification ledger record in the transaction
