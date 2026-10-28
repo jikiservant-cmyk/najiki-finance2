@@ -56,16 +56,33 @@ const UpdateApplicationSchema = ApplicationSchema.partial({ code: true }).extend
 /**
  * Rotate an application's credentials.
  *
- * `rotateWebhookSecret` defaults to **false** deliberately: the webhook secret
- * is what a partner verifies our outbound notifications with, so rotating it
- * silently would make every delivery fail signature verification on their side
- * until they are told the new one. Rotating the API key alone is the common case
- * (a leaked or lost key) and has no partner-side effect.
+ * The two credentials are independent, because they break different things:
+ *
+ *   * the **API key** is what the partner presents on every request. Rotating it
+ *     is a partner-side change and has no effect on our outbound deliveries.
+ *   * the **webhook signing secret** is what the partner verifies our
+ *     notifications with. Rotating it is a us-side change that breaks their
+ *     verifier until they are told the new value.
+ *
+ * `rotateApiKey` defaults to true only when the secret is *not* being rotated.
+ * That keeps the original `{ id }` call meaning "new key please", while making
+ * `{ id, rotateWebhookSecret: true }` mean "new signing secret only". It used to
+ * issue a new API key as well — so fixing a signature problem at the dashboard
+ * silently broke the partner's authentication at the same moment, and the key
+ * was only ever displayed once.
  */
-const RotateApplicationSchema = z.object({
-  id: Id,
-  rotateWebhookSecret: z.boolean().optional().default(false),
-})
+const RotateApplicationSchema = z
+  .object({
+    id: Id,
+    rotateApiKey: z.boolean().optional(),
+    rotateWebhookSecret: z.boolean().optional().default(false),
+  })
+  // Refusing "rotate nothing" is the point of the explicit flags: a typo in the
+  // body would otherwise return 200 having changed nothing, and the operator
+  // would authenticate the partner with a key that no longer exists.
+  .refine((value) => value.rotateApiKey !== false || value.rotateWebhookSecret === true, {
+    message: 'Nothing to rotate: set rotateApiKey and/or rotateWebhookSecret',
+  })
 
 /**
  * Revealing the outbound signing secret.
@@ -516,18 +533,27 @@ export async function POST(request: Request) {
 
         const credentials = newApplicationCredentials()
         const rotateWebhookSecret = parsed.data.rotateWebhookSecret === true
+        // An absent flag means "whatever this call is for": a bare `{ id }` is
+        // still a key rotation, but rotating the secret does not drag the key
+        // along with it.
+        const rotateApiKey = parsed.data.rotateApiKey ?? !rotateWebhookSecret
 
         const updated = await db.application.update({
           where: { id: parsed.data.id },
           data: {
-            apiKeyHash: credentials.data.apiKeyHash,
-            apiKeyHint: credentials.data.apiKeyHint,
-            apiKeyRotatedAt: credentials.data.apiKeyRotatedAt,
-            // Destroying the old cleartext is what makes this a real
-            // revocation rather than a second working key. `findApplicationByApiKey`
-            // consults the cleartext column only for rows with no hash, so once
-            // this row has the new hash the superseded key is dead.
-            apiKey: null,
+            ...(rotateApiKey
+              ? {
+                  apiKeyHash: credentials.data.apiKeyHash,
+                  apiKeyHint: credentials.data.apiKeyHint,
+                  apiKeyRotatedAt: credentials.data.apiKeyRotatedAt,
+                  // Destroying the old cleartext is what makes this a real
+                  // revocation rather than a second working key.
+                  // `findApplicationByApiKey` consults the cleartext column only
+                  // for rows with no hash, so once this row has the new hash the
+                  // superseded key is dead.
+                  apiKey: null,
+                }
+              : {}),
             ...(rotateWebhookSecret
               ? { webhookSecretEncrypted: credentials.data.webhookSecretEncrypted }
               : {}),
@@ -535,11 +561,13 @@ export async function POST(request: Request) {
           omit: { apiKey: true, apiKeyHash: true, webhookSecretEncrypted: true },
         })
 
-        // Returned exactly once. Neither value is recoverable afterwards.
+        // Each value is returned exactly once, and only if it was rotated.
+        // Neither is recoverable afterwards.
         result = {
           ...updated,
-          apiKey: credentials.plaintextApiKey,
+          apiKeyRotated: rotateApiKey,
           webhookSecretRotated: rotateWebhookSecret,
+          ...(rotateApiKey ? { apiKey: credentials.plaintextApiKey } : {}),
           ...(rotateWebhookSecret ? { webhookSecret: credentials.webhookSecret } : {}),
         }
         break

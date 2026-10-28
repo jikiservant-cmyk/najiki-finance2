@@ -169,6 +169,14 @@ export default function SetupPage() {
   const [loading, setLoading] = useState(true)
   const [activeTab, setActiveTab] = useState('applications')
   const [newApiKey, setNewApiKey] = useState<string | null>(null)
+  // Credentials issued by a rotation, keyed by application id, so they render
+  // under the card that produced them. They used to go to a banner at the very
+  // top of the page — above the tabs — so rotating from a card near the bottom
+  // put the new key off-screen and it looked as though nothing had happened.
+  // Only in this tab's memory: it is plaintext, shown once, and never re-fetched.
+  const [rotatedCreds, setRotatedCreds] = useState<
+    Record<string, { apiKey?: string; webhookSecret?: string }>
+  >({})
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const [inbound, setInbound] = useState<InboundEndpoints | null>(null)
 
@@ -273,6 +281,14 @@ export default function SetupPage() {
       e.currentTarget.reset()
       setNewAppIsActive(true)
       fetchData()
+      // Same discovery problem as a rotation: the key is shown once, so bring
+      // it into view instead of relying on the operator noticing it appeared
+      // above the tabs.
+      window.setTimeout(() => {
+        document
+          .getElementById('new-api-key-banner')
+          ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }, 100)
     } else {
       const err = await res.json()
       setStatusMessage({ type: 'error', text: err.error || 'Failed to create application' })
@@ -280,39 +296,62 @@ export default function SetupPage() {
   }
 
   /**
-   * Rotate an application's API key.
+   * Rotate an application's API key — and only the API key.
    *
    * Confirmed first, because it is irreversible and immediately breaks any
-   * integration still using the old key. The new key is shown once, in the same
-   * banner a newly created application uses.
+   * integration still using the old key. The new key renders in the card that
+   * issued it and is scrolled into view: it used to be dropped into the banner
+   * at the top of the page, off-screen from the button that produced it, which
+   * read as "the rotate button does nothing".
    */
-  async function handleRotateApplication(appId: string, appName: string) {
+  async function handleRotateApiKey(appId: string, appName: string) {
     if (!window.confirm(
       `Rotate the API key for "${appName}"?\n\n` +
-      'The current key stops working immediately. Any integration still using ' +
-      'it will start getting 401s until it is updated.'
+      'The current key stops working immediately: the partner app will get 401s ' +
+      'until it is given the new one.\n\n' +
+      'The webhook signing secret is NOT affected.'
     )) return
 
     try {
       const res = await fetch('/api/setup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'rotateApplication', data: { id: appId } }),
+        body: JSON.stringify({
+          type: 'rotateApplication',
+          data: { id: appId, rotateApiKey: true, rotateWebhookSecret: false },
+        }),
       })
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
-        setStatusMessage({ type: 'error', text: err.error || 'Failed to rotate API key' })
+        const detail = Array.isArray(err.details) ? ` (${err.details.join('; ')})` : ''
+        setStatusMessage({ type: 'error', text: (err.error || 'Failed to rotate API key') + detail })
         return
       }
 
       const rotated = await res.json()
-      setNewApiKey(rotated.apiKey)
+      if (!rotated.apiKey) {
+        setStatusMessage({
+          type: 'error',
+          text: 'The server did not return the new key. Nothing was shown and the old key is gone — rotate again.',
+        })
+        fetchData()
+        return
+      }
+
+      setRotatedCreds((current) => ({ ...current, [appId]: { ...current[appId], apiKey: rotated.apiKey } }))
       setStatusMessage({
         type: 'success',
-        text: `New API key issued for "${appName}". Copy it now — it is not stored and cannot be shown again.`,
+        text: `New API key for "${appName}" — it is on that application's card below. Copy it now; it is not stored and cannot be shown again.`,
       })
       fetchData()
+      // The card may be taller than the viewport, so bring the key to the
+      // operator rather than relying on them noticing it appeared.
+      window.setTimeout(() => {
+        document
+          .getElementById(`rotated-api-key-${appId}`)
+          ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }, 100)
     } catch {
       setStatusMessage({ type: 'error', text: 'Failed to rotate API key' })
     }
@@ -387,37 +426,57 @@ export default function SetupPage() {
     }
   }
 
-  /** Replace the signing secret. The new value is shown once, in the banner. */
+  /**
+   * Replace the signing secret — and only the signing secret.
+   *
+   * This used to call `{ rotateWebhookSecret: true }` alone, which the server
+   * treated as "rotate both": fixing a signature problem silently issued a new
+   * API key as well, so the partner started getting 401s on its own requests at
+   * the exact moment the operator was trying to unbreak verification. The API
+   * key is untouched now, and the confirmation says so.
+   */
   async function handleRotateWebhookSecret(appId: string, appName: string) {
     if (!window.confirm(
       `Rotate the webhook signing secret for "${appName}"?\n\n` +
       'Until the partner app is updated it will reject every notification with 401. ' +
-      'Deliveries are retried with backoff, so nothing is lost while you update it.'
+      'Deliveries are retried with backoff, so nothing is lost while you update it.\n\n' +
+      'The API key is NOT affected.'
     )) return
 
-    const res = await fetch('/api/setup', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: 'rotateApplication', data: { id: appId, rotateWebhookSecret: true } }),
-    })
-    const payload = await res.json().catch(() => ({}))
+    try {
+      const res = await fetch('/api/setup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'rotateApplication',
+          data: { id: appId, rotateApiKey: false, rotateWebhookSecret: true },
+        }),
+      })
+      const payload = await res.json().catch(() => ({}))
 
-    if (!res.ok) {
-      setStatusMessage({ type: 'error', text: payload.error || 'Failed to rotate the webhook secret' })
-      return
-    }
+      if (!res.ok) {
+        setStatusMessage({ type: 'error', text: payload.error || 'Failed to rotate the webhook secret' })
+        return
+      }
 
-    // The rotation also issues a new API key; keep it visible rather than
-    // silently invalidating whatever the partner is using.
-    if (payload.apiKey) setNewApiKey(payload.apiKey)
-    if (payload.webhookSecret) {
-      setRevealedSecrets((current) => ({ ...current, [appId]: payload.webhookSecret }))
+      // Shown inline in the card's secret block, which is where the operator
+      // already looks for it — revealed and rotatable in one place.
+      if (payload.webhookSecret) {
+        setRevealedSecrets((current) => ({ ...current, [appId]: payload.webhookSecret }))
+      }
+      setStatusMessage({
+        type: 'success',
+        text: `New signing secret issued for "${appName}". The API key is unchanged. Copy the secret into the partner app, then run both tests again.`,
+      })
+      fetchData()
+      window.setTimeout(() => {
+        document
+          .getElementById(`webhook-secret-${appId}`)
+          ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }, 100)
+    } catch {
+      setStatusMessage({ type: 'error', text: 'Failed to rotate the webhook secret' })
     }
-    setStatusMessage({
-      type: 'success',
-      text: `New key and signing secret issued for "${appName}". Update the partner app now.`,
-    })
-    fetchData()
   }
 
   /**
@@ -728,9 +787,55 @@ export default function SetupPage() {
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
-  function copyToClipboard(text: string) {
-    navigator.clipboard.writeText(text)
-    setStatusMessage({ type: 'success', text: 'Copied to clipboard!' })
+  /**
+   * Copy text, and report honestly whether it worked.
+   *
+   * This was a bare `navigator.clipboard.writeText()` followed by an
+   * unconditional "Copied to clipboard!". That API is undefined outside a
+   * secure context, rejects when the document is not focused or the permission
+   * is denied, and is blocked outright in some embedded/proxied browsers — so
+   * on a plain-HTTP dashboard the operator was told the key had been copied
+   * while nothing had. With a credential that is displayed exactly once, a lie
+   * here loses it.
+   */
+  async function copyToClipboard(text: string): Promise<boolean> {
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(text)
+        setStatusMessage({ type: 'success', text: 'Copied to clipboard!' })
+        return true
+      } catch {
+        // Permission denied or document not focused — try the legacy path.
+      }
+    }
+
+    try {
+      const area = document.createElement('textarea')
+      area.value = text
+      area.setAttribute('readonly', '')
+      area.style.position = 'fixed'
+      area.style.top = '-1000px'
+      area.style.opacity = '0'
+      document.body.appendChild(area)
+      area.select()
+      area.setSelectionRange(0, text.length)
+      const copied = document.execCommand('copy')
+      document.body.removeChild(area)
+      if (copied) {
+        setStatusMessage({ type: 'success', text: 'Copied to clipboard!' })
+        return true
+      }
+    } catch {
+      // Fall through to the message below.
+    }
+
+    setStatusMessage({
+      type: 'error',
+      text:
+        'Your browser blocked the clipboard. Select the value and press Ctrl+C ' +
+        '(⌘C on a Mac) — it stays on screen until you reload the page.',
+    })
+    return false
   }
 
   function maskKey(key?: string) {
@@ -792,12 +897,13 @@ export default function SetupPage() {
       )}
 
       {newApiKey && (
-        <Alert className="mb-8 border-emerald-500 bg-emerald-50 dark:bg-emerald-950/40">
+        <Alert id="new-api-key-banner" className="mb-8 border-emerald-500 bg-emerald-50 dark:bg-emerald-950/40">
           <AlertDescription className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
             <div className="flex-1">
               <p className="font-bold text-emerald-900 dark:text-emerald-200">New Application API Key Generated</p>
               <p className="text-xs text-muted-foreground mb-1">
-                Save this key now. The client application passes this in <code>Authorization: Bearer nk_...</code>
+                Save this key now. The client application passes this in{' '}
+                <code>Authorization: Bearer njk_...</code>
               </p>
               <p className="text-emerald-800 dark:text-emerald-300 font-mono text-xs bg-emerald-100/70 dark:bg-emerald-900/50 p-2 rounded break-all select-all">
                 {newApiKey}
@@ -1020,7 +1126,12 @@ export default function SetupPage() {
 
                       {/* ── Signing secret: what the partner verifies with ── */}
                       <div className="pt-1">
-                        <Label className="text-xs text-muted-foreground">Outbound signing secret</Label>
+                        <Label
+                          id={`webhook-secret-${app.id}`}
+                          className="text-xs text-muted-foreground"
+                        >
+                          Outbound signing secret
+                        </Label>
                         {revealedSecrets[app.id] ? (
                           <>
                             <div className="flex items-center gap-2 mt-1">
@@ -1079,7 +1190,7 @@ export default function SetupPage() {
                               onClick={() => handleRotateWebhookSecret(app.id, app.name)}
                             >
                               <RefreshCw className="w-3.5 h-3.5" />
-                              {app.webhookSecretSet ? 'Rotate secret' : 'Create secret'}
+                              {app.webhookSecretSet ? 'Rotate signing secret' : 'Create signing secret'}
                             </Button>
                             <span className="text-[11px] text-muted-foreground">
                               {app.webhookSecretSet
@@ -1277,31 +1388,78 @@ export default function SetupPage() {
                         )}
                       </div>
 
-                      {app.apiKeyHint && (
-                        <div className="pt-2">
-                          <Label className="text-xs text-muted-foreground">
-                            Client API Key:
-                          </Label>
-                          <div className="flex items-center gap-2 mt-1">
-                            <p className="text-xs font-mono bg-muted p-2 rounded flex-1 overflow-x-auto">
-                              njk_••••••••{app.apiKeyHint}
+                      {/* ── Client API key ──
+                          Rendered even when no hint is stored: the rotate
+                          button used to live inside this block, so an
+                          application whose key predates the hint column had no
+                          way to issue one at all. */}
+                      <div className="pt-2">
+                        <Label className="text-xs text-muted-foreground">Client API Key</Label>
+                        <div className="flex items-center gap-2 mt-1">
+                          <p className="text-xs font-mono bg-muted p-2 rounded flex-1 overflow-x-auto">
+                            {app.apiKeyHint ? `njk_••••••••${app.apiKeyHint}` : '— no key issued —'}
+                          </p>
+                        </div>
+                        <p className="text-[11px] text-muted-foreground mt-1">
+                          Only a hash is stored, so the key cannot be shown again. If it is
+                          lost or leaked, rotate it — the old one stops working immediately
+                          and the new one appears right here.
+                        </p>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="mt-2 gap-1"
+                          onClick={() => handleRotateApiKey(app.id, app.name)}
+                        >
+                          <RefreshCw className="w-3.5 h-3.5" />
+                          Rotate API key
+                        </Button>
+
+                        {rotatedCreds[app.id]?.apiKey && (
+                          <div
+                            id={`rotated-api-key-${app.id}`}
+                            className="mt-2 rounded-lg border border-emerald-500/60 bg-emerald-50 dark:bg-emerald-950/30 p-3"
+                          >
+                            <p className="text-xs font-semibold text-emerald-900 dark:text-emerald-200">
+                              New API key for {app.name} — shown once, not stored
+                            </p>
+                            <div className="flex items-center gap-2 mt-1">
+                              <code className="text-xs font-mono bg-emerald-100/70 dark:bg-emerald-900/50 p-2 rounded flex-1 overflow-x-auto break-all select-all">
+                                {rotatedCreds[app.id].apiKey}
+                              </code>
+                              <Button
+                                type="button"
+                                size="sm"
+                                className="gap-1 shrink-0"
+                                onClick={() => copyToClipboard(rotatedCreds[app.id].apiKey!)}
+                              >
+                                <Copy className="w-3.5 h-3.5" /> Copy
+                              </Button>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                className="shrink-0"
+                                onClick={() =>
+                                  setRotatedCreds((current) => {
+                                    const next = { ...current, [app.id]: { ...current[app.id] } }
+                                    delete next[app.id].apiKey
+                                    return next
+                                  })
+                                }
+                              >
+                                Hide
+                              </Button>
+                            </div>
+                            <p className="text-[11px] text-muted-foreground mt-1">
+                              The partner sends this as{' '}
+                              <code className="font-mono">Authorization: Bearer …</code>. It is
+                              not recoverable — if it is lost, rotate again.
                             </p>
                           </div>
-                          <p className="text-[11px] text-muted-foreground mt-1">
-                            Only a hash is stored, so the key cannot be shown again. If it
-                            is lost or leaked, rotate it — the old one stops working immediately.
-                          </p>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            className="mt-2"
-                            onClick={() => handleRotateApplication(app.id, app.name)}
-                          >
-                            Rotate API Key
-                          </Button>
-                        </div>
-                      )}
+                        )}
+                      </div>
                     </CardContent>
                   </Card>
                 ))

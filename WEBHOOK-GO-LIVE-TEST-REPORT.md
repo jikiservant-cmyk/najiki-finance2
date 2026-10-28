@@ -6,10 +6,10 @@ Round 1 tested every webhook in both directions. Round 2 fixed the three warning
 out of it and verified the QStash cron control plane. Round 3 added the missing dashboard
 interface, so the Church app's endpoints and signing secret can be configured and copied
 without a terminal. Round 4 proves the secret works — by sending it a real request and a
-deliberately forged one.
+deliberately forged one. Round 5 fixes credential rotation, which lost the new key.
 
 ```
-npm test       290 tests, 290 pass, 0 fail
+npm test       309 tests, 309 pass, 0 fail
 npx eslint .   clean
 tsc --noEmit   clean (12 pre-existing errors in src/lib/data.ts — Prisma client
                cannot be generated in this sandbox; no file touched here is affected)
@@ -23,6 +23,7 @@ tsc --noEmit   clean (12 pre-existing errors in src/lib/data.ts — Prisma clien
 | `tests/cron-workers.test.ts` | 16 | every worker endpoint: auth, retry, reconcile, stall detection |
 | `tests/setup-webhooks.test.ts` | 15 | dashboard config: summary rules, edit, reveal, no secret leakage |
 | `tests/webhook-secret-live.test.ts` | 15 | the signing secret against a real verifier, both ways, plus rotation |
+| `tests/setup-rotation.test.ts` | 9 | API-key vs signing-secret rotation, and the copy/render fixes |
 | rest (14 files) | 181 | pre-existing suites, unchanged |
 
 ---
@@ -46,8 +47,8 @@ even displayed the webhook path it had stored.
   preflight script and the tests, so the dashboard cannot say "fine" about something that will
   not deliver.
 - **The signing secret**, on demand: **Reveal → Copy**, decrypted for that single action and
-  never included in the list payload. **Create / Rotate secret** issues a new one and shows it
-  once. The rotation also returns the new API key rather than silently invalidating it.
+  never included in the list payload. **Create / Rotate signing secret** issues a new one and
+  shows it once, inline.
 - **Edit endpoint**: `name`, `baseUrl`, `webhookPath`, `internalSecretRef`, `active` — saved
   through the `updateApplication` branch that already existed but had no UI calling it. The save
   reports back the URL that will actually be used.
@@ -69,6 +70,44 @@ even displayed the webhook path it had stored.
    client. It now omits both (and `create` no longer returns the key hash). `webhookPath` is also
    validated as a path, because `https://host/hook` in that field produced
    `https://hosthttps://host/hook` at send time.
+
+### 0a · Rotating credentials without losing them
+
+"I rotate the API key and I cannot copy it." Three separate causes, all now fixed:
+
+1. **The new key rendered above the tabs.** The banner lives at the top of the page; the
+   *Rotate* button is at the bottom of a card. On any normal screen the key appeared
+   off-screen, so the button looked like it did nothing. Each rotation now renders **on the
+   card that produced it** and is scrolled into view.
+2. **Copy lied.** `copyToClipboard` was a bare `navigator.clipboard.writeText()` with an
+   unconditional "Copied to clipboard!". That API is undefined outside a secure context and
+   rejects when the document is not focused or the permission is denied — so on a plain-HTTP
+   or proxied dashboard it reported success while copying nothing, for a value shown exactly
+   once. It is now awaited, falls back to a hidden textarea + `execCommand('copy')`, and on
+   failure says so and tells the operator to select the text and press Ctrl+C.
+3. **Rotating the secret also rotated the API key.** `{ rotateWebhookSecret: true }` was
+   treated as "rotate both", so fixing a signature problem issued a new key at the same
+   moment and the partner began getting 401s on its own requests. The two are independent
+   now, and the confirmation says which one is being replaced.
+
+| Action | API key | Signing secret | Confirmation says |
+| --- | --- | --- | --- |
+| **Rotate API key** | replaced | untouched | "The webhook signing secret is NOT affected." |
+| **Rotate signing secret** | untouched | replaced | "The API key is NOT affected." |
+| `POST { type:'rotateApplication', id }` (old runbooks) | replaced | untouched | — |
+| both flags set | replaced | replaced | — |
+| both flags `false` | refused, `400` | refused | "Nothing to rotate" |
+
+The last row matters: a typo in the body used to return `200` having changed nothing, and the
+operator would then hand the partner a key that no longer existed.
+
+The banner also advertised `Authorization: Bearer nk_...` while every key is `njk_...`.
+
+**Tests:** `tests/setup-rotation.test.ts` (9). The server half is driven for real — a secret
+rotation leaves the key hash untouched and the partner's key still verifies; a key rotation
+leaves the stored secret byte-identical; the old `{ id }` shape still means "new key"; and
+"rotate nothing" is a 400. The two rendering fixes are guarded at the source level, since this
+runner has no browser.
 
 ---
 
