@@ -5,7 +5,12 @@ import path from 'node:path'
 import Module from 'node:module'
 import ts from 'typescript'
 import { isPlatformFeeType, resolvePartnerWebhookUrl } from '../src/lib/constants.ts'
-import { isConfirmedTerminalStatus, parseTenantProviderCredentials } from '../src/lib/payment-security.ts'
+// Loaded through the shared helper (not a bare ESM import) because
+// payment-security now imports ./provider-amount; see tests/helpers/ts-load.ts.
+const { isConfirmedTerminalStatus, parseTenantProviderCredentials } = (await import('./helpers/ts-load.ts')).loadTsModule<{
+  isConfirmedTerminalStatus: (result: any, expected?: any) => boolean
+  parseTenantProviderCredentials: (raw: unknown) => any
+}>('src/lib/payment-security.ts')
 import { normalizePhone } from '../src/lib/phone.ts'
 import { buildSignatureUrlCandidates } from '../src/lib/webhook-url.ts'
 import { verifyNotificationSignature } from '../src/lib/notification-signature.ts'

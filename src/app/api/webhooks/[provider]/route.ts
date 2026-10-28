@@ -19,6 +19,7 @@
 
 import crypto from 'crypto'
 import { NextResponse } from 'next/server'
+import { checkProviderAmount } from '@/lib/provider-amount'
 import { db } from '@/lib/db'
 import { getAvailableProviders, getPaymentProvider } from '@/lib/providers'
 import { createWebhookLog, getPaymentByReference } from '@/lib/data'
@@ -378,19 +379,31 @@ export async function POST(
     const normalizedStatus = String(parsedWebhook.status || '').toLowerCase()
 
     // ── 5. Amount / currency gates against the stored intent ───────────────
+    //
+    // LivePay reports its own collection fee in `charge`, and it is not
+    // consistent about whether that fee is inside `amount`:
+    //   • production 2026-10-28: intent 17,000, `amount: 17510, charge: 510`
+    //     (LivePay dashboard: revenue 17,510, balance 17,000) => fee inside;
+    //   • its documented flat payload: `amount: 5000, charge: 150` for a
+    //     5,000 request => fee already excluded.
+    // Comparing only the gross rejected the first (AMOUNT_MISMATCH), so the
+    // payment was never settled and the partner app was never told. The gate
+    // now accepts an exact match on EITHER the gross or the net, never a
+    // tolerance band. See src/lib/provider-amount.ts.
     const expectedAmount = Number(paymentIntent.amount)
-    const reportedAmount =
-      parsedWebhook.amount !== undefined && parsedWebhook.amount !== null
-        ? Number(parsedWebhook.amount)
-        : expectedAmount
+    const amountCheck = checkProviderAmount({
+      expected: expectedAmount,
+      reported: parsedWebhook.amount as number | string | null | undefined,
+      charge: parsedWebhook.charge as number | string | null | undefined,
+    })
 
-    if (!Number.isFinite(reportedAmount) || Math.abs(expectedAmount - reportedAmount) > 0.001) {
+    if (!amountCheck.ok) {
       await db.webhookLog.update({
         where: { id: webhookLog.id },
         data: {
           paymentIntentId: paymentIntent.id,
           processed: true,
-          processingError: `AMOUNT_MISMATCH expected=${expectedAmount} reported=${reportedAmount}`,
+          processingError: amountCheck.detail,
         },
       })
       await db.paymentTransaction.create({
@@ -398,13 +411,27 @@ export async function POST(
           paymentIntentId: paymentIntent.id,
           status: 'disputed',
           rawProviderResponse: sanitizedPayload,
-          note: `AMOUNT_MISMATCH | expected ${expectedAmount} ${paymentIntent.currency}, got ${reportedAmount} ${parsedWebhook.currency || ''}`,
+          note:
+            `AMOUNT_MISMATCH | expected ${expectedAmount} ${paymentIntent.currency}, ` +
+            `got ${amountCheck.reported} ${parsedWebhook.currency || ''} ` +
+            `(charge ${amountCheck.charge}, net ${amountCheck.net})` +
+            (amountCheck.reason === 'AMOUNT_MISMATCH' ? '' : ` [${amountCheck.reason}]`),
         },
       })
       console.error(
-        `[Webhook] Amount mismatch on ${paymentIntent.reference}: expected ${expectedAmount}, reported ${reportedAmount}`
+        `[Webhook] Amount mismatch on ${paymentIntent.reference}: ${amountCheck.detail}`
       )
       return NextResponse.json({ error: 'Amount mismatch' }, { status: 422 })
+    }
+
+    // The intent amount is authoritative (gross never reaches the ledger): a
+    // fee-bearing settlement credits exactly what the partner asked for.
+    if (amountCheck.charge > 0) {
+      console.info(
+        `[Webhook] ${paymentIntent.reference} settled on ${amountCheck.match} ` +
+          `(reported ${amountCheck.reported}, provider charge ${amountCheck.charge}, net ${amountCheck.net}); ` +
+          `ledger credited the intent amount ${expectedAmount}, never the gross`
+      )
     }
 
     if (

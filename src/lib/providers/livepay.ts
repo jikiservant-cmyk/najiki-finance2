@@ -479,10 +479,19 @@ export class LivePayProvider implements PaymentProvider {
             ? Number(rawAmount)
             : undefined
 
+        // Same gross/net split as the webhook parser: `/transaction-status`
+        // returns the payer's gross plus LivePay's fee.
+        const rawCharge = tx?.charge ?? data?.charge
+        const parsedCharge =
+          rawCharge === undefined || rawCharge === null || rawCharge === ''
+            ? undefined
+            : Number(rawCharge)
+
         return {
           success: true,
           status,
           amount: parsedAmount !== undefined && Number.isFinite(parsedAmount) ? parsedAmount : rawAmount,
+          charge: parsedCharge !== undefined && Number.isFinite(parsedCharge) ? parsedCharge : undefined,
           currency: tx?.currency || data?.currency || currency,
           providerPaymentId:
             tx?.internal_reference ||
@@ -710,6 +719,17 @@ export class LivePayProvider implements PaymentProvider {
         ? Number(rawAmount)
         : rawAmount
 
+    // LivePay bills the payer GROSS and reports its own collection fee in
+    // `charge` (e.g. amount 17,510 / charge 510 for a 17,000 request). Dropping
+    // it here is what made every fee-bearing payment fail the amount gate:
+    // callers could only compare the gross to the intent. See
+    // src/lib/provider-amount.ts.
+    const rawCharge = tx?.charge ?? payload?.charge
+    const parsedCharge =
+      rawCharge === undefined || rawCharge === null || rawCharge === ''
+        ? undefined
+        : Number(rawCharge)
+
     return {
       reference: tx?.customer_reference || tx?.reference || payload?.customer_reference || payload?.reference,
       providerPaymentId:
@@ -721,6 +741,7 @@ export class LivePayProvider implements PaymentProvider {
         payload?.provider_transaction_id,
       status,
       amount: typeof parsedAmount === 'number' && Number.isFinite(parsedAmount) ? parsedAmount : rawAmount,
+      charge: typeof parsedCharge === 'number' && Number.isFinite(parsedCharge) ? parsedCharge : undefined,
       currency: tx?.currency || payload?.currency,
       metadata: payload,
       failureReason:

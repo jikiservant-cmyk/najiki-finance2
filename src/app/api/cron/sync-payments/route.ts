@@ -5,7 +5,12 @@ import { completePayment, enqueueWebhookNotification } from '@/lib/payments'
 import { verifyCronRequest } from '@/lib/qstash-verify'
 import { resolveTenantOrPlatformCredentials } from '@/lib/tenant-credentials'
 import { isConfirmedTerminalStatus } from '@/lib/payment-security'
-import { isPlatformFeeType, resolvePartnerWebhookUrl } from '@/lib/constants'
+import {
+  isPlatformFeeType,
+  reconcileCreatedAfter,
+  reconcileMaxAgeDays,
+  resolvePartnerWebhookUrl,
+} from '@/lib/constants'
 import { fallbackSigningSecretsFromRow, webhookSecretFromRow } from '@/lib/application-auth'
 import { safeJsonObject } from '@/lib/json'
 
@@ -22,14 +27,15 @@ async function handleSync(request: Request) {
     // Find all pending or processing payments older than 30 seconds
     const thirtySecondsAgo = new Date(Date.now() - 30_000)
     // 24h was too narrow: a payment the provider never resolved silently fell
-    // out of the poller and was never reconciled again. It is now polled for a
-    // week and anything older surfaces through /api/cron/alerts.
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+    // out of the poller and was never reconciled again. The window is now
+    // RECONCILE_MAX_AGE_DAYS (default 30) instead of a hard-coded week, and
+    // anything older is REPORTED below instead of vanishing.
+    const oldestEligible = reconcileCreatedAfter()
     const pollCutoff = new Date(Date.now() - 30_000)
     const pendingPayments = await db.paymentIntent.findMany({
       where: {
         status: { in: ['pending', 'processing'] },
-        createdAt: { lte: thirtySecondsAgo, gte: sevenDaysAgo },
+        createdAt: { lte: thirtySecondsAgo, gte: oldestEligible },
         // Skip rows another worker polled in the last 30 seconds.
         OR: [{ lastPolledAt: null }, { lastPolledAt: { lte: pollCutoff } }],
         ...(appCode ? { application: { code: appCode } } : {}),
@@ -132,9 +138,18 @@ async function handleSync(request: Request) {
       }
     }
 
+    // Intents older than the window are no longer invisible.
+    const strandedBeyondWindow = await db.paymentIntent
+      .count({
+        where: { status: { in: ['pending', 'processing'] }, createdAt: { lt: oldestEligible } },
+      })
+      .catch(() => null)
+
     return NextResponse.json({
       success: true,
       polledCount: pendingPayments.length,
+      maxAgeDays: reconcileMaxAgeDays(),
+      strandedBeyondWindow,
       results: pollResults,
     })
   } catch (error: any) {
