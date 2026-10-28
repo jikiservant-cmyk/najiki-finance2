@@ -63,7 +63,14 @@ export interface InitiatePaymentResponse {
 export interface PaymentStatusResponse {
   success: boolean
   status: 'pending' | 'processing' | 'success' | 'failed' | 'expired' | 'cancelled'
+  /** Gross amount the payer was billed. May include `charge`. */
   amount?: number
+  /**
+   * Provider collection fee added ON TOP of the requested amount (e.g. LivePay's
+   * 3% Airtel charge). `amount - charge` is what the merchant actually receives
+   * and is the only figure that may be compared to a PaymentIntent amount.
+   */
+  charge?: number
   currency?: string
   providerPaymentId?: string
   failureReason?: string
@@ -75,7 +82,10 @@ export interface ParsedWebhook {
   reference: string
   providerPaymentId: string
   status: 'pending' | 'processing' | 'success' | 'failed' | 'expired' | 'cancelled'
+  /** Gross amount the payer was billed. May include `charge`. */
   amount?: number
+  /** Provider fee included in `amount`; `amount - charge` is the merchant net. */
+  charge?: number
   currency?: string
   metadata?: Record<string, any>
   failureReason?: string

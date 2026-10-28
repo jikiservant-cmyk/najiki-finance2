@@ -9,7 +9,7 @@ import {
 } from './payments'
 import { resolveTenantOrPlatformCredentials } from './tenant-credentials'
 import { isConfirmedTerminalStatus } from './payment-security'
-import { isPlatformFeeType, resolvePartnerWebhookUrl } from './constants'
+import { isPlatformFeeType, reconcileCreatedAfter, reconcileMaxAgeDays, resolvePartnerWebhookUrl } from './constants'
 import { fallbackSigningSecretsFromRow, webhookSecretFromRow } from './application-auth'
 import { safeJsonObject } from './json'
 
@@ -261,6 +261,14 @@ export async function reconcileProcessingPayments(
   polled: number
   transitioned: number
   retriedNotifications: number
+  maxAgeDays: number
+  /**
+   * Non-terminal intents OLDER than the sweep window. They are not polled by
+   * this worker (by design: bounded work), so this number is the only signal
+   * that a backlog exists outside the window. Non-zero means someone must run
+   * a wider sweep (RECONCILE_MAX_AGE_DAYS=<n>) or reconcile by reference.
+   */
+  strandedBeyondWindow: number
   details: ReconcileSingleResult[]
 }> {
   const limit = opts.limit ?? 12
@@ -272,17 +280,19 @@ export async function reconcileProcessingPayments(
   let polled = 0
   let transitioned = 0
   let retriedNotifications = 0
+  let strandedBeyondWindow = 0
   const details: ReconcileSingleResult[] = []
+  const maxAgeDays = reconcileMaxAgeDays()
+  const oldestEligible = reconcileCreatedAfter()
 
   try {
     const createdCutoff = new Date(Date.now() - minAgeMs)
     const pollCutoff = new Date(Date.now() - minPollIntervalMs)
-    const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000)
 
     const candidates = await db.paymentIntent.findMany({
       where: {
         status: { in: ['processing', 'pending'] },
-        createdAt: { lte: createdCutoff, gte: fourteenDaysAgo },
+        createdAt: { lte: createdCutoff, gte: oldestEligible },
         ...(minPollIntervalMs > 0
           ? { OR: [{ lastPolledAt: null }, { lastPolledAt: { lte: pollCutoff } }] }
           : {}),
@@ -291,6 +301,18 @@ export async function reconcileProcessingPayments(
       orderBy: [{ lastPolledAt: { sort: 'asc', nulls: 'first' } }, { createdAt: 'desc' }],
       take: limit,
     })
+
+    // Surface (never silently ignore) intents that fell outside the window.
+    try {
+      strandedBeyondWindow = await db.paymentIntent.count({
+        where: {
+          status: { in: ['processing', 'pending'] },
+          createdAt: { lt: oldestEligible },
+        },
+      })
+    } catch (countErr) {
+      console.warn('[reconcile] Could not count intents outside the sweep window:', countErr)
+    }
 
     for (const item of candidates) {
       if (Date.now() - startedAt >= budgetMs) break
@@ -346,5 +368,5 @@ export async function reconcileProcessingPayments(
     console.warn('[reconcile] Sweep warning:', err)
   }
 
-  return { polled, transitioned, retriedNotifications, details }
+  return { polled, transitioned, retriedNotifications, maxAgeDays, strandedBeyondWindow, details }
 }

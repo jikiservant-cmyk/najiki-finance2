@@ -4,7 +4,15 @@ import fs from 'node:fs'
 import path from 'node:path'
 import Module from 'node:module'
 import ts from 'typescript'
-import { isConfirmedTerminalStatus, parseTenantProviderCredentials } from '../src/lib/payment-security.ts'
+import { loadTsModule } from './helpers/ts-load.ts'
+// Loaded through the shared helper (not a bare ESM import) because
+// payment-security now imports ./provider-amount: the raw
+// `node --experimental-strip-types` resolver does not add extensions to nested
+// relative imports, while the helper transpiles and resolves them.
+const { isConfirmedTerminalStatus, parseTenantProviderCredentials } = loadTsModule<{
+  isConfirmedTerminalStatus: (result: any, expected?: any) => boolean
+  parseTenantProviderCredentials: (raw: unknown) => any
+}>('src/lib/payment-security.ts')
 import { isAllowedSuperAdminEmail } from '../src/lib/admin-allowlist.ts'
 import { allowInsecureDevAuth } from '../src/lib/dev-auth.ts'
 import { readTextWithLimit, PayloadTooLargeError } from '../src/lib/request-body.ts'

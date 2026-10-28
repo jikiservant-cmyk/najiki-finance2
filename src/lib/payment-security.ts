@@ -1,4 +1,5 @@
 import type { PaymentStatusResponse, ProviderCredentials } from './providers/types'
+import { checkProviderAmount } from './provider-amount'
 
 /** A provider transport/API error is never evidence that a payment failed. */
 export function isConfirmedTerminalStatus(
@@ -12,8 +13,19 @@ export function isConfirmedTerminalStatus(
 ): boolean {
   if (result?.success !== true || (result.status !== 'success' && result.status !== 'failed')) return false
   if (!expected) return true
-  if (result.amount !== undefined &&
-      (!Number.isFinite(Number(result.amount)) || Math.abs(Number(result.amount) - expected.amount) > 0.001)) return false
+  // Providers report the payer's GROSS plus their own fee (`charge`): LivePay
+  // billed 17,510 for a 17,000 request, keeping 510 and crediting 17,000. The
+  // intent amount must be compared to the NET (`amount - charge`), otherwise
+  // every fee-bearing payment is stuck in `processing` forever — the status
+  // poll can never confirm it and the reconcile sweep silently skips it.
+  if (result.amount !== undefined) {
+    const amountCheck = checkProviderAmount({
+      expected: expected.amount,
+      reported: result.amount,
+      charge: result.charge,
+    })
+    if (!amountCheck.ok) return false
+  }
   if (result.currency && result.currency.toUpperCase() !== expected.currency.toUpperCase()) return false
   const storedIdIsPlaceholderRef =
     Boolean(expected.reference) && expected.providerPaymentId === expected.reference
