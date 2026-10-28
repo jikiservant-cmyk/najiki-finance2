@@ -2,11 +2,13 @@
 
 **Updated:** 2026-10-28 · **Branch:** `arena/0ee5b699-najiki-finance2`
 
-Round 1 tested every webhook in both directions. Round 2 fixed the three warnings that
-came out of it, and verified the QStash cron control plane.
+Round 1 tested every webhook in both directions. Round 2 fixed the three warnings that came
+out of it and verified the QStash cron control plane. Round 3 added the missing dashboard
+interface, so the Church app's endpoints and signing secret can be configured and copied
+without a terminal.
 
 ```
-npm test       260 tests, 260 pass, 0 fail
+npm test       275 tests, 275 pass, 0 fail
 npx eslint .   clean
 tsc --noEmit   clean (12 pre-existing errors in src/lib/data.ts — Prisma client
                cannot be generated in this sandbox; no file touched here is affected)
@@ -18,7 +20,53 @@ tsc --noEmit   clean (12 pre-existing errors in src/lib/data.ts — Prisma clien
 | `tests/webhook-outbound.test.ts` | 12 | gateway → Church app, against a real HTTP verifier |
 | `tests/webhook-ops.test.ts` | 16 | rate limit, SSRF host normalisation, QStash schedules + signed publish |
 | `tests/cron-workers.test.ts` | 16 | every worker endpoint: auth, retry, reconcile, stall detection |
+| `tests/setup-webhooks.test.ts` | 15 | dashboard config: summary rules, edit, reveal, no secret leakage |
 | rest (14 files) | 181 | pre-existing suites, unchanged |
+
+---
+
+## 0. Configuring the webhooks from the dashboard — new
+
+The complaint was exact: the Setup page could **create** an application but not **edit** its
+delivery endpoint, never showed the URL settlements are POSTed to, and had no way to read the
+signing secret, so the values the partner needs lived only in a terminal. Worse, the page never
+even displayed the webhook path it had stored.
+
+**Setup → Applications now has, per application:**
+
+- **The outbound webhook URL**, resolved exactly as the sender resolves it (`baseUrl` +
+  `webhookPath`, including the legacy-path heal), with a **Copy** button.
+- **Live validity, not a claim.** The same rules the sender and the preflight enforce are shown
+  inline: a placeholder domain (`https://church.yourdomain.com`) is flagged **"Won't deliver"**
+  because the outbound guard refuses it permanently; a missing or undecryptable signing secret is
+  an error, because notifications would go out unsigned; plain HTTP and the legacy path are
+  warnings. One module (`src/lib/application-webhook-status.ts`) now backs the page, the
+  preflight script and the tests, so the dashboard cannot say "fine" about something that will
+  not deliver.
+- **The signing secret**, on demand: **Reveal → Copy**, decrypted for that single action and
+  never included in the list payload. **Create / Rotate secret** issues a new one and shows it
+  once. The rotation also returns the new API key rather than silently invalidating it.
+- **Edit endpoint**: `name`, `baseUrl`, `webhookPath`, `internalSecretRef`, `active` — saved
+  through the `updateApplication` branch that already existed but had no UI calling it. The save
+  reports back the URL that will actually be used.
+- **The inbound URLs to give the providers** (new card at the top of the tab): the LivePay
+  payment-status callback and the Africa's Talking delivery-report URL, built from
+  `NEXTAUTH_URL` — the same origin the inbound signature is verified against. Copyable, and
+  clearly showing "not configured" rather than a plausible-looking wrong URL.
+
+**Two bugs found while wiring it, both fixed:**
+
+1. **Every entity created from this page was stored `inactive`.** `Switch` is a Radix
+   `role="switch"` *button*, which never participates in form submission, so
+   `new FormData(form).get('isActive')` was always `null` → `false`. Applications, providers and
+   tenants created through the UI were all deactivated, and the church app would have rejected
+   every request until someone noticed the badge. The switches are controlled state now, and a
+   source-level test keeps them that way.
+2. **`updateApplication` echoed secrets back to the browser.** It returned the row without
+   `omit`, so every edit sent the stored `apiKey` and the `webhookSecretEncrypted` blob to the
+   client. It now omits both (and `create` no longer returns the key hash). `webhookPath` is also
+   validated as a path, because `https://host/hook` in that field produced
+   `https://hosthttps://host/hook` at send time.
 
 ---
 
@@ -172,6 +220,7 @@ These are configuration, not code. `npm run webhook:preflight` checks all of the
 4. **`LIVEPAY_WEBHOOK_SECRET` ≥16 chars and matching the portal** — for tenant traffic it is the
    *tenant's* secret that must match.
 5. **`NEXTAUTH_URL` = the exact public HTTPS origin** — it is the first element of the signed string.
+   Setup → Applications now prints the inbound URLs it produces, so a mismatch is visible there.
 
 ## 6. Remaining warnings
 

@@ -43,7 +43,27 @@ const TABLE_NAMES = [
   'walletAccount',
   'ledgerEntry',
   'adminUser',
+  'tenantProviderConfig',
+  'smsMessage',
 ] as const
+
+/**
+ * Strip Prisma `omit` columns from a returned row.
+ *
+ * Prisma's `select` is left unimplemented on purpose — several callers select a
+ * field subset while the tests rely on the seeded relations being present, and
+ * quietly narrowing those would turn a passing test into a false one. `omit` is
+ * implemented because the setup route depends on it for something load-bearing:
+ * never returning an API-key hash or the encrypted webhook secret.
+ */
+function project<T>(row: T, args?: { omit?: Record<string, boolean> }): T {
+  if (!row || !args?.omit) return row
+  const copy = { ...(row as any) }
+  for (const key of Object.keys(args.omit)) {
+    if (args.omit[key]) delete copy[key]
+  }
+  return copy as T
+}
 
 function clone<T>(value: T): T {
   return value === undefined ? value : (structuredClone(value) as T)
@@ -103,18 +123,18 @@ export function createFakeDb(seed: FakeDbSeed = {}): FakeDb {
   const nextId = (prefix: string) => `${prefix}_${++counter}`
 
   const model = (table: string) => ({
-    async findUnique({ where }: { where: Row }) {
-      return clone(rows[table].find((row) => matchesWhere(row, where)) ?? null)
+    async findUnique({ where, omit }: { where: Row; omit?: Row }) {
+      return project(clone(rows[table].find((row) => matchesWhere(row, where)) ?? null), { omit })
     },
 
-    async findFirst(args: { where?: Row; orderBy?: any } = {}) {
-      return clone(rows[table].find((row) => matchesWhere(row, args.where)) ?? null)
+    async findFirst(args: { where?: Row; orderBy?: any; omit?: Row } = {}) {
+      return project(clone(rows[table].find((row) => matchesWhere(row, args.where)) ?? null), args)
     },
 
-    async findMany(args: { where?: Row; take?: number; orderBy?: any } = {}) {
+    async findMany(args: { where?: Row; take?: number; orderBy?: any; omit?: Row } = {}) {
       let result = rows[table].filter((row) => matchesWhere(row, args.where))
       if (typeof args.take === 'number') result = result.slice(0, args.take)
-      return clone(result)
+      return clone(result).map((row) => project(row, args))
     },
 
     async count(args: { where?: Row } = {}) {
@@ -141,7 +161,7 @@ export function createFakeDb(seed: FakeDbSeed = {}): FakeDb {
       return clone(row)
     },
 
-    async update({ where, data }: { where: Row; data: Row }) {
+    async update({ where, data, omit }: { where: Row; data: Row; omit?: Row }) {
       const row = rows[table].find((candidate) => matchesWhere(candidate, where))
       if (!row) {
         const error: any = new Error(`No ${table} found for update`)
@@ -149,7 +169,7 @@ export function createFakeDb(seed: FakeDbSeed = {}): FakeDb {
         throw error
       }
       applyUpdate(row, data)
-      return clone(row)
+      return project(clone(row), { omit })
     },
 
     async updateMany({ where, data }: { where: Row; data: Row }) {
