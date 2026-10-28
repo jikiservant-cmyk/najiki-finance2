@@ -19,6 +19,12 @@ import {
   deriveTenantWebhookSecret,
   isLegacyAutoProvisionedRef,
 } from '@/lib/tenant-credentials'
+import { webhookSecretFromRow } from '@/lib/application-auth'
+import {
+  describeApplicationWebhook,
+  inboundWebhookEndpoints,
+} from '@/lib/application-webhook-status'
+import { runWebhookSelfTest } from '@/lib/webhook-selftest'
 
 // Every write path is validated. These payloads previously went straight from
 // `request.json()` into Prisma, so a typo in the dashboard (or a crafted
@@ -31,7 +37,16 @@ const ApplicationSchema = z.object({
   code: Code,
   name: z.string().min(1).max(200),
   baseUrl: z.string().url().max(500),
-  webhookPath: z.string().min(1).max(300).default('/api/internal/payment-completed'),
+  // A path, not a URL: resolvePartnerWebhookUrl() concatenates it onto baseUrl,
+  // so "https://host/hook" here would produce "https://hosthttps://host/hook".
+  webhookPath: z
+    .string()
+    .min(1)
+    .max(300)
+    .default('/api/webhooks/najiki')
+    .refine((path) => path.trim().startsWith('/'), {
+      message: 'webhookPath must start with "/" (it is appended to the base URL)',
+    }),
   internalSecretRef: z.string().max(200).optional().default(''),
   isActive: z.boolean().optional().default(true),
 })
@@ -50,6 +65,29 @@ const UpdateApplicationSchema = ApplicationSchema.partial({ code: true }).extend
 const RotateApplicationSchema = z.object({
   id: Id,
   rotateWebhookSecret: z.boolean().optional().default(false),
+})
+
+/**
+ * Revealing the outbound signing secret.
+ *
+ * The API key is hashed and unrecoverable, but the webhook secret has to be
+ * recoverable — it is the HMAC key a partner verifies with, so the server needs
+ * it at send time and the operator needs it to configure the partner. It is
+ * stored under AES-256-GCM and only decrypted for this explicit, super-admin
+ * action, never included in the list payload.
+ */
+const RevealWebhookSecretSchema = z.object({ id: Id })
+
+/**
+ * Sending a test delivery to the partner.
+ *
+ * `mode: 'invalid'` signs with a key that is not this application's, to find
+ * out whether the partner verifies at all. Both modes are diagnostic: a 2xx to
+ * `invalid` is a finding, not a success.
+ */
+const SelfTestWebhookSchema = z.object({
+  id: Id,
+  mode: z.enum(['valid', 'invalid']).optional().default('valid'),
 })
 
 const ProviderSchema = z.object({
@@ -120,23 +158,55 @@ export async function GET() {
     await requireSuperAdmin()
 
     const [applications, providers, tenantProviderConfigs, tenants] = await Promise.all([
-      db.application.findMany({
-        // `omit` is load-bearing, not tidiness. Selecting a whole Application
-        // would ship `apiKeyHash` and `webhookSecretEncrypted` to the browser,
-        // and an offline attack on a stored hash is the one thing hashing
-        // cannot defend against. The plaintext `apiKey` is omitted for the same
-        // reason — it is only ever returned once, from the create branch below.
-        omit: {
-          apiKey: true,
-          apiKeyHash: true,
-          webhookSecretEncrypted: true,
-        },
-        include: {
-          tenants: true,
-          paymentTypes: true,
-        },
-        orderBy: { createdAt: 'desc' },
-      }),
+      // `webhookSecretEncrypted` is selected so the response can report whether
+      // a signing secret exists (and whether it decrypts) — never its value.
+      // `apiKey`/`apiKeyHash` stay out: an offline attack on a stored hash is
+      // the one thing hashing cannot defend against.
+      db.application
+        .findMany({
+          omit: {
+            apiKey: true,
+            apiKeyHash: true,
+          },
+          include: {
+            tenants: true,
+            paymentTypes: true,
+          },
+          orderBy: { createdAt: 'desc' },
+        })
+        .then((rows) =>
+          rows.map((row) => {
+            const { webhookSecretEncrypted, ...rest } = row
+            const storedSecret = webhookSecretEncrypted ?? null
+            let secretValue: string | null = null
+            let secretUndecryptable = false
+            if (storedSecret) {
+              try {
+                secretValue = webhookSecretFromRow({ webhookSecretEncrypted: storedSecret })
+              } catch {
+                secretUndecryptable = true
+              }
+              if (!secretValue && !secretUndecryptable) secretUndecryptable = true
+            }
+
+            const webhook = describeApplicationWebhook({
+              code: rest.code,
+              baseUrl: rest.baseUrl,
+              webhookPath: rest.webhookPath,
+              hasWebhookSecret: Boolean(secretValue),
+              secretUndecryptable,
+            })
+
+            // The encrypted blob never leaves the server.
+            return {
+              ...rest,
+              webhookUrl: webhook.webhookUrl,
+              webhookSecretSet: webhook.webhookSecretSet,
+              webhookDeliverable: webhook.deliverable,
+              webhookIssues: webhook.issues,
+            }
+          })
+        ),
       db.provider.findMany({
         orderBy: { createdAt: 'desc' },
       }),
@@ -203,12 +273,20 @@ export async function GET() {
 
     // This payload contains application API keys and provider credential
     // references — never let it be cached by a browser or intermediary.
+    // The inbound half — what the providers must be pointed at. Derived from
+    // the configured public origin rather than from request headers, because it
+    // has to match the origin the signature is computed against.
+    const inbound = inboundWebhookEndpoints(
+      process.env.NEXTAUTH_URL || process.env.PUBLIC_BASE_URL || null
+    )
+
     return NextResponse.json(
       {
         applications,
         providers,
         tenantProviderConfigs,
         tenants,
+        inbound,
       },
       { headers: { 'Cache-Control': 'no-store, max-age=0' } }
     )
@@ -261,15 +339,26 @@ export async function POST(request: Request) {
             isActive: parsed.data.isActive,
           },
         })
-        // Shown once. It is not stored in plaintext and cannot be shown again.
-        result = { ...result, apiKey: credentials.plaintextApiKey, webhookSecret: credentials.webhookSecret }
+        // Shown once. Neither is recoverable afterwards (the key by design, the
+        // secret only through the explicit reveal action). The hash is stripped:
+        // it has no business in a browser.
+        const { apiKeyHash: _omitHash, ...created } = result as Record<string, unknown>
+        result = {
+          ...created,
+          apiKey: credentials.plaintextApiKey,
+          webhookSecret: credentials.webhookSecret,
+        }
         break
       }
 
       case 'updateApplication': {
         const parsed = UpdateApplicationSchema.safeParse(data)
         if (!parsed.success) return validationError(parsed.error)
-        result = await db.application.update({
+
+        // `omit` is not cosmetic here: without it this branch echoed the stored
+        // `apiKey` and the `webhookSecretEncrypted` blob back to the browser on
+        // every edit.
+        const updated = await db.application.update({
           where: { id: parsed.data.id },
           data: {
             name: parsed.data.name,
@@ -278,7 +367,142 @@ export async function POST(request: Request) {
             internalSecretRef: parsed.data.internalSecretRef,
             isActive: parsed.data.isActive,
           },
+          omit: { apiKey: true, apiKeyHash: true },
         })
+
+        // The saved URL and any remaining problem, so the form can confirm what
+        // it actually stored rather than what it sent.
+        const { webhookSecretEncrypted, ...row } = updated
+        const secretValue = webhookSecretFromRow({ webhookSecretEncrypted: webhookSecretEncrypted ?? null })
+        const webhook = describeApplicationWebhook({
+          code: row.code,
+          baseUrl: row.baseUrl,
+          webhookPath: row.webhookPath,
+          hasWebhookSecret: Boolean(secretValue),
+        })
+        result = {
+          ...row,
+          webhookUrl: webhook.webhookUrl,
+          webhookSecretSet: webhook.webhookSecretSet,
+          webhookDeliverable: webhook.deliverable,
+          webhookIssues: webhook.issues,
+          message: `Saved. Notifications will be sent to ${webhook.webhookUrl}`,
+        }
+        break
+      }
+
+      case 'revealWebhookSecret': {
+        // The partner needs this value to configure its verifier, and it is the
+        // only way to hand it over after the create response was missed. It is
+        // read on demand, for this one action, and never included in a list.
+        const parsed = RevealWebhookSecretSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
+
+        const application = await db.application.findUnique({
+          where: { id: parsed.data.id },
+          select: {
+            id: true,
+            code: true,
+            name: true,
+            apiKey: true,
+            webhookSecretEncrypted: true,
+          },
+        })
+        if (!application) {
+          return NextResponse.json({ error: 'Application not found' }, { status: 404 })
+        }
+
+        const webhookSecret = webhookSecretFromRow(application)
+        if (!webhookSecret) {
+          return NextResponse.json(
+            {
+              error:
+                `No usable signing secret for ${application.code}: none is stored, or it cannot be ` +
+                'decrypted with APP_ENCRYPTION_KEY. Rotate the webhook secret to create one.',
+            },
+            { status: 400 }
+          )
+        }
+
+        console.warn(
+          `[setup] webhook signing secret revealed for application ${application.code}`
+        )
+        result = {
+          id: application.id,
+          code: application.code,
+          webhookSecret,
+          note:
+            'This is the HMAC key for verifying inbound notifications. Do not put it in a client-side bundle.',
+        }
+        break
+      }
+
+      case 'sendTestWebhook': {
+        // "Do the secrets actually work?" cannot be answered by inspecting the
+        // stored value: what breaks a go-live is the partner holding a
+        // different one, or not checking at all. So this sends a real signed
+        // request to the real endpoint and reports what came back.
+        const parsed = SelfTestWebhookSchema.safeParse(data)
+        if (!parsed.success) return validationError(parsed.error)
+
+        const application = await db.application.findUnique({
+          where: { id: parsed.data.id },
+          select: {
+            id: true,
+            code: true,
+            name: true,
+            baseUrl: true,
+            webhookPath: true,
+            webhookSecretEncrypted: true,
+          },
+        })
+        if (!application) {
+          return NextResponse.json({ error: 'Application not found' }, { status: 404 })
+        }
+
+        let secret: string | null = null
+        try {
+          secret = webhookSecretFromRow(application)
+        } catch {
+          secret = null
+        }
+        if (!secret) {
+          return NextResponse.json(
+            {
+              error:
+                `No usable signing secret for ${application.code}, so there is nothing to sign the ` +
+                'test with. Rotate the webhook secret to create one, then run the test again.',
+            },
+            { status: 400 }
+          )
+        }
+
+        const view = describeApplicationWebhook({
+          code: application.code,
+          baseUrl: application.baseUrl,
+          webhookPath: application.webhookPath,
+          hasWebhookSecret: true,
+        })
+        if (!view.webhookUrl) {
+          return NextResponse.json(
+            { error: 'No webhook URL is configured for this application. Set the base URL first.' },
+            { status: 400 }
+          )
+        }
+
+        const test = await runWebhookSelfTest({
+          applicationCode: application.code,
+          webhookUrl: view.webhookUrl,
+          secret,
+          mode: parsed.data.mode,
+        })
+
+        console.warn(
+          `[setup] webhook self-test (${test.mode}) for ${application.code}: ${test.verdict}` +
+            `${test.statusCode ? ` HTTP ${test.statusCode}` : ''}`
+        )
+
+        result = { id: application.id, code: application.code, ...test }
         break
       }
 

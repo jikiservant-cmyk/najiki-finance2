@@ -76,6 +76,32 @@ export function isPrivateOrInternalIp(ip: string): boolean {
   return false
 }
 
+/**
+ * Normalise a hostname so IP literals are actually recognised.
+ *
+ * `new URL('http://[::1]/x').hostname` is the string `'[::1]'` — brackets
+ * included — and `net.isIP('[::1]')` is `0`. The literal check below therefore
+ * never matched a bracketed IPv6 address, so this fell through to the DNS
+ * branch, where a lookup failure is tolerated and the URL was accepted:
+ *
+ *     http://[::1]/                        ← loopback
+ *     http://[::ffff:169.254.169.254]/     ← cloud metadata
+ *     http://[fd00::1]/                    ← unique-local
+ *     http://[fe80::1%25eth0]/             ← link-local, with a zone id
+ *
+ * Stripping the brackets (and any `%zone` suffix, which `net.isIP` also does
+ * not accept) puts those strings back through the same private-range check that
+ * already refuses their unbracketed forms.
+ */
+export function normalizeHostForIpCheck(hostname: string): string {
+  let host = String(hostname ?? '').trim().toLowerCase()
+  if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1)
+  // A zone/scope suffix (`%25eth0` once URL-decoded, or a literal `%eth0`).
+  const zoneIndex = host.indexOf('%')
+  if (zoneIndex !== -1) host = host.slice(0, zoneIndex)
+  return host
+}
+
 export function isPlaceholderUrl(urlString: string): boolean {
   try {
     const cleaned = urlString.trim()
@@ -121,10 +147,16 @@ export async function validateSafeUrl(urlString: string): Promise<URL> {
     throw new Error(`Target host is restricted internal infrastructure: ${hostname}`)
   }
 
-  // 3. Check direct IP address literal
-  if (net.isIP(hostname)) {
-    if (isPrivateOrInternalIp(hostname)) {
-      throw new Error(`Requests to private or internal IP addresses are blocked: ${hostname}`)
+  // 3. Check direct IP address literal.
+  //
+  // The hostname is normalised first: `URL.hostname` keeps the brackets on an
+  // IPv6 literal, and `net.isIP('[::1]')` is 0, so without this the check was
+  // skipped and loopback/metadata literals were handed to the DNS branch (which
+  // tolerates lookup failure) and accepted. See normalizeHostForIpCheck().
+  const ipLiteral = normalizeHostForIpCheck(hostname)
+  if (net.isIP(ipLiteral)) {
+    if (isPrivateOrInternalIp(ipLiteral)) {
+      throw new Error(`Requests to private or internal IP addresses are blocked: ${ipLiteral}`)
     }
   } else {
     // 4. Resolve DNS to protect against DNS rebinding / hostnames resolving to internal IPs

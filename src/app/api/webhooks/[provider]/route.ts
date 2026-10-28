@@ -32,6 +32,7 @@ import { buildSignatureUrlCandidates } from '@/lib/webhook-url'
 import { readTextWithLimit } from '@/lib/request-body'
 import { safeJsonObject } from '@/lib/json'
 import { decideWebhookLogAction } from '@/lib/webhook-dedupe'
+import { inboundRateLimitPerMinute } from '@/lib/webhook-rate-limit'
 import { isPlatformFeeType, resolvePartnerWebhookUrl } from '@/lib/constants'
 import {
   flushPendingNotificationsForPayment,
@@ -50,8 +51,9 @@ export async function POST(
 
   try {
     // ── 1. Unauthenticated-endpoint guards ─────────────────────────────────
+    // Per-IP ceiling, tunable — see inboundRateLimitPerMinute().
     const ipDecision = await checkRateLimit('webhook-inbound', clientIdentifier(request), {
-      tokens: 120,
+      tokens: inboundRateLimitPerMinute(),
       window: '1 m',
     })
     if (!ipDecision.ok) {

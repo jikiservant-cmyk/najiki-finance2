@@ -21,8 +21,16 @@ import {
   AlertCircle,
   Plus,
   RefreshCw,
-  ArrowRight
+  ArrowRight,
+  Send,
+  ShieldAlert
 } from 'lucide-react'
+
+interface WebhookIssue {
+  level: 'error' | 'warning'
+  code: string
+  message: string
+}
 
 interface Application {
   id: string
@@ -39,6 +47,43 @@ interface Application {
   updatedAt: string
   tenants: any[]
   paymentTypes: any[]
+  /** Resolved outbound endpoint — exactly what settlements are POSTed to. */
+  webhookUrl?: string
+  /** Whether a signing secret exists. The value is never in the list payload. */
+  webhookSecretSet?: boolean
+  /** False when the sender would refuse, or the partner could not verify. */
+  webhookDeliverable?: boolean
+  webhookIssues?: WebhookIssue[]
+}
+
+/** Inbound endpoints the providers must be pointed at. */
+interface InboundEndpoints {
+  origin: string | null
+  livepay: string | null
+  africastalking: string | null
+}
+
+/**
+ * The outcome of a real signed delivery to the partner, from
+ * `POST /api/setup {type:'sendTestWebhook'}`.
+ */
+interface SelfTestResult {
+  mode: 'valid' | 'invalid'
+  sent: boolean
+  ok: boolean
+  verdict: string
+  url: string
+  statusCode: number
+  latencyMs: number
+  timestamp: number
+  signature: string
+  locallyValid: boolean
+  responseSnippet: string
+  headline: string
+  detail: string
+  nextSteps: string[]
+  payload: string
+  headers: Record<string, string>
 }
 
 interface Tenant {
@@ -125,6 +170,27 @@ export default function SetupPage() {
   const [activeTab, setActiveTab] = useState('applications')
   const [newApiKey, setNewApiKey] = useState<string | null>(null)
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [inbound, setInbound] = useState<InboundEndpoints | null>(null)
+
+  // Which application's endpoint form is open, and the secret revealed for it.
+  // Revealed secrets live only in this browser tab's memory: they are fetched
+  // on demand and dropped when the form closes or the page reloads.
+  // Radix `Switch` renders a role="switch" button, not a form control, so
+  // `new FormData(form).get('isActive')` is ALWAYS null. Every entity created
+  // from this page was therefore stored inactive — the church app included.
+  // These are controlled now.
+  const [newAppIsActive, setNewAppIsActive] = useState(true)
+  const [newProviderIsActive, setNewProviderIsActive] = useState(true)
+  const [newTenantIsActive, setNewTenantIsActive] = useState(true)
+  const [editingAppId, setEditingAppId] = useState<string | null>(null)
+  const [editAppIsActive, setEditAppIsActive] = useState(true)
+  const [revealedSecrets, setRevealedSecrets] = useState<Record<string, string>>({})
+  const [revealingId, setRevealingId] = useState<string | null>(null)
+  // Results of real test deliveries, keyed `${appId}:${mode}`. They are the
+  // only evidence that the partner accepts a signature made with OUR secret,
+  // so they stay on screen until the page is reloaded.
+  const [testResults, setTestResults] = useState<Record<string, SelfTestResult>>({})
+  const [testingKey, setTestingKey] = useState<string | null>(null)
 
   // Provider Config Form State
   const [editingConfigId, setEditingConfigId] = useState<string | null>(null)
@@ -153,6 +219,7 @@ export default function SetupPage() {
         setProviders(data.providers || [])
         setTenantConfigs(data.tenantProviderConfigs || [])
         setTenantsList(data.tenants || [])
+        setInbound(data.inbound || null)
       } else if (res.status === 401) {
         setStatusMessage({ type: 'error', text: 'Your session has expired. Please sign in again.' })
       } else if (res.status === 403) {
@@ -189,7 +256,7 @@ export default function SetupPage() {
       baseUrl: formData.get('baseUrl') as string,
       webhookPath: formData.get('webhookPath') as string,
       internalSecretRef: formData.get('internalSecretRef') as string,
-      isActive: (formData.get('isActive') as string) === 'on',
+      isActive: newAppIsActive,
     }
     const res = await fetch('/api/setup', { 
       method: 'POST', 
@@ -199,8 +266,12 @@ export default function SetupPage() {
     if (res.ok) {
       const newApp = await res.json()
       setNewApiKey(newApp.apiKey)
-      setStatusMessage({ type: 'success', text: `Application "${data.name}" created successfully!` })
+      setStatusMessage({
+        type: 'success',
+        text: `Application "${data.name}" created ${newAppIsActive ? 'and active' : 'INACTIVE — it will reject requests until you activate it'}.`,
+      })
       e.currentTarget.reset()
+      setNewAppIsActive(true)
       fetchData()
     } else {
       const err = await res.json()
@@ -247,6 +318,153 @@ export default function SetupPage() {
     }
   }
 
+  /**
+   * Save an application's delivery endpoint.
+   *
+   * Until now the only way to write `baseUrl` / `webhookPath` was to create the
+   * application — the API accepted an update but nothing in the UI called it, so
+   * a wrong host could only be fixed by deleting history-bearing records.
+   */
+  async function handleUpdateApplication(e: React.FormEvent<HTMLFormElement>, app: Application) {
+    e.preventDefault()
+    const formData = new FormData(e.currentTarget)
+
+    const res = await fetch('/api/setup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'updateApplication',
+        data: {
+          id: app.id,
+          name: (formData.get('name') as string) || app.name,
+          baseUrl: formData.get('baseUrl') as string,
+          webhookPath: formData.get('webhookPath') as string,
+          internalSecretRef: (formData.get('internalSecretRef') as string) ?? '',
+          isActive: editAppIsActive,
+        },
+      }),
+    })
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      const detail = Array.isArray(err.details) ? ` (${err.details.join('; ')})` : ''
+      setStatusMessage({ type: 'error', text: (err.error || 'Failed to save application') + detail })
+      return
+    }
+
+    const saved = await res.json()
+    setStatusMessage({
+      type: 'success',
+      text: saved.message || `Saved ${app.name}.`,
+    })
+    setEditingAppId(null)
+    fetchData()
+  }
+
+  /** Read the outbound signing secret, so it can be copied into the partner app. */
+  async function handleRevealWebhookSecret(appId: string, appName: string) {
+    setRevealingId(appId)
+    try {
+      const res = await fetch('/api/setup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'revealWebhookSecret', data: { id: appId } }),
+      })
+      const payload = await res.json().catch(() => ({}))
+
+      if (!res.ok) {
+        setStatusMessage({ type: 'error', text: payload.error || 'Could not read the webhook secret' })
+        return
+      }
+
+      setRevealedSecrets((current) => ({ ...current, [appId]: payload.webhookSecret }))
+      setStatusMessage({
+        type: 'success',
+        text: `Signing secret for "${appName}" revealed. Copy it into the partner app's verifier.`,
+      })
+    } finally {
+      setRevealingId(null)
+    }
+  }
+
+  /** Replace the signing secret. The new value is shown once, in the banner. */
+  async function handleRotateWebhookSecret(appId: string, appName: string) {
+    if (!window.confirm(
+      `Rotate the webhook signing secret for "${appName}"?\n\n` +
+      'Until the partner app is updated it will reject every notification with 401. ' +
+      'Deliveries are retried with backoff, so nothing is lost while you update it.'
+    )) return
+
+    const res = await fetch('/api/setup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'rotateApplication', data: { id: appId, rotateWebhookSecret: true } }),
+    })
+    const payload = await res.json().catch(() => ({}))
+
+    if (!res.ok) {
+      setStatusMessage({ type: 'error', text: payload.error || 'Failed to rotate the webhook secret' })
+      return
+    }
+
+    // The rotation also issues a new API key; keep it visible rather than
+    // silently invalidating whatever the partner is using.
+    if (payload.apiKey) setNewApiKey(payload.apiKey)
+    if (payload.webhookSecret) {
+      setRevealedSecrets((current) => ({ ...current, [appId]: payload.webhookSecret }))
+    }
+    setStatusMessage({
+      type: 'success',
+      text: `New key and signing secret issued for "${appName}". Update the partner app now.`,
+    })
+    fetchData()
+  }
+
+  /**
+   * Send a real signed request to the partner and show what came back.
+   *
+   * Two modes, and the pair is the test:
+   *   valid   — signed with the stored secret; the endpoint should answer 2xx.
+   *   invalid — signed with a key that is deliberately not this application's;
+   *             a verifying endpoint MUST answer 401/403. A 2xx here means the
+   *             endpoint is not checking, so anyone could post a forged success.
+   */
+  async function handleTestWebhook(appId: string, appName: string, mode: 'valid' | 'invalid') {
+    const key = `${appId}:${mode}`
+    setTestingKey(key)
+    try {
+      const res = await fetch('/api/setup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'sendTestWebhook', data: { id: appId, mode } }),
+      })
+      const payload = await res.json().catch(() => ({}))
+
+      if (!res.ok) {
+        setStatusMessage({ type: 'error', text: payload.error || 'Could not send the test delivery' })
+        return
+      }
+
+      setTestResults((current) => ({ ...current, [key]: payload as SelfTestResult }))
+    } catch (error: any) {
+      setStatusMessage({
+        type: 'error',
+        text: `Test delivery failed in the browser: ${error?.message ?? 'network error'}`,
+      })
+    } finally {
+      setTestingKey(null)
+    }
+  }
+
+  /** The same request as a curl command, so the partner can be handed it. */
+  function replayCommand(result: SelfTestResult) {
+    const headers = Object.entries(result.headers)
+      .filter(([name]) => name !== 'Content-Type')
+      .map(([name, value]) => `-H '${name}: ${value}'`)
+      .join(' ')
+    return `curl -i -X POST '${result.url}' -H 'Content-Type: application/json' ${headers} --data '${result.payload}'`
+  }
+
   async function handleCreateProvider(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault()
     const formData = new FormData(e.currentTarget)
@@ -254,7 +472,7 @@ export default function SetupPage() {
       code: formData.get('code') as string,
       name: formData.get('name') as string,
       credentialsRef: formData.get('credentialsRef') as string,
-      isActive: (formData.get('isActive') as string) === 'on',
+      isActive: newProviderIsActive,
     }
     const res = await fetch('/api/setup', { 
       method: 'POST', 
@@ -262,8 +480,12 @@ export default function SetupPage() {
       body: JSON.stringify({ type: 'provider', data }) 
     })
     if (res.ok) {
-      setStatusMessage({ type: 'success', text: `Provider "${data.name}" registered successfully!` })
+      setStatusMessage({
+        type: 'success',
+        text: `Provider "${data.name}" registered ${newProviderIsActive ? 'and active' : 'INACTIVE — no payment can use it'}.`,
+      })
       e.currentTarget.reset()
+      setNewProviderIsActive(true)
       fetchData()
     } else {
       const err = await res.json()
@@ -280,7 +502,7 @@ export default function SetupPage() {
       appType: (formData.get('appType') as string) || 'sacco',
       name: formData.get('name') as string,
       defaultProviderId: formData.get('defaultProviderId') as string,
-      isActive: (formData.get('isActive') as string) === 'on',
+      isActive: newTenantIsActive,
     }
     const res = await fetch('/api/setup', { 
       method: 'POST', 
@@ -603,6 +825,79 @@ export default function SetupPage() {
         {/* TAB 1: APPLICATIONS */}
         {/* ============================================================ */}
         <TabsContent value="applications">
+          {/* Where the providers send their callbacks. Previously only in the
+              README, which meant an operator had to reconstruct the URL by
+              hand — and a wrong origin silently fails every signature. */}
+          <Card className="mb-8">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <ArrowRight className="w-4 h-4" /> Inbound webhooks (point the providers here)
+              </CardTitle>
+              <CardDescription>
+                Give these URLs to the payment provider and the SMS provider. They are built
+                from <code className="font-mono text-xs">NEXTAUTH_URL</code>, the same origin
+                the inbound signature is verified against.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {!inbound?.livepay && (
+                <p className="text-xs text-amber-600 dark:text-amber-400">
+                  Public origin is not configured. Set NEXTAUTH_URL, or every provider callback
+                  will fail signature verification.
+                </p>
+              )}
+
+              <div>
+                <Label className="text-xs text-muted-foreground">LivePay — payment status callback</Label>
+                <div className="flex items-center gap-2 mt-1">
+                  <code className="text-xs font-mono bg-muted p-2 rounded flex-1 overflow-x-auto">
+                    {inbound?.livepay || '— not configured —'}
+                  </code>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={!inbound?.livepay}
+                    onClick={() => inbound?.livepay && copyToClipboard(inbound.livepay)}
+                    className="gap-1 shrink-0"
+                  >
+                    <Copy className="w-3.5 h-3.5" /> Copy
+                  </Button>
+                </div>
+              </div>
+
+              <div>
+                <Label className="text-xs text-muted-foreground">
+                  Africa&apos;s Talking — delivery reports
+                </Label>
+                <div className="flex items-center gap-2 mt-1">
+                  <code className="text-xs font-mono bg-muted p-2 rounded flex-1 overflow-x-auto">
+                    {inbound?.africastalking
+                      ? `${inbound.africastalking}?key=<AFRICASTALKING_CALLBACK_SECRET>`
+                      : '— not configured —'}
+                  </code>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={!inbound?.africastalking}
+                    onClick={() =>
+                      inbound?.africastalking &&
+                      copyToClipboard(`${inbound.africastalking}?key=<AFRICASTALKING_CALLBACK_SECRET>`)
+                    }
+                    className="gap-1 shrink-0"
+                  >
+                    <Copy className="w-3.5 h-3.5" /> Copy
+                  </Button>
+                </div>
+                <p className="text-[11px] text-muted-foreground mt-1">
+                  Replace the placeholder with your AFRICASTALKING_CALLBACK_SECRET. The secret is
+                  deliberately not rendered here.
+                </p>
+              </div>
+            </CardContent>
+          </Card>
+
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
             <Card>
               <CardHeader>
@@ -625,15 +920,28 @@ export default function SetupPage() {
                   </div>
                   <div>
                     <Label>Webhook Path</Label>
-                    <Input name="webhookPath" required placeholder="/api/internal/payment-completed" defaultValue="/api/internal/payment-completed" />
+                    <Input
+                      name="webhookPath"
+                      required
+                      placeholder="/api/webhooks/najiki"
+                      defaultValue="/api/webhooks/najiki"
+                    />
+                    <p className="text-[11px] text-muted-foreground mt-1">
+                      Path only — it is appended to the base URL. This is where payments are
+                      reported back to the application.
+                    </p>
                   </div>
                   <div>
                     <Label>Internal Secret Ref</Label>
                     <Input name="internalSecretRef" required placeholder="e.g. SACCO_INTERNAL_SECRET" />
                   </div>
                   <div className="flex items-center gap-2">
-                    <Label>Active</Label>
-                    <Switch name="isActive" defaultChecked />
+                    <Switch
+                      id="new-app-active"
+                      checked={newAppIsActive}
+                      onCheckedChange={setNewAppIsActive}
+                    />
+                    <Label htmlFor="new-app-active">Active</Label>
                   </div>
                   <Button type="submit">Create Application</Button>
                 </form>
@@ -653,14 +961,320 @@ export default function SetupPage() {
                           <h4 className="font-bold text-base">{app.name} <span className="text-muted-foreground font-mono text-xs">({app.code})</span></h4>
                           <p className="text-xs text-muted-foreground mt-0.5">{app.baseUrl}</p>
                         </div>
-                        <span className={`text-[11px] px-2 py-0.5 rounded font-medium ${app.isActive ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300' : 'bg-muted text-muted-foreground'}`}>
-                          {app.isActive ? 'Active' : 'Inactive'}
-                        </span>
+                        <div className="flex flex-col items-end gap-1">
+                          <span className={`text-[11px] px-2 py-0.5 rounded font-medium ${app.isActive ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300' : 'bg-muted text-muted-foreground'}`}>
+                            {app.isActive ? 'Active' : 'Inactive'}
+                          </span>
+                          {app.webhookDeliverable === false && (
+                            <span className="text-[11px] px-2 py-0.5 rounded font-medium bg-destructive/10 text-destructive">
+                              Won&apos;t deliver
+                            </span>
+                          )}
+                        </div>
                       </div>
 
                       <div className="flex items-center gap-4 text-xs text-muted-foreground pt-1 border-t">
                         <span>Tenants: <strong>{app.tenants?.length || 0}</strong></span>
                         <span>Payment Types: <strong>{app.paymentTypes?.length || 0}</strong></span>
+                      </div>
+
+                      {/* ── Outbound endpoint: what we POST settlements to ── */}
+                      <div className="pt-1">
+                        <Label className="text-xs text-muted-foreground">
+                          Outbound webhook (settlements are POSTed here)
+                        </Label>
+                        <div className="flex items-center gap-2 mt-1">
+                          <code className="text-xs font-mono bg-muted p-2 rounded flex-1 overflow-x-auto whitespace-nowrap">
+                            {app.webhookUrl || '— not configured —'}
+                          </code>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="gap-1 shrink-0"
+                            disabled={!app.webhookUrl}
+                            onClick={() => app.webhookUrl && copyToClipboard(app.webhookUrl)}
+                          >
+                            <Copy className="w-3.5 h-3.5" /> Copy
+                          </Button>
+                        </div>
+
+                        {(app.webhookIssues?.length ?? 0) > 0 && (
+                          <ul className="mt-2 space-y-1">
+                            {app.webhookIssues!.map((issue) => (
+                              <li
+                                key={issue.code}
+                                className={`text-[11px] flex items-start gap-1.5 ${
+                                  issue.level === 'error'
+                                    ? 'text-destructive'
+                                    : 'text-amber-600 dark:text-amber-400'
+                                }`}
+                              >
+                                <AlertCircle className="w-3 h-3 mt-0.5 shrink-0" />
+                                <span>{issue.message}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+
+                      {/* ── Signing secret: what the partner verifies with ── */}
+                      <div className="pt-1">
+                        <Label className="text-xs text-muted-foreground">Outbound signing secret</Label>
+                        {revealedSecrets[app.id] ? (
+                          <>
+                            <div className="flex items-center gap-2 mt-1">
+                              <code className="text-xs font-mono bg-muted p-2 rounded flex-1 overflow-x-auto break-all">
+                                {revealedSecrets[app.id]}
+                              </code>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="gap-1 shrink-0"
+                                onClick={() => copyToClipboard(revealedSecrets[app.id])}
+                              >
+                                <Copy className="w-3.5 h-3.5" /> Copy
+                              </Button>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                className="shrink-0"
+                                onClick={() =>
+                                  setRevealedSecrets((current) => {
+                                    const next = { ...current }
+                                    delete next[app.id]
+                                    return next
+                                  })
+                                }
+                              >
+                                Hide
+                              </Button>
+                            </div>
+                            <p className="text-[11px] text-muted-foreground mt-1">
+                              Verify inbound notifications with{' '}
+                              <code className="font-mono">HMAC-SHA256(secret, &quot;{'{'}timestamp{'}'}.{'{'}rawBody{'}'}&quot;)</code>{' '}
+                              against the <code className="font-mono">X-Najiki-Signature</code> header.
+                            </p>
+                          </>
+                        ) : (
+                          <div className="flex items-center gap-2 mt-1 flex-wrap">
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="gap-1"
+                              disabled={!app.webhookSecretSet || revealingId === app.id}
+                              onClick={() => handleRevealWebhookSecret(app.id, app.name)}
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                              {revealingId === app.id ? 'Reading…' : 'Reveal'}
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="gap-1"
+                              onClick={() => handleRotateWebhookSecret(app.id, app.name)}
+                            >
+                              <RefreshCw className="w-3.5 h-3.5" />
+                              {app.webhookSecretSet ? 'Rotate secret' : 'Create secret'}
+                            </Button>
+                            <span className="text-[11px] text-muted-foreground">
+                              {app.webhookSecretSet
+                                ? 'Stored encrypted; revealed on demand.'
+                                : 'No secret yet — notifications would be unsigned.'}
+                            </span>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* ── Does the secret actually work? ──
+                          The only way to know is to send a signed request to the
+                          partner and read its answer. The second button sends a
+                          wrong signature on purpose: if that is accepted too, the
+                          endpoint is not verifying anything. */}
+                      <div className="pt-1">
+                        <Label className="text-xs text-muted-foreground">Test the signing secret</Label>
+                        <div className="flex items-center gap-2 mt-1 flex-wrap">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="gap-1"
+                            disabled={!app.webhookUrl || !app.webhookSecretSet || testingKey === `${app.id}:valid`}
+                            onClick={() => handleTestWebhook(app.id, app.name, 'valid')}
+                          >
+                            <Send className="w-3.5 h-3.5" />
+                            {testingKey === `${app.id}:valid` ? 'Sending…' : 'Send signed test'}
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="gap-1"
+                            disabled={!app.webhookUrl || !app.webhookSecretSet || testingKey === `${app.id}:invalid`}
+                            onClick={() => handleTestWebhook(app.id, app.name, 'invalid')}
+                          >
+                            <ShieldAlert className="w-3.5 h-3.5" />
+                            {testingKey === `${app.id}:invalid` ? 'Sending…' : 'Send bad signature'}
+                          </Button>
+                          <span className="text-[11px] text-muted-foreground">
+                            Sends <code className="font-mono">event=&quot;webhook.test&quot;</code> to the real endpoint.
+                          </span>
+                        </div>
+
+                        {(['valid', 'invalid'] as const).map((mode) => {
+                          const result = testResults[`${app.id}:${mode}`]
+                          if (!result) return null
+                          const tone = result.ok
+                            ? 'border-emerald-500/40 bg-emerald-50 dark:bg-emerald-950/30'
+                            : 'border-destructive/40 bg-destructive/5'
+                          return (
+                            <div key={mode} className={`mt-2 rounded-lg border p-3 text-xs ${tone}`}>
+                              <div className="flex items-start gap-2">
+                                {result.ok ? (
+                                  <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0 text-emerald-600" />
+                                ) : (
+                                  <AlertCircle className="w-4 h-4 mt-0.5 shrink-0 text-destructive" />
+                                )}
+                                <div className="space-y-1 flex-1">
+                                  <p className="font-medium">{result.headline}</p>
+                                  <p className="text-muted-foreground">{result.detail}</p>
+                                  <p className="text-[11px] text-muted-foreground font-mono">
+                                    {mode === 'invalid' ? 'wrong key' : 'real key'}
+                                    {' · '}
+                                    {result.statusCode ? `HTTP ${result.statusCode}` : 'no response'}
+                                    {' · '}
+                                    {result.latencyMs} ms
+                                    {' · '}
+                                    ours verified the signature:{' '}
+                                    {String(result.locallyValid)}
+                                  </p>
+                                  {result.nextSteps?.length > 0 && (
+                                    <ul className="list-disc pl-4 text-[11px] text-muted-foreground space-y-0.5">
+                                      {result.nextSteps.map((step) => (
+                                        <li key={step}>{step}</li>
+                                      ))}
+                                    </ul>
+                                  )}
+                                  {result.responseSnippet && (
+                                    <p className="text-[11px] font-mono break-all text-muted-foreground">
+                                      response: {result.responseSnippet}
+                                    </p>
+                                  )}
+                                  {result.sent && (
+                                    <details className="text-[11px]">
+                                      <summary className="cursor-pointer text-muted-foreground">
+                                        What was sent (headers, body, curl)
+                                      </summary>
+                                      <pre className="mt-1 p-2 rounded bg-muted overflow-x-auto whitespace-pre-wrap break-all">
+{Object.entries(result.headers).map(([name, value]) => `${name}: ${value}`).join('\n')}
+
+{result.payload}
+                                      </pre>
+                                      <Button
+                                        type="button"
+                                        variant="outline"
+                                        size="sm"
+                                        className="gap-1 mt-1"
+                                        onClick={() => copyToClipboard(replayCommand(result))}
+                                      >
+                                        <Copy className="w-3.5 h-3.5" /> Copy curl
+                                      </Button>
+                                    </details>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+
+                      {/* ── Edit the endpoint ── */}
+                      <div className="pt-1">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="gap-1"
+                          onClick={() => {
+                            const next = editingAppId === app.id ? null : app.id
+                            setEditingAppId(next)
+                            if (next) setEditAppIsActive(Boolean(app.isActive))
+                          }}
+                        >
+                          <Edit3 className="w-3.5 h-3.5" />
+                          {editingAppId === app.id ? 'Close' : 'Edit endpoint'}
+                        </Button>
+
+                        {editingAppId === app.id && (
+                          <form
+                            onSubmit={(event) => handleUpdateApplication(event, app)}
+                            className="space-y-3 mt-3 p-3 rounded-lg border bg-muted/30"
+                          >
+                            <div>
+                              <Label className="text-xs">Name</Label>
+                              <Input name="name" defaultValue={app.name} required />
+                            </div>
+                            <div>
+                              <Label className="text-xs">Base URL</Label>
+                              <Input
+                                name="baseUrl"
+                                defaultValue={app.baseUrl}
+                                required
+                                placeholder="https://church.yourdomain.com"
+                              />
+                              <p className="text-[11px] text-muted-foreground mt-1">
+                                The application&apos;s public origin. Placeholder domains are refused
+                                by the outbound guard.
+                              </p>
+                            </div>
+                            <div>
+                              <Label className="text-xs">Webhook Path</Label>
+                              <Input
+                                name="webhookPath"
+                                defaultValue={app.webhookPath}
+                                required
+                                placeholder="/api/webhooks/najiki"
+                              />
+                            </div>
+                            <div>
+                              <Label className="text-xs">Internal Secret Ref</Label>
+                              <Input
+                                name="internalSecretRef"
+                                defaultValue={app.internalSecretRef || ''}
+                                placeholder="e.g. CHURCH_INTERNAL_SECRET"
+                              />
+                              <p className="text-[11px] text-muted-foreground mt-1">
+                                Optional. Name of an environment variable the partner also accepts
+                                as a signing key.
+                              </p>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <Switch
+                                id={`edit-app-active-${app.id}`}
+                                checked={editAppIsActive}
+                                onCheckedChange={setEditAppIsActive}
+                              />
+                              <Label htmlFor={`edit-app-active-${app.id}`} className="text-xs">
+                                Active
+                              </Label>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <Button type="submit" size="sm">Save endpoint</Button>
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => setEditingAppId(null)}
+                              >
+                                Cancel
+                              </Button>
+                            </div>
+                          </form>
+                        )}
                       </div>
 
                       {app.apiKeyHint && (
@@ -721,8 +1335,12 @@ export default function SetupPage() {
                     <Input name="credentialsRef" required placeholder="e.g. LIVEPAY_" defaultValue="LIVEPAY_" />
                   </div>
                   <div className="flex items-center gap-2">
-                    <Label>Active</Label>
-                    <Switch name="isActive" defaultChecked />
+                    <Switch
+                      id="new-provider-active"
+                      checked={newProviderIsActive}
+                      onCheckedChange={setNewProviderIsActive}
+                    />
+                    <Label htmlFor="new-provider-active">Active</Label>
                   </div>
                   <Button type="submit">Create Provider</Button>
                 </form>
@@ -815,8 +1433,12 @@ export default function SetupPage() {
                     )}
                   </div>
                   <div className="flex items-center gap-2">
-                    <Label>Active</Label>
-                    <Switch name="isActive" defaultChecked />
+                    <Switch
+                      id="new-tenant-active"
+                      checked={newTenantIsActive}
+                      onCheckedChange={setNewTenantIsActive}
+                    />
+                    <Label htmlFor="new-tenant-active">Active</Label>
                   </div>
                   <Button type="submit">Create Tenant</Button>
                 </form>

@@ -46,6 +46,7 @@ function thresholds() {
     smsQueueBacklog: Number(process.env.ALERT_SMS_QUEUE_BACKLOG || 100),
     failedSmsCount: Number(process.env.ALERT_FAILED_SMS || 20),
     walletDriftWallets: Number(process.env.ALERT_WALLET_DRIFT_WALLETS || 1),
+    retryWorkerLagMinutes: Number(process.env.ALERT_RETRY_WORKER_LAG_MINUTES || 15),
   }
 }
 
@@ -131,6 +132,57 @@ async function handleAlerts(request: Request) {
       }
     } catch (error: any) {
       console.error('[alerts] notification check failed:', error)
+    }
+
+    // ── 3b. Is the retry worker actually running? ───────────────────────────
+    //
+    // Every other signal here is derived from data the workers produce, so a
+    // worker that has silently stopped looks exactly like a quiet system. This
+    // one looks at the *schedule's* observable effect instead: a row that is due
+    // to be retried and has been due for longer than the threshold means
+    // /api/cron/notifications is not being called (schedule deleted, paused,
+    // pointed at the wrong host, or QStash credentials rotated).
+    //
+    // Recovery is automatic once it runs again, so this is a warning — but it
+    // is the difference between "the church is not being told" and nobody
+    // knowing.
+    try {
+      const overdueSince = new Date(Date.now() - limits.retryWorkerLagMinutes * 60 * 1000)
+      const [overdue, oldestDue] = await Promise.all([
+        db.internalNotification.count({
+          where: {
+            status: { in: ['pending', 'failed_retrying'] },
+            nextRetryAt: { lte: overdueSince },
+          },
+        }),
+        db.internalNotification.findFirst({
+          where: { status: { in: ['pending', 'failed_retrying'] }, nextRetryAt: { not: null } },
+          orderBy: { nextRetryAt: 'asc' },
+          select: { nextRetryAt: true },
+        }),
+      ])
+
+      const lagMinutes = oldestDue?.nextRetryAt
+        ? Math.max(0, Math.round((Date.now() - new Date(oldestDue.nextRetryAt).getTime()) / 60000))
+        : 0
+      metrics.notificationRetryOverdue = overdue
+      metrics.notificationRetryLagMinutes = lagMinutes
+
+      if (overdue > 0) {
+        alerts.push({
+          id: 'notification-worker-stalled',
+          severity: 'warning',
+          title: `${overdue} partner webhook retr${overdue === 1 ? 'y is' : 'ies are'} overdue by more than ${limits.retryWorkerLagMinutes} minutes`,
+          detail:
+            'The retry worker (/api/cron/notifications) does not appear to be running. ' +
+            'Check that the QStash schedule exists and is not paused: ' +
+            'npx tsx scripts/setup-cron-schedules.ts --verify',
+          value: overdue,
+          threshold: 0,
+        })
+      }
+    } catch (error: any) {
+      console.error('[alerts] retry worker liveness check failed:', error)
     }
 
     // ── 4. SMS backlog / failures ───────────────────────────────────────────

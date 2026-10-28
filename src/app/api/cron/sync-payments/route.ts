@@ -6,7 +6,7 @@ import { verifyCronRequest } from '@/lib/qstash-verify'
 import { resolveTenantOrPlatformCredentials } from '@/lib/tenant-credentials'
 import { isConfirmedTerminalStatus } from '@/lib/payment-security'
 import { isPlatformFeeType, resolvePartnerWebhookUrl } from '@/lib/constants'
-import { webhookSecretFromRow } from '@/lib/application-auth'
+import { fallbackSigningSecretsFromRow, webhookSecretFromRow } from '@/lib/application-auth'
 import { safeJsonObject } from '@/lib/json'
 
 async function handleSync(request: Request) {
@@ -110,6 +110,7 @@ async function handleSync(request: Request) {
                 webhookUrl: resolvePartnerWebhookUrl(payment.application),
                 webhookSecret: webhookSecretFromRow(payment.application),
                 fallbackWebhookSecret: payment.application.apiKey ?? null,
+                fallbackWebhookSecrets: fallbackSigningSecretsFromRow(payment.application),
                 externalEntityId: payment.externalEntityId,
                 tenantId: payment.tenantId,
                 tenantCode: payment.tenant?.code ?? null,
