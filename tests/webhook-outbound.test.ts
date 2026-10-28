@@ -558,20 +558,17 @@ test('webhook(hop 2): the SSRF guard refuses loopback, private ranges and placeh
   assert.equal(allowed.hostname, 'church.najiki.app')
 })
 
-test('webhook(hop 2): SSRF guard gap — bracketed IPv6 literals are not recognised as IP literals', async () => {
-  // `URL.hostname` keeps the brackets, and `net.isIP('[::1]')` is 0, so the
-  // literal check is skipped and these fall through to the DNS branch (which
-  // fails open, because an unresolvable host is tolerated). They are therefore
-  // accepted today. This test pins the *current* behaviour so a fix is a
-  // deliberate change rather than a surprise; the guard's intent is to refuse
-  // them, and webhook URLs are only settable by a super admin.
+test('webhook(hop 2): bracketed IPv6 literals are refused (previously accepted)', async () => {
+  // `URL.hostname` keeps the brackets on an IPv6 literal, and `net.isIP('[::1]')`
+  // is 0, so these used to skip the literal check, fail DNS resolution, and be
+  // accepted by the fail-open branch. They are now normalised before the check.
   const { validateSafeUrl } = loadTsModule<{ validateSafeUrl: (url: string) => Promise<URL> }>(
     'src/lib/safe-fetch.ts',
     {}
   )
 
   for (const url of ['http://[::1]/x', 'http://[::ffff:169.254.169.254]/x', 'http://[fd00::1]/x']) {
-    const parsed = await validateSafeUrl(url)
-    assert.ok(parsed instanceof URL, `${url} is currently accepted (see finding W-3)`)
+    await assert.rejects(() => validateSafeUrl(url), `must refuse ${url}`)
   }
 })
+

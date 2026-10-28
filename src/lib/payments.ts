@@ -589,6 +589,32 @@ export async function deliverQueuedNotification(
   }
 }
 
+/**
+ * Hand a signed notification to QStash for delivery and retries.
+ *
+ * The exact bytes are published — the *same* `payloadString` the HMAC was
+ * computed over — rather than the object via `publishJSON`. `publishJSON`
+ * re-stringifies the body, so the bytes QStash forwards are only identical to
+ * the signed ones as long as `JSON.stringify` keeps the same key order twice.
+ * It does today, but that is a property of the object literal in one function
+ * rather than a guarantee, and the failure mode is silent: the partner answers
+ * 401 to a delivery we scheduled and consider handled. Publishing the string
+ * removes the coupling entirely.
+ */
+async function publishSignedViaQStash(
+  client: Client,
+  url: string,
+  payloadString: string,
+  secret: string | null | undefined
+): Promise<void> {
+  await client.publish({
+    url,
+    body: payloadString,
+    headers: buildNotificationHeaders(secret, payloadString),
+    retries: 3,
+  })
+}
+
 export async function enqueueWebhookNotification(data: {
   paymentIntentId: string
   reference: string
@@ -676,13 +702,7 @@ export async function enqueueWebhookNotification(data: {
     try {
       const client = getQStashClient()
       if (client) {
-        const headers = buildNotificationHeaders(data.webhookSecret, payloadString)
-        await client.publishJSON({
-          url: res.usedUrl,
-          body: payloadObject,
-          headers,
-          retries: 3,
-        })
+        await publishSignedViaQStash(client, res.usedUrl, payloadString, data.webhookSecret)
         await recordNotificationDispatched(data.paymentIntentId)
         return
       }
@@ -700,13 +720,7 @@ export async function enqueueWebhookNotification(data: {
     try {
       const client = getQStashClient()
       if (client) {
-        const headers = buildNotificationHeaders(data.webhookSecret, payloadString)
-        await client.publishJSON({
-          url: data.webhookUrl,
-          body: payloadObject,
-          headers,
-          retries: 3,
-        })
+        await publishSignedViaQStash(client, data.webhookUrl, payloadString, data.webhookSecret)
         await recordNotificationDispatched(data.paymentIntentId)
         return
       }

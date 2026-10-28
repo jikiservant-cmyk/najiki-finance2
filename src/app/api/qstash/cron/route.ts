@@ -5,8 +5,8 @@ import { completePayment, enqueueWebhookNotification } from '@/lib/payments'
 import { verifyCronRequest } from '@/lib/qstash-verify'
 import { loadTenantProviderCredentials } from '@/lib/tenant-credentials'
 import { isConfirmedTerminalStatus } from '@/lib/payment-security'
-import { PLATFORM_FEE_TYPES } from '@/lib/constants'
-import { webhookSecretFromRow } from '@/lib/application-auth'
+import { PLATFORM_FEE_TYPES, resolvePartnerWebhookUrl } from '@/lib/constants'
+import { fallbackSigningSecretsFromRow, webhookSecretFromRow } from '@/lib/application-auth'
 import { safeJsonObject } from '@/lib/json'
 
 async function handleCron(request: Request) {
@@ -87,6 +87,14 @@ async function handleCron(request: Request) {
 
             // Only enqueue webhook if it wasn't already processed
             if (!completion.wasAlreadyProcessed) {
+              // This must carry the same fields as the live webhook path in
+              // /api/webhooks/[provider]/route.ts. It previously did not: the
+              // payment type was omitted (so a partner relying on
+              // `paymentTypeCode` saw null and could not tell a tithe from an
+              // offering), the application-API-key fallback secrets were
+              // omitted (so a partner verifying with its API key got a 401 and
+              // no retry), and the URL was concatenated by hand instead of
+              // going through resolvePartnerWebhookUrl (no legacy-path heal).
               await enqueueWebhookNotification({
                 paymentIntentId: payment.id,
                 reference: payment.reference,
@@ -96,13 +104,19 @@ async function handleCron(request: Request) {
                 providerPaymentId: result.providerPaymentId || payment.providerPaymentId || '',
                 failureReason: result.failureReason,
                 applicationId: payment.applicationId,
-                webhookUrl: `${payment.application.baseUrl}${payment.application.webhookPath}`,
+                webhookUrl: resolvePartnerWebhookUrl(payment.application),
                 webhookSecret: webhookSecretFromRow(payment.application),
-              externalEntityId: payment.externalEntityId,
-              tenantId: payment.tenantId,
-              tenantCode: payment.tenant?.code ?? null,
-              metadata: safeJsonObject(payment.metadata),
-            })
+                fallbackWebhookSecret: payment.application.apiKey ?? null,
+                fallbackWebhookSecrets: fallbackSigningSecretsFromRow(payment.application),
+                externalEntityId: payment.externalEntityId,
+                tenantId: payment.tenantId,
+                tenantCode: payment.tenant?.code ?? null,
+                paymentTypeCode:
+                  payment.paymentType?.code ??
+                  (safeJsonObject(payment.metadata)?.paymentTypeCode as string | undefined) ??
+                  null,
+                metadata: safeJsonObject(payment.metadata),
+              })
             }
 
             pollResults.push({ id: payment.id, reference: payment.reference, status: 'resolved', polledStatus: result.status })

@@ -59,6 +59,19 @@ function matchesCondition(value: any, condition: any): boolean {
   if ('not' in condition) return value !== condition.not
   if ('equals' in condition) return value === condition.equals
 
+  // Range filters. Dates and numbers compare with < / > directly, which is what
+  // the cron workers rely on (`createdAt: { lte, gte }`, `lastPolledAt: { lte }`).
+  if ('lte' in condition || 'lt' in condition || 'gte' in condition || 'gt' in condition) {
+    if (value === null || value === undefined) return false
+    const compare = (bound: any) =>
+      bound instanceof Date ? new Date(value).getTime() - bound.getTime() : Number(value) - Number(bound)
+    if ('lte' in condition && !(compare(condition.lte) <= 0)) return false
+    if ('lt' in condition && !(compare(condition.lt) < 0)) return false
+    if ('gte' in condition && !(compare(condition.gte) >= 0)) return false
+    if ('gt' in condition && !(compare(condition.gt) > 0)) return false
+    return true
+  }
+
   return value === condition
 }
 

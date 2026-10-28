@@ -31,6 +31,8 @@ import { isPlaceholderUrl } from '../src/lib/safe-fetch'
 import { webhookSecretFromRow, fallbackSigningSecretsFromRow } from '../src/lib/application-auth'
 import { resolvePartnerWebhookUrl } from '../src/lib/constants'
 import { getAvailableProviders } from '../src/lib/providers'
+import { CRON_JOBS, cronDestination } from '../src/lib/cron-jobs'
+import { Client } from '@upstash/qstash'
 
 const problems: string[] = []
 const warnings: string[] = []
@@ -180,27 +182,83 @@ async function checkProviders(db: PrismaClient) {
   if (!livePay) fail('No active livepay provider row: inbound webhooks resolve to 404 "Provider not active".')
 }
 
+/**
+ * Are the workers that make retries happen actually registered?
+ *
+ * `vercel.json` runs /api/cron/notifications once a day (the Hobby plan allows
+ * no less), so a partner webhook that fails waits up to 24 hours unless the
+ * QStash schedules exist. This asks QStash directly, read-only: it lists the
+ * schedules and compares each against `src/lib/cron-jobs.ts`.
+ */
 async function checkRetrySchedule() {
-  console.log('\n— Retry worker —')
-  try {
-    const vercel = JSON.parse(fs.readFileSync(new URL('../vercel.json', import.meta.url), 'utf8'))
-    const cron = (vercel.crons ?? []).find((entry: any) => entry.path === '/api/cron/notifications')
-    if (!cron) {
-      fail('/api/cron/notifications is not scheduled: a failed delivery is never retried.')
-      return
-    }
-    console.log(`  schedule: ${cron.schedule}`)
-    if (cron.schedule !== '* * * * *') {
-      warn(
-        `The retry worker runs "${cron.schedule}", not every minute. Backoff is designed around minute-level retries, so a transient partner outage is recovered late (not lost).`
-      )
-    }
-  } catch {
-    warn('Could not read vercel.json to confirm the retry schedule.')
-  }
+  console.log('\n— Background workers (QStash schedules) —')
 
   if (!(process.env.CRON_SECRET || '').trim()) {
-    fail('CRON_SECRET is not set: the retry worker cannot be called.')
+    fail('CRON_SECRET is not set: the worker endpoints cannot be called by Vercel Cron either.')
+  }
+
+  const origin = publicOrigin()
+  const jobs = CRON_JOBS
+
+  for (const job of jobs) {
+    console.log(`  · ${job.path.padEnd(28)} ${job.cron.padEnd(14)} ${job.description}`)
+  }
+
+  // The daily backstop in vercel.json — only meaningful once a day.
+  try {
+    const vercel = JSON.parse(fs.readFileSync(new URL('../vercel.json', import.meta.url), 'utf8'))
+    const scheduled = new Set((vercel.crons ?? []).map((entry: any) => entry.path))
+    const missingBackstop = ['/api/cron/notifications', '/api/cron/alerts'].filter((path) => !scheduled.has(path))
+    if (missingBackstop.length > 0) {
+      warn(`vercel.json does not schedule ${missingBackstop.join(', ')} — there would be no backstop at all.`)
+    }
+  } catch {
+    warn('Could not read vercel.json to confirm the daily backstop.')
+  }
+
+  const token = (process.env.QSTASH_TOKEN || '').trim()
+  if (!token) {
+    fail(
+      'QSTASH_TOKEN is not set: no worker runs more than once a day, so a failed partner webhook waits up to 24h and the SMS queue does not drain. Set it and run: npm run cron:setup'
+    )
+    return
+  }
+  if (!origin) return
+
+  try {
+    const client = new Client({ token })
+    const schedules = await client.schedules.list()
+    const byDestination = new Map<string, typeof schedules>()
+    for (const schedule of schedules) {
+      const group = byDestination.get(schedule.destination) ?? []
+      group.push(schedule)
+      byDestination.set(schedule.destination, group)
+    }
+
+    for (const job of jobs) {
+      const destination = cronDestination(origin, job)
+      const found = byDestination.get(destination) ?? []
+      const first = found[0]
+
+      if (!first) {
+        fail(`${job.path}: no QStash schedule for ${destination} — this worker never runs.`)
+        continue
+      }
+      if (first.cron !== job.cron) {
+        fail(`${job.path}: scheduled "${first.cron}", expected "${job.cron}". Run: npm run cron:setup`)
+      }
+      if (first.isPaused) {
+        fail(`${job.path}: schedule ${first.scheduleId} is PAUSED — this worker is not running.`)
+      }
+      if (found.length > 1) {
+        warn(`${job.path}: ${found.length} schedules for the same destination — it will run more often than intended.`)
+      }
+      console.log(`  ✓ ${job.path.padEnd(28)} live (${first.cron}) id=${first.scheduleId}`)
+    }
+  } catch (error: any) {
+    fail(
+      `Could not list QStash schedules (${error?.message ?? error}). This may be a wrong QSTASH_TOKEN, or the workers are not registered at all: npm run cron:setup`
+    )
   }
 }
 

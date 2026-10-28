@@ -733,22 +733,50 @@ test('webhook(hop 1): the nested `data` envelope LivePay also sends is accepted'
   assert.equal(harness.completePaymentCalls[0].providerPaymentId, 'LP_TX_9002')
 })
 
-test('webhook(hop 1): inbound deliveries are rate limited per source IP', async () => {
+test('webhook(hop 1): a Sunday-scale burst from one provider IP is not throttled', async () => {
+  // 300 settlements inside one minute all arrive from the provider's egress
+  // address. At the old 120/min ceiling two thirds of these were answered 429
+  // and the congregation's payments stayed "pending" until the retry landed.
   const harness = loadWebhookRoute()
-  const ip = '198.51.100.77'
+  const ip = '198.51.100.10'
   const body = { customer_reference: 'CHURCH-0001', status: 'PENDING' }
 
-  const attempts: number[] = []
-  for (let i = 0; i < 121; i++) {
+  const statuses: number[] = []
+  for (let i = 0; i < 300; i++) {
     const response = await deliver(harness, buildRequest({ body, provider: 'mtn', ip }), 'mtn')
-    attempts.push(response.status)
+    statuses.push(response.status)
   }
 
-  assert.ok(
-    attempts.slice(0, 120).every((status) => status !== 429),
-    'the first 120 deliveries within a minute must not be throttled'
+  assert.equal(
+    statuses.filter((status) => status === 429).length,
+    0,
+    'a 300-payment burst must not be throttled at the default ceiling'
   )
-  assert.equal(attempts[120], 429, 'the 121st delivery from one IP must be throttled')
+})
+
+test('webhook(hop 1): the inbound ceiling still exists and is tunable per deployment', async () => {
+  const previous = process.env.WEBHOOK_INBOUND_RATE_LIMIT_PER_MINUTE
+  process.env.WEBHOOK_INBOUND_RATE_LIMIT_PER_MINUTE = '60'
+  try {
+    const harness = loadWebhookRoute()
+    const ip = '198.51.100.20'
+    const body = { customer_reference: 'CHURCH-0001', status: 'PENDING' }
+
+    const statuses: number[] = []
+    for (let i = 0; i < 61; i++) {
+      const response = await deliver(harness, buildRequest({ body, provider: 'mtn', ip }), 'mtn')
+      statuses.push(response.status)
+    }
+
+    assert.ok(
+      statuses.slice(0, 60).every((status) => status !== 429),
+      'the configured allowance must be honoured'
+    )
+    assert.equal(statuses[60], 429, 'past the allowance the request must be throttled')
+  } finally {
+    if (previous === undefined) delete process.env.WEBHOOK_INBOUND_RATE_LIMIT_PER_MINUTE
+    else process.env.WEBHOOK_INBOUND_RATE_LIMIT_PER_MINUTE = previous
+  }
 })
 
 // ── Africa's Talking delivery reports ──────────────────────────────────────
