@@ -221,7 +221,14 @@ correct.
 1. **Africa's Talking dashboard — delivery-report callback.**
    `https://<gateway>/api/webhooks/africastalking?key=<AFRICASTALKING_CALLBACK_SECRET>`
    Until this answers, every message ages `pending → unknown` and nothing notifies.
-2. **Netlify env:** `AFRICASTALKING_API_KEY`, `AFRICASTALKING_USERNAME` (production
+
+   `AFRICASTALKING_CALLBACK_SECRET` is **not issued by Africa's Talking** — they
+   do not sign delivery reports and there is no value in their dashboard to copy.
+   You invent it: `openssl rand -hex 32`, then put the same string in the host's
+   environment variables *and* in the URL above. Angle brackets are placeholders;
+   pasting them literally sends `<AFRICASTALKING_CALLBACK_SECRET>` as the secret
+   and every callback gets 401.
+2. **Host env (Vercel):** `AFRICASTALKING_API_KEY`, `AFRICASTALKING_USERNAME` (production
    app, **not `sandbox`**), `AFRICASTALKING_SENDER_ID` (approved).
 3. **`ENFORCE_REDIS_RATELIMIT=true`** before any volume: the limiter fails open to
    per-instance memory when Upstash is slow, which multiplies the published limit
