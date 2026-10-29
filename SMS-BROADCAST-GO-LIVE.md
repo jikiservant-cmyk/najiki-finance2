@@ -519,7 +519,94 @@ the default with the placeholder as a separate fix.
 
 ---
 
-## 6.4 How to check the claims in this document yourself
+## 6.4 Dispatcher conformance — check this before enforcing uniqueness
+
+`sms_queue.najiki_reference` has no unique index. Before creating one, confirm the
+dispatcher never produces a duplicate. **All the risk is on the caller's side**:
+on Na'jiki, a retry is completely inert.
+
+### What Na'jiki guarantees (tested, not assumed)
+
+`POST /api/messaging/send` with a repeated `Idempotency-Key` returns:
+
+```jsonc
+{ "success": true, "smsId": "sms_…", "reference": "MSG-…", "deduplicated": true }
+```
+
+with the **original** `smsId` and `reference`, `createOrGet` returns the existing
+row without inserting, the route only enqueues when `created === true`, and no
+second provider call is made. Asserted in `tests/sms-paths-e2e.test.ts`: one row,
+one provider call, even after a second queue drain.
+
+So a duplicate reference can only appear if the dispatcher itself **inserts a new
+queue row per retry and stores the returned reference on both**. That is the
+single behaviour to verify.
+
+### The five conformance checks
+
+| # | Check | Compliant behaviour | If it fails |
+|---|---|---|---|
+| 1 | `najiki_sms_id` stores the 202's **`smsId`** | matches `^sms_[0-9a-f]{20}$` | storing the `MSG-` reference makes every webhook miss the required predicate |
+| 2 | One queue row per `idempotency_key` | a retry updates the existing row | two rows share one `najiki_reference` → duplicate |
+| 3 | `Idempotency-Key` is stable across retries | `"<jobId>:<memberId>"`, 8–255 chars | a fresh key per attempt sends and bills twice |
+| 4 | `202 { deduplicated: true }` is treated as success | store the returned ids, do not re-insert | duplicated rows, duplicated references |
+| 5 | 403 / 401 / 429 set `status = 'failed'` with **no** reference | `delivery_status` stays `NULL` | a null reference row cannot be matched by any webhook |
+
+### Detect non-conformance in the data
+
+Run these against `church.sms_queue` after a **2–3 recipient** test broadcast:
+
+```sql
+-- 1. Mistakes the reference for the sms id. Should return zero rows.
+SELECT id, najiki_reference, najiki_sms_id
+  FROM church.sms_queue
+ WHERE najiki_sms_id LIKE 'MSG-%';
+
+-- 2. Malformed ids — hand-inserted, truncated, or a cuid from the Prisma default.
+SELECT id, najiki_reference, najiki_sms_id
+  FROM church.sms_queue
+ WHERE najiki_sms_id IS NOT NULL
+   AND najiki_sms_id !~ '^sms_[0-9a-f]{20}$';
+
+-- 3. Dispatched but unmatched. A row here can never be updated by a webhook.
+SELECT id, status, najiki_reference, najiki_sms_id
+  FROM church.sms_queue
+ WHERE status = 'sent' AND najiki_reference IS NULL;
+
+-- 4. The duplicate check that must be empty BEFORE the unique index.
+SELECT najiki_reference, count(*)
+  FROM church.sms_queue
+ WHERE najiki_reference IS NOT NULL
+ GROUP BY najiki_reference HAVING count(*) > 1;
+
+-- 5. Two SMALL broadcasts of the same body: rows must be one per recipient,
+--    with distinct references.
+SELECT count(*) AS rows, count(DISTINCT najiki_reference) AS refs,
+       count(DISTINCT najiki_sms_id) AS ids
+  FROM church.sms_queue WHERE created_at > now() - interval '10 minutes';
+```
+
+Query 5 is the useful one: `rows = refs = ids` for a clean broadcast. `rows > refs`
+means a retry inserted a second row (check #2). `refs > ids` means an id was never
+stored.
+
+### Safe order from here
+
+1. Deploy **PR #26**.
+2. Send one SMS from `/messaging`; read the new **Detail** column
+   (`accepted · 1×` vs `not reached · 1×`).
+3. Run the five checks above after a 2–3 recipient broadcast.
+4. Only then add the webhook handler (strict `reference` + `smsId` match, row-count
+   check).
+5. Only then `CREATE UNIQUE INDEX ... sms_queue_najiki_reference_key` — the
+   duplicate query in §6.3 must return zero rows first.
+
+Doing 4 before 3 is how a broadcast report ends up quietly wrong instead of loudly
+broken.
+
+---
+
+## 6.5 How to check the claims in this document yourself
 
 Every Na'jiki-side statement above is verifiable in the repository. Database
 metadata alone cannot confirm them — the schema lives in `prisma/schema.prisma`,

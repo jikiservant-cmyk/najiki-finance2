@@ -747,4 +747,17 @@ test('e2e: an idempotent retry returns the same smsId, so the pair stays unique'
   assert.equal(second.reference, first.reference)
   // One row, so the (reference, smsId) pair a webhook matches against is unique.
   assert.equal(h.db.rows.smsMessage.length, 1)
+
+  // The retry is completely inert on this side: it re-queues nothing, so a
+  // duplicate-key retry can never produce a second billed send. All risk of a
+  // duplicated reference therefore sits in the CALLER's queue: if it inserts a
+  // second row per retry and stores the returned reference on both, it creates
+  // the duplicate that the webhook's required (reference, smsId) match exists to
+  // disambiguate.
+  await h.queue.processBatch(10)
+  const providerCallsAfterFirstDrain = h.providerCalls.length
+  assert.equal(providerCallsAfterFirstDrain, 1, 'exactly one provider call for the whole retry sequence')
+  await h.queue.processBatch(10)
+  assert.equal(h.providerCalls.length, 1, 'a later drain sends nothing extra')
+  assert.equal(h.db.rows.smsMessage.length, 1)
 })
