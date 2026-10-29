@@ -7,6 +7,20 @@ import { checkRateLimit } from '@/lib/rate-limit'
 import { SmsInputSchema, MAX_SMS_BODY_BYTES, resolveSmsDailyLimit } from '@/lib/sms-policy'
 import { readTextWithLimit, PayloadTooLargeError } from '@/lib/request-body'
 
+/**
+ * This route drains the queue after responding (`after(...)`), and a single
+ * provider call is bounded at 12s (see waitForSmsProvider). Without an explicit
+ * budget Vercel's default (10s on Hobby) kills the function *between*
+ * `claimForSending` — which has already flipped the row to `pending` — and
+ * `recordProviderAcceptance`, which is the only writer of `provider_message_id`.
+ *
+ * A row orphaned in that window is unrecoverable: the queued sweep only selects
+ * `queued`, the claim only accepts `queued`, and delivery reports match on a
+ * provider id that was never written. It then displays as `pending` for 48 hours
+ * even though the carrier may have delivered it.
+ */
+export const maxDuration = 60
+
 export async function POST(request: Request) {
   try {
     // 1. Enforce dashboard session authentication.

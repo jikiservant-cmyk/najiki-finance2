@@ -197,6 +197,56 @@ export const smsStore = {
     return result.count === 1
   },
 
+  /**
+   * Close out rows that were claimed but never reached the provider hand-off.
+   *
+   * THE BUG THIS EXISTS FOR
+   * -----------------------
+   * `processBatch` claims a row (`queued → pending`, `attemptCount++`) and only
+   * afterwards calls the provider and then `recordProviderAcceptance` — the sole
+   * writer of `providerMessageId`. If the process dies in between (serverless
+   * timeout, cold-start eviction, a crash), the row is left:
+   *
+   *     status = 'pending', providerMessageId = NULL, attemptCount >= 1
+   *
+   * and nothing can recover it. The queued sweep selects only `queued`, the
+   * claim only accepts `queued`, and delivery reports are matched by
+   * `providerMessageId`, which was never written. The row therefore reads as
+   * `pending` in the dashboard for the full 48 hours until `markStalePendingUnknown`
+   * moves it — long after the recipient's phone may have received the message.
+   *
+   * WHY `unknown` AND NOT `failed`
+   * ------------------------------
+   * We genuinely do not know whether the carrier accepted it: the request may
+   * have been transmitted and the response lost. Marking `failed` would invite a
+   * resend (a second billed message) or a refund for a delivered one. `unknown`
+   * is the honest terminal state, it is already part of the vocabulary, it
+   * supports `SMS_NOTIFY_UNKNOWN` so the partner learns, and it stops the
+   * dashboard presenting a dead row as in-flight.
+   *
+   * Rows that DID receive a provider id are untouched: a delivery report can
+   * still settle those, so they must stay `pending`.
+   */
+  reclaimOrphanedPending: async (minutes = 5): Promise<number> => {
+    const age = Math.max(1, Math.min(Math.floor(minutes), 1440))
+    const cutoff = new Date(Date.now() - age * 60 * 1000)
+    const result = await db.smsMessage.updateMany({
+      where: {
+        status: 'pending',
+        providerMessageId: null,
+        attemptCount: { gt: 0 },
+        updatedAt: { lt: cutoff },
+      },
+      data: {
+        status: 'unknown',
+        failureReason:
+          'Provider outcome unknown: claimed but no provider message id was recorded. ' +
+          'The carrier may or may not have accepted it; not resent, to avoid a duplicate charge.',
+      },
+    })
+    return result.count
+  },
+
   /** A missing/late DLR is unknown, never delivered and never auto-retried. */
   markStalePendingUnknown: async (hours = 48): Promise<number> => {
     const result = await db.smsMessage.updateMany({
