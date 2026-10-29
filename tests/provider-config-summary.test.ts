@@ -109,3 +109,49 @@ test('a blank submitted secret is treated as "keep the stored one"', () => {
   // A real value replaces it.
   assert.equal(shouldPreserveStoredSecret('new-key'), false)
 })
+
+/**
+ * `undecryptable` — the flag that separates "configured" from "readable".
+ *
+ * `APP_ENCRYPTION_KEY` is not a namespace key: replacing it makes every blob
+ * written under the old key permanently unreadable (AES-256-GCM authenticates
+ * with the key, so decryption fails rather than returning garbage). The setup
+ * route used to report such a row with the plain fallback summary, which is
+ * byte-identical in shape to a healthy one — `hasApiKey` is true because the
+ * `_encrypted` blob exists, and `accountNo` is empty because the value is
+ * inside the blob. An operator could not tell the two apart.
+ *
+ * These tests pin the shapes so the distinction cannot be lost again.
+ */
+const ENCRYPTED_BLOB_ONLY = { _encrypted: 'aabbcc:ddeeff:00112233' }
+
+test('an encrypted blob reports hasApiKey but no readable account number', () => {
+  const summary = summarizeProviderConfig(ENCRYPTED_BLOB_ONLY)
+
+  // Indistinguishable from a healthy row on these two fields alone.
+  assert.equal(summary.hasApiKey, true)
+  assert.equal(summary.encrypted, true)
+  assert.equal(summary.accountNo, '')
+
+  // Nothing marks it as broken, which is exactly why the route must say so.
+  assert.equal(summary.undecryptable, undefined)
+})
+
+test('the undecryptable flag survives JSON serialisation to the dashboard', () => {
+  // The route adds the flag after the spread; this pins that it is a plain
+  // own-property on the object that reaches the browser.
+  const reported = { ...summarizeProviderConfig(ENCRYPTED_BLOB_ONLY), encrypted: true, undecryptable: true }
+  const roundTripped = JSON.parse(JSON.stringify(reported))
+
+  assert.equal(roundTripped.undecryptable, true)
+  assert.equal(roundTripped.hasApiKey, true)
+  assert.equal(roundTripped.accountNo, '')
+  // Still no credential material, in either direction.
+  assert.equal(JSON.stringify(roundTripped).includes('aabbcc'), false)
+})
+
+test('a healthy plaintext row is never marked undecryptable', () => {
+  const summary = summarizeProviderConfig(PLAINTEXT_LEGACY_ROW)
+  assert.equal(summary.undecryptable, undefined)
+  assert.equal(summary.accountNo, '1234567890')
+})

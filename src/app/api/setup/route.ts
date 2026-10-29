@@ -266,9 +266,23 @@ export async function GET() {
                     },
                   }
                 } catch {
+                  // The blob is the encrypted form but will not open under the
+                  // current APP_ENCRYPTION_KEY. Reported, not hidden: the plain
+                  // fallback summary below reads as "configured" (hasApiKey is
+                  // true because `_encrypted` exists) while `accountNo` is
+                  // blank, so the operator cannot tell this row apart from a
+                  // healthy one — and the payment path has already fallen back
+                  // to the platform LivePay credentials by then.
+                  console.error(
+                    `[setup] Stored provider credentials for tenant ${rest.tenantId} could not be decrypted with APP_ENCRYPTION_KEY`
+                  )
                   return {
                     ...rest,
-                    configSummary: summarizeProviderConfig(configJson),
+                    configSummary: {
+                      ...summarizeProviderConfig(configJson),
+                      encrypted: true,
+                      undecryptable: true,
+                    },
                   }
                 }
               }

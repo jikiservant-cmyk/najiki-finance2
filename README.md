@@ -202,8 +202,11 @@ npm run db:check
 6. Set `NEXTAUTH_URL` to your public HTTPS origin — it must match the URL
    registered with LivePay or webhook signatures will not verify.
 7. Point Africa's Talking's delivery-report callback at
-   `https://<your-domain>/api/webhooks/africastalking` and set
-   `AFRICASTALKING_CALLBACK_SECRET`.
+   `https://<your-domain>/api/webhooks/africastalking?key=<AFRICASTALKING_CALLBACK_SECRET>`
+   and set `AFRICASTALKING_CALLBACK_SECRET`. That secret is yours to invent —
+   Africa's Talking does not issue one and does not sign delivery reports, so
+   the query parameter is the only credential on the callback. Make it with
+   `openssl rand -hex 32` and paste the same value in both places.
 8. Optionally set `ALERT_WEBHOOK_URL` (Slack/Discord/generic JSON) so
    `/api/cron/alerts` can reach a human.
 

@@ -221,8 +221,29 @@ correct.
 1. **Africa's Talking dashboard — delivery-report callback.**
    `https://<gateway>/api/webhooks/africastalking?key=<AFRICASTALKING_CALLBACK_SECRET>`
    Until this answers, every message ages `pending → unknown` and nothing notifies.
-2. **Netlify env:** `AFRICASTALKING_API_KEY`, `AFRICASTALKING_USERNAME` (production
+
+   `AFRICASTALKING_CALLBACK_SECRET` is **not issued by Africa's Talking** — they
+   do not sign delivery reports and there is no value in their dashboard to copy.
+   You invent it: `openssl rand -hex 32`, then put the same string in the host's
+   environment variables *and* in the URL above. Angle brackets are placeholders;
+   pasting them literally sends `<AFRICASTALKING_CALLBACK_SECRET>` as the secret
+   and every callback gets 401.
+2. **Host env (Vercel):** `AFRICASTALKING_API_KEY`, `AFRICASTALKING_USERNAME` (production
    app, **not `sandbox`**), `AFRICASTALKING_SENDER_ID` (approved).
+   **Leave `AFRICASTALKING_ALLOWED_IPS` unset.** Africa's Talking publishes no
+   list of the addresses it posts delivery reports from; they are issued on
+   request (`info@africastalking.com`) and change at platform migrations. With a
+   secret configured, the allow-list cannot authorise on its own anyway — it can
+   only *subtract* access, and only when `AFRICASTALKING_REQUIRE_ALLOWED_IP=true`.
+   A stale or partial list therefore converts working delivery reports into 401s
+   with no upside, which is the exact failure this document exists to end.
+
+   If you want it as a second factor, collect the addresses first: set
+   `SMS_CALLBACK_DEBUG_IP=true`, send a few messages, and read
+   `[Africa's Talking DLR] Accepted from <ip>` out of the runtime logs. A
+   rejection logs its address unconditionally, so a misconfigured list tells you
+   what to add. Gather several addresses over a few days before enforcing —
+   Africa's Talking posts from more than one.
 3. **`ENFORCE_REDIS_RATELIMIT=true`** before any volume: the limiter fails open to
    per-instance memory when Upstash is slow, which multiplies the published limit
    by the warm-instance count.

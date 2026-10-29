@@ -19,6 +19,8 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
 import { loadTsModule, srcPath } from './helpers/ts-load.ts'
 import {
   SmsInputSchema,
@@ -678,4 +680,119 @@ test('the account-level reason reaches failure_reason through the queue', async 
 
   assert.deepEqual(await smsQueue.processBatch(1), [{ smsId: 'sms-1', success: false, status: 'failed' }])
   assert.deepEqual(reasons, ['Provider rejected SMS: InvalidApiKey: Invalid API Key'])
+})
+
+// ── Orphaned `pending` rows ─────────────────────────────────────────────────
+//
+// processBatch claims a row (queued → pending) and only later writes
+// providerMessageId. If the process dies in between, the row has no provider id:
+// the queued sweep selects only `queued`, the claim only accepts `queued`, and
+// delivery reports match on a provider id that was never written. It then shows
+// as `pending` for the full 48 hours even though the carrier may have delivered
+// it. reclaimOrphanedPending closes those rows honestly.
+
+function reclaimHarness() {
+  const updates: any[] = []
+  const { smsStore } = loadTsModule<any>('src/lib/sms-store.ts', {
+    './db': {
+      db: {
+        smsMessage: {
+          updateMany: async (args: any) => { updates.push(args); return { count: 1 } },
+          findMany: async () => [],
+        },
+      },
+    },
+  })
+  return { smsStore, updates }
+}
+
+test('orphaned pending rows are closed as unknown, never as failed and never re-sent', async () => {
+  const { smsStore, updates } = reclaimHarness()
+  assert.equal(await smsStore.reclaimOrphanedPending(5), 1)
+
+  const where = updates[0].where
+  const data = updates[0].data
+
+  // Only rows that were claimed (attemptCount > 0) and carry no provider id.
+  assert.equal(where.status, 'pending')
+  assert.equal(where.providerMessageId, null)
+  assert.deepEqual(where.attemptCount, { gt: 0 })
+  assert.ok(where.updatedAt.lt instanceof Date, 'an age cutoff is required')
+
+  // `unknown`, not `failed`: a `failed` row invites a resend, and the carrier may
+  // already have delivered this one — that would bill twice.
+  assert.equal(data.status, 'unknown')
+  assert.notEqual(data.status, 'failed')
+  assert.match(data.failureReason, /Provider outcome unknown/)
+  // No resend machinery is touched.
+  assert.equal('nextAttemptAt' in data, false)
+  assert.equal('attemptCount' in data, false)
+})
+
+test('the cutoff is the configured age, and out-of-range values are clamped', async () => {
+  const now = Date.now()
+  for (const [input, expectedMinutes] of [[5, 5], [0, 1], [-10, 1], [999999, 1440]] as const) {
+    const { smsStore, updates } = reclaimHarness()
+    await smsStore.reclaimOrphanedPending(input as number)
+    const cutoff = updates[0].where.updatedAt.lt as Date
+    const ageMinutes = (now - cutoff.getTime()) / 60000
+    assert.ok(
+      Math.abs(ageMinutes - expectedMinutes) < 0.1,
+      `minutes=${input} should clamp to ${expectedMinutes}, got ${ageMinutes.toFixed(2)}`
+    )
+  }
+})
+
+test('rows that DID get a provider id are left pending so a delivery report can settle them', async () => {
+  const { smsStore, updates } = reclaimHarness()
+  await smsStore.reclaimOrphanedPending(5)
+  // The null filter is the guarantee: these rows must not be swept.
+  assert.equal(updates[0].where.providerMessageId, null)
+})
+
+test('updateMany is called with only where/data — take/limit are not valid Prisma args', async () => {
+  const { smsStore, updates } = reclaimHarness()
+  await smsStore.reclaimOrphanedPending(5)
+  assert.deepEqual(Object.keys(updates[0]).sort(), ['data', 'where'])
+})
+
+test('the sms cron reclaims orphans and reports the count', async () => {
+  const reclaimed: number[] = []
+  const route = loadTsModule<any>('src/app/api/qstash/sms-cron/route.ts', {
+    'next/server': {
+      NextResponse: { json: (body: any, init?: any) => ({ status: init?.status ?? 200, body, json: async () => body }) },
+    },
+    '@/lib/qstash-verify': { verifyCronRequest: async () => true },
+    '@/lib/sms-queue': {
+      smsQueue: { processBatch: async () => [] },
+      retrySmsNotifications: async () => 0,
+      reconcileSmsDeliveryReports: async () => 0,
+    },
+    '@/lib/sms-store': {
+      smsStore: {
+        reclaimOrphanedPending: async (minutes: number) => { reclaimed.push(minutes); return 3 },
+        markStalePendingUnknown: async () => 0,
+        pruneDeliveryReports: async () => 0,
+      },
+    },
+  })
+
+  const response = await route.POST(new Request('https://g.test/api/qstash/sms-cron', { method: 'POST' }))
+  const body = await response.json()
+  assert.deepEqual(reclaimed, [5], 'defaults to 5 minutes')
+  assert.equal(body.orphanedReclaimed, 3)
+})
+
+test('both messaging routes declare a serverless budget long enough for one provider call', () => {
+  for (const file of [
+    'src/app/api/messaging/send/route.ts',
+    'src/app/api/messaging/quick-send/route.ts',
+  ]) {
+    const source = fs.readFileSync(path.resolve(import.meta.dirname, '..', file), 'utf8')
+    const match = /export const maxDuration = (\d+)/.exec(source)
+    assert.ok(match, `${file} must export maxDuration`)
+    // waitForSmsProvider allows 12s per call; Vercel's default (10s on Hobby)
+    // would kill the function between claim and provider-id persistence.
+    assert.ok(Number(match![1]) >= 30, `${file} maxDuration ${match![1]}s leaves no budget for the drain`)
+  }
 })

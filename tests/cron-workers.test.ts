@@ -486,6 +486,10 @@ test('cron(sms): the queue drain is authenticated and reports what it did', asyn
         },
         '@/lib/sms-store': {
           smsStore: {
+            // A row claimed but never handed to the provider has no provider id,
+            // so no delivery report can settle it and the queued sweep cannot
+            // reclaim it; the cron closes those as `unknown`.
+            reclaimOrphanedPending: async () => 3,
             markStalePendingUnknown: async () => 0,
             pruneDeliveryReports: async () => 4,
           },
@@ -502,6 +506,36 @@ test('cron(sms): the queue drain is authenticated and reports what it did', asyn
     assert.equal(body.reportsResolved, 1)
     assert.equal(body.reportsPruned, 4)
     assert.equal(body.notificationsDelivered, 2)
+    assert.equal(body.orphanedReclaimed, 3)
+  })
+})
+
+test('cron(sms): a failing orphan reclaim cannot stop the queue drain', async () => {
+  await withCronSecret(async () => {
+    const route = loadTsModule<{ GET: (request: Request) => Promise<Response> }>(
+      'src/app/api/qstash/sms-cron/route.ts',
+      {
+        '@/lib/sms-queue': {
+          smsQueue: { processBatch: async () => [{ id: 'sms_1', status: 'sent' }] },
+          retrySmsNotifications: async () => 0,
+          reconcileSmsDeliveryReports: async () => 0,
+        },
+        '@/lib/sms-store': {
+          smsStore: {
+            reclaimOrphanedPending: async () => { throw new Error('column does not exist') },
+            markStalePendingUnknown: async () => 0,
+            pruneDeliveryReports: async () => 0,
+          },
+        },
+      }
+    )
+
+    const response = await route.GET(cronRequest('/api/qstash/sms-cron'))
+    const body: any = await response.json()
+    assert.equal(response.status, 200)
+    assert.equal(body.success, true)
+    assert.equal(body.processedCount, 1, 'the drain still ran')
+    assert.equal(body.orphanedReclaimed, 0, 'and reports 0 rather than failing')
   })
 })
 

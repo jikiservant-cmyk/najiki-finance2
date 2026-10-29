@@ -123,6 +123,40 @@ export default function MessagingDashboard() {
 
   useEffect(() => { refresh() }, [refresh])
 
+  // Poll while the tab is visible.
+  //
+  // The page used to fetch exactly once on mount, so a message that settled at
+  // the carrier kept showing as `pending` until the operator found the refresh
+  // button — which reads as "delivery is broken" when delivery is fine. Polling
+  // is cheap: the dashboard endpoint is a super-admin GET with
+  // `Cache-Control: no-store`, and it aggregates in Postgres rather than in JS.
+  //
+  // Paused when the tab is hidden so a dashboard left open overnight does not
+  // keep querying, and cleared on unmount so a fast route change cannot stack
+  // intervals.
+  useEffect(() => {
+    const POLL_MS = 15_000
+    let timer: ReturnType<typeof setInterval> | null = null
+
+    const start = () => {
+      if (timer !== null) return
+      timer = setInterval(() => { void refresh() }, POLL_MS)
+    }
+    const stop = () => {
+      if (timer !== null) { clearInterval(timer); timer = null }
+    }
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') { void refresh(); start() } else { stop() }
+    }
+
+    if (document.visibilityState === 'visible') start()
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      stop()
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [refresh])
+
   const safeData = {
     totalSent: typeof data?.totalSent === 'number' ? data.totalSent : 0,
     totalCost: typeof data?.totalCost === 'number' ? data.totalCost : 0,
