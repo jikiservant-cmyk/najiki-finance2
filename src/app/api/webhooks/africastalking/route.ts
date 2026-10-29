@@ -73,7 +73,11 @@ export async function POST(request: Request) {
       return new NextResponse('Unauthorized', { status: 401 })
     }
 
-    const ipDecision = await checkRateLimit('sms-callback-ip', clientIpFrom(request) || 'unknown', {
+    // Resolved once: the rate limiter, the authoriser and the diagnostic log
+    // below must all be looking at the same address.
+    const clientIp = clientIpFrom(request)
+
+    const ipDecision = await checkRateLimit('sms-callback-ip', clientIp || 'unknown', {
       tokens: 120,
       window: '1 m',
     })
@@ -99,17 +103,29 @@ export async function POST(request: Request) {
       headerSecret: request.headers.get('x-callback-secret'),
       requestUrl: request.url,
       body: payload,
-      clientIp: clientIpFrom(request),
+      clientIp,
       requireAllowedIp: process.env.AFRICASTALKING_REQUIRE_ALLOWED_IP === 'true',
     })
 
     if (!auth.ok) {
+      // The resolved address is logged because the operator cannot otherwise
+      // tell WHY an allow-list rejected a report: Africa's Talking publishes no
+      // list of source IPs (they are issued on request and change at migrations),
+      // so the only way to build `AFRICASTALKING_ALLOWED_IPS` is to observe the
+      // addresses that actually arrive. See the accept log below.
       console.warn(
-        `[Africa's Talking DLR] Rejected callback (${auth.reason}). ` +
+        `[Africa's Talking DLR] Rejected callback (${auth.reason}) from ${clientIp || 'unresolved ip'}. ` +
           'Configure the callback URL with ?key=<AFRICASTALKING_CALLBACK_SECRET>. ' +
           'AFRICASTALKING_ALLOWED_IPS cannot authorise on its own while a secret is set.'
       )
       return new NextResponse('Unauthorized', { status: 401 })
+    }
+
+    // Opt-in only: off by default so existing deployments keep their log volume
+    // and no caller address is written to logs unless someone is deliberately
+    // collecting them for an allow-list.
+    if (String(process.env.SMS_CALLBACK_DEBUG_IP ?? '').trim().toLowerCase() === 'true') {
+      console.log(`[Africa's Talking DLR] Accepted from ${clientIp || 'unresolved ip'} (via ${auth.via})`)
     }
 
     const id = payload.id == null ? '' : String(payload.id).trim()
