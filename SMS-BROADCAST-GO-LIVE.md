@@ -95,7 +95,7 @@ directions.
 ## 3. Verification
 
 ```
-npm test        364 tests, 364 pass, 0 fail      (325 before, +39 new)
+npm test        366 tests, 366 pass, 0 fail      (325 before, +41 new)
 npx eslint      clean on every changed file
 npx tsc --noEmit 12 errors, all pre-existing in src/lib/data.ts
 ```
@@ -107,7 +107,7 @@ comparison, the 403 body, the rejection reason, the `unknown` flag, masking, and
 every Africa's Talking failure shape (account-level, axios, raw body, SDK-local
 phone rejection, and the three that must *stay* ambiguous).
 
-**`tests/sms-paths-e2e.test.ts` (14)** — the modules **chained**, because that is
+**`tests/sms-paths-e2e.test.ts` (16)** — the modules **chained**, because that is
 a different claim: the names one module writes are the names the next one reads.
 It drives the real `POST /api/messaging/send` → real `smsStore.createOrGet` →
 real `smsQueue.processBatch` → real Africa's Talking DLR route → real
@@ -130,6 +130,8 @@ What that surfaces that units cannot:
 | `CHURCH` / `Church` / `"  church  "` all resolve in **quick-send** | the dashboard path, which 404'd before the fallback |
 | `unknown` is silent by default and notifies when opted in | the flag behaves at both ends of the chain |
 | daily ceiling returns 429 + `Retry-After` and creates no row | the refusal does not poison the next send |
+| `smsId` handed out at submit is byte-identical to the one the webhook repeats, and is never the `reference` | the required `(reference, smsId)` match cannot fail on a contract mismatch |
+| an idempotent retry returns the **same** `smsId` and `reference` | the pair a webhook matches on stays unique per message |
 
 **Live server check** (`next dev`, real HTTP, no database): the middleware
 exemption was proven on the wire rather than inferred from a regex —
@@ -337,10 +339,14 @@ rerun-safe — the constraint is created inside a `DO` block because
 
 ```sql
 -- 1. Delivery outcome lives beside the send state, not inside it.
+--    Two columns, not three: `notification_delivered_at` is deliberately NOT
+--    added. On the Na'jiki side it records when the *partner* acknowledged a
+--    notification — on the church side the church IS the partner, so nothing in
+--    this integration would ever write it, and an always-null column invites
+--    exactly the kind of false inference this document is trying to prevent.
 ALTER TABLE church.sms_queue
-  ADD COLUMN IF NOT EXISTS delivery_status         text,
-  ADD COLUMN IF NOT EXISTS delivery_updated_at     timestamptz,
-  ADD COLUMN IF NOT EXISTS notification_delivered_at timestamptz;
+  ADD COLUMN IF NOT EXISTS delivery_status     text,
+  ADD COLUMN IF NOT EXISTS delivery_updated_at timestamptz;
 
 -- 2. Re-runnable: ADD CONSTRAINT has no IF NOT EXISTS, so guard on the catalog.
 DO $$
@@ -403,22 +409,78 @@ CREATE UNIQUE INDEX IF NOT EXISTS sms_queue_najiki_reference_key
   ON church.sms_queue (najiki_reference);
 ```
 
-Until that index exists, make the webhook `UPDATE` safe anyway by also matching
-the `smsId` the webhook carries:
+Until that index exists, the webhook `UPDATE` **must** match the `smsId` the
+payload carries. It is a required predicate, not an optional one:
 
 ```sql
 UPDATE church.sms_queue
    SET delivery_status        = $2,                    -- delivered | failed | unknown
        provider_message_id    = COALESCE($3, provider_message_id),
        last_error             = CASE WHEN $2 = 'failed' THEN $4 ELSE last_error END,
-       delivery_updated_at    = now()
+       delivery_updated_at    = CASE WHEN delivery_status IS DISTINCT FROM $2
+                                     THEN now() ELSE delivery_updated_at END
  WHERE najiki_reference = $1
-   AND ($5::text IS NULL OR najiki_sms_id = $5)        -- $5 = body.smsId
+   AND najiki_sms_id    = $5                           -- $5 = body.smsId, REQUIRED
    AND COALESCE(delivery_status, '') NOT IN ('delivered','failed');
 ```
 
-The final predicate is the important one: it makes a replayed delivery idempotent
-and stops a late event rewriting a terminal row.
+Three properties worth stating precisely:
+
+* **`smsId` is required.** There is deliberately no `OR $5 IS NULL` fallback. A
+  missing `smsId` in the payload is a contract violation, and falling back to
+  reference-only matching would reintroduce exactly the multi-row hazard this is
+  here to prevent. Reject the event and alert instead.
+* **`delivery_updated_at` only advances when the value actually changes** — the
+  `IS DISTINCT FROM` compares against the pre-update value — so a replayed event
+  is a genuine no-op rather than a silent touch.
+* **`unknown` is intentionally overwritable.** The terminal guard excludes only
+  `delivered` and `failed`, so a late `delivered` can still correct an `unknown`.
+  That mirrors Na'jiki's own rule (`applyDeliveryReport` accepts transitions from
+  `pending` **or** `unknown`), so the two sides cannot disagree.
+
+#### The caller must treat "not exactly one row" as an error
+
+The `UPDATE` returning `0` or `>1` is a reconciliation case, **not** a success.
+Check it explicitly rather than assuming:
+
+```ts
+const result = await sql`...the UPDATE above...`
+if (result.count !== 1) {
+  // 0  → the reference/smsId pair is unknown to this queue, or the row was
+  //      already terminal (a replay). Distinguish before alerting: re-read the
+  //      row and check delivery_status.
+  // >1 → najiki_sms_id is not unique either. Stop, alert, do not guess.
+  return Response.json({ received: true, reconciled: false, matched: result.count })
+}
+return Response.json({ received: true })
+```
+
+Returning **200** in the `0`/`>1` case keeps Na'jiki from retrying a logical error
+ten times a minute forever; surface it in your own alerting instead.
+
+#### What `smsId` actually is (and what your column must hold)
+
+Verified in the gateway, because this is the one join key the whole webhook
+depends on:
+
+| Field | Source | Format | Example |
+|---|---|---|---|
+| `smsId` | `sms_messages.id`, minted by `newId()` (`src/lib/sms-store.ts:50`) | `sms_` + 20 lowercase hex | `sms_4d6f43b6ab43b4488ed6` |
+| `reference` | `newReference()` (`src/lib/sms-store.ts:54`) | `MSG-<HEX>-<HEX>` | `MSG-1A186FB2774-8B94FA` |
+
+The 202 response from `POST /api/messaging/send` returns **both**
+(`smsId: smsRequest.id`, `reference: smsRequest.reference`), and the webhook
+repeats both (`smsId: sms.id, reference: sms.reference` in
+`src/lib/sms-queue.ts:116`) — the same `smsId` the caller was handed, so
+`najiki_sms_id` must store **the 202 response's `smsId`**, not the `MSG-` reference.
+
+Two traps:
+
+* `sms_messages.id` is `@default(cuid())` in Prisma, but that default is never
+  used — the application always supplies `newId()`. A row hand-inserted without
+  an id would get a *cuid* instead, so match by exact equality, never by format.
+* `smsId` and `reference` are not interchangeable. Storing the reference in
+  `najiki_sms_id` makes every webhook fail the required predicate above.
 
 #### Send state vs delivery state
 
@@ -474,12 +536,13 @@ and `@unique` is emitted as a bare `CREATE UNIQUE INDEX`, which is **invisible i
 | Account-level provider failures are classified | `src/lib/sms.ts:61` and `:77` |
 | The application-code match is normalised | `src/lib/sms-policy.ts:70`, used at `src/app/api/messaging/send/route.ts:89` |
 | The status endpoint's response fields | `src/app/api/messaging/sms/[reference]/route.ts:97–130` |
+| `smsId` format (`sms_` + 20 hex) | `src/lib/sms-store.ts:50`; returned at `send/route.ts:163`, repeated at `sms-queue.ts:116` |
 | No Prisma change on this branch | `git diff --stat main..HEAD -- prisma/` → empty |
 
 Reproduce the test result rather than trusting the number:
 
 ```bash
-npm ci && npm test        # 364 tests, 0 fail
+npm ci && npm test        # 366 tests, 0 fail
 npx eslint .              # clean
 npx tsc --noEmit          # only the pre-existing src/lib/data.ts errors
 ```

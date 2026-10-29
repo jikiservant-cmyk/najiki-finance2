@@ -694,3 +694,57 @@ test('e2e: the per-application daily ceiling returns 429 with Retry-After and se
     else process.env.SMS_DAILY_LIMIT_PER_APP = previous
   }
 })
+
+// ── The join key the partner's webhook depends on ────────────────────────────
+
+test('e2e: the smsId handed out at submit is exactly the one the webhook repeats', async () => {
+  const h = buildHarness()
+
+  const accepted = await (await h.send.POST(postSend({}))).json()
+
+  // Format contract: `sms_` + 20 lowercase hex, minted by newId() in sms-store.
+  // `sms_messages.id` also declares @default(cuid()), but that default is never
+  // used — the application always supplies the id — so a partner must match by
+  // exact equality, never by shape.
+  assert.match(accepted.smsId, /^sms_[0-9a-f]{20}$/)
+  // And it is NOT the reference: storing one in the other's column would make
+  // every webhook fail the required (reference, smsId) predicate.
+  assert.match(accepted.reference, /^MSG-/)
+  assert.notEqual(accepted.smsId, accepted.reference)
+
+  await h.queue.processBatch(10)
+  await h.callback.POST(postDlr({ id: 'AT-1', status: 'Success' }))
+
+  assert.equal(h.notifications.length, 1)
+  const payload = JSON.parse(h.notifications[0].body)
+  assert.equal(payload.smsId, accepted.smsId, 'the webhook repeats the smsId we handed out')
+  assert.equal(payload.reference, accepted.reference)
+  assert.match(payload.smsId, /^sms_[0-9a-f]{20}$/)
+})
+
+test('e2e: an idempotent retry returns the same smsId, so the pair stays unique', async () => {
+  const h = buildHarness()
+  const key = 'broadcast-job-9:member-7'
+
+  const submit = () =>
+    h.send.POST(
+      new Request('https://gateway.test/api/messaging/send', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${API_KEY}`,
+          'idempotency-key': key,
+        },
+        body: JSON.stringify({ to: PHONE, message: 'Service at 9am', applicationCode: 'church' }),
+      })
+    )
+
+  const first = await (await submit()).json()
+  const second = await (await submit()).json()
+
+  assert.equal(second.deduplicated, true)
+  assert.equal(second.smsId, first.smsId, 'a retry must not mint a second id')
+  assert.equal(second.reference, first.reference)
+  // One row, so the (reference, smsId) pair a webhook matches against is unique.
+  assert.equal(h.db.rows.smsMessage.length, 1)
+})
