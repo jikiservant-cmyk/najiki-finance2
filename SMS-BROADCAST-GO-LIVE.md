@@ -16,6 +16,38 @@ Four independent faults were stacked. Fixing one would not have revealed the nex
 | 2 | Provider rejection reason overwritten with the constant `'Provider rejected SMS'` | `InvalidSenderId`, `InsufficientBalance` and a network failure were indistinguishable in `failure_reason` | `src/lib/sms.ts`, `sms-store.ts`, `sms-queue.ts` |
 | 3 | No per-message status read | A partner tracking a broadcast depended entirely on the webhook, which fires only for `delivered`/`failed` | new `GET /api/messaging/sms/:reference` |
 | 4 | `unknown` is terminal but never notified | A recipient that aged out of the settlement window stayed unresolved forever | opt-in `SMS_NOTIFY_UNKNOWN` |
+| 5 | **Account-level provider failures were discarded** | `Invalid API Key`, `Insufficient balance`, `User not found` came back in `SMSMessageData.Message` with no recipients; the code threw "outcome unknown", so the row stayed `pending` with no reason and became `unknown` 48 h later | `classifyProviderFailure()` in `src/lib/sms.ts` |
+
+### Fault 5 is the one that explains the silent `pending → unknown` rows
+
+Africa's Talking reports failures in **two** places and only one was read:
+
+| Channel | Example | Was it handled? |
+|---|---|---|
+| per recipient — `SMSMessageData.Recipients[].status` | `InsufficientBalance` | yes |
+| **account level** — `SMSMessageData.Message`, **no recipients at all** | `Invalid API Key`, `Insufficient balance`, `User not found` | **no — thrown as ambiguous** |
+
+The SDK (`node_modules/africastalking/lib/sms.js`) makes this worse: on any
+non-201 it rejects with the axios error, so a 401 never even reaches the response
+parser — it lands in the `catch` and was flattened to `"Provider outcome unknown"`.
+
+That classification is deliberate and correct for a *lost* response (never treat
+an uncertain send as failed, or a retry bills twice). But it was being applied to
+**permanent, deterministic misconfiguration**, producing exactly the state in the
+production dump: `pending`, `failure_reason: null`, then `unknown` after 48 h,
+with nothing anywhere to explain it.
+
+`classifyProviderFailure()` now recognises only unambiguous "we did not accept
+this" reasons — bad key, bad username, insufficient balance, unregistered sender,
+invalid number, suspended account — from all three shapes the SDK can reject with
+(axios `error.response.data`, a raw body on 2xx-not-201, and the SDK's local Joi
+phone validation). Anything unrecognised still throws, so an uncertain outcome is
+still never turned into a failure.
+
+Consequence worth knowing: a permanent error now lands in `failed` with
+`failure_reason` like `Provider rejected SMS: InvalidApiKey: Invalid API Key`,
+which is both human-readable and greppable, instead of silently ageing to
+`unknown`.
 
 Two further causes are **configuration, not code**, and must be checked in the
 deployment before anything else (see §6): the Africa's Talking delivery-report
@@ -30,7 +62,7 @@ callback URL, and `AFRICASTALKING_USERNAME` silently defaulting to `sandbox`.
 | `src/lib/sms-policy.ts` | `applicationCode` is trimmed in the schema; new `applicationCodeMatches()`; new `smsNotifyUnknownEnabled()` | none — widening only |
 | `src/app/api/messaging/send/route.ts` | Uses the normalised comparison; the 403 now names the expected code | none |
 | `src/app/api/messaging/quick-send/route.ts` | Exact lookup first, then a case-insensitive retry | none — one extra query only on the miss path |
-| `src/lib/sms.ts` | Provider's own status returned as `providerStatus` | additive field |
+| `src/lib/sms.ts` | Provider's own status returned as `providerStatus`; account-level failures classified instead of discarded; one-shot sandbox warning in production | additive |
 | `src/lib/sms-store.ts` | `failExplicitly(id, reason?)` stores the real reason; `getPendingTerminalNotifications()` can include `unknown` | additive; old call shape still valid |
 | `src/lib/sms-queue.ts` | Passes the real reason; `unknown` notifiable only when the flag is on | default behaviour unchanged |
 | `src/app/api/messaging/dashboard/route.ts` | Returns `attemptCount`, `providerMessageId`, `failureReason` | additive |
@@ -63,15 +95,17 @@ directions.
 ## 3. Verification
 
 ```
-npm test        357 tests, 357 pass, 0 fail      (325 before, +32 new)
+npm test        364 tests, 364 pass, 0 fail      (325 before, +39 new)
 npx eslint      clean on every changed file
 npx tsc --noEmit 12 errors, all pre-existing in src/lib/data.ts
 ```
 
 Two suites, deliberately different in kind.
 
-**`tests/sms-partner-flow.test.ts` (18)** — each module in isolation: the code
-comparison, the 403 body, the rejection reason, the `unknown` flag, masking.
+**`tests/sms-partner-flow.test.ts` (25)** — each module in isolation: the code
+comparison, the 403 body, the rejection reason, the `unknown` flag, masking, and
+every Africa's Talking failure shape (account-level, axios, raw body, SDK-local
+phone rejection, and the three that must *stay* ambiguous).
 
 **`tests/sms-paths-e2e.test.ts` (14)** — the modules **chained**, because that is
 a different claim: the names one module writes are the names the next one reads.

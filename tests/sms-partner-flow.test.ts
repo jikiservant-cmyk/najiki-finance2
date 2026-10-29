@@ -487,3 +487,195 @@ test('the status route file is where the middleware exemption points', () => {
   )
   assert.equal(typeof route.GET, 'function')
 })
+
+// ── Africa's Talking failure shapes ─────────────────────────────────────────
+//
+// The SDK (node_modules/africastalking/lib/sms.js) rejects in three shapes and
+// Africa's Talking reports failures in two places. Before this, only a
+// per-recipient status was understood, so every account-level failure — wrong
+// key, empty balance, unregistered sender — was thrown as "Provider outcome
+// unknown", held `pending`, and aged into `unknown` with no reason recorded.
+
+function atProvider(response: any) {
+  const sms = loadTsModule<any>('src/lib/sms.ts', {
+    africastalking: () => ({ SMS: { send: async () => response } }),
+    '@/lib/phone': { normalizeToE164: (p: string) => p },
+  })
+  return sms.sendSmsViaProvider
+}
+
+function atProviderThrowing(thrown: unknown) {
+  const sms = loadTsModule<any>('src/lib/sms.ts', {
+    africastalking: () => ({ SMS: { send: async () => { throw thrown } } }),
+    '@/lib/phone': { normalizeToE164: (p: string) => p },
+  })
+  return sms.sendSmsViaProvider
+}
+
+const PROVIDER_ENV = { key: process.env.AFRICASTALKING_API_KEY, user: process.env.AFRICASTALKING_USERNAME }
+function withProviderEnv() {
+  process.env.AFRICASTALKING_API_KEY = 'test-key'
+  process.env.AFRICASTALKING_USERNAME = 'najiki'
+}
+function restoreProviderEnv() {
+  if (PROVIDER_ENV.key === undefined) delete process.env.AFRICASTALKING_API_KEY
+  else process.env.AFRICASTALKING_API_KEY = PROVIDER_ENV.key
+  if (PROVIDER_ENV.user === undefined) delete process.env.AFRICASTALKING_USERNAME
+  else process.env.AFRICASTALKING_USERNAME = PROVIDER_ENV.user
+}
+
+test('classifyProviderFailure: only unambiguous "not accepted" reasons are classified', () => {
+  const sms = loadTsModule<any>('src/lib/sms.ts', { africastalking: () => ({}), '@/lib/phone': {} })
+  const { classifyProviderFailure } = sms
+
+  for (const [message, label] of [
+    ['Invalid API Key', 'InvalidApiKey'],
+    ['invalid api key', 'InvalidApiKey'],
+    ['Insufficient balance', 'InsufficientBalance'],
+    ['User not found', 'InvalidUsername'],
+    ['InvalidSenderId', 'InvalidSenderId'],
+    ['Sender ID is not registered', 'InvalidSenderId'],
+    ['Invalid phone number', 'InvalidPhoneNumber'],
+    ['Account is suspended', 'AccountInactive'],
+  ] as const) {
+    assert.match(String(classifyProviderFailure(message)), new RegExp(`^${label}: `), message)
+  }
+
+  // The provider's own words are preserved beside the label.
+  assert.match(String(classifyProviderFailure('Insufficient balance')), /Insufficient balance/)
+  // Bounded, so a long body cannot be written into failure_reason unbounded.
+  assert.ok(String(classifyProviderFailure(`Invalid API Key ${'x'.repeat(400)}`)).length <= 200)
+
+  // Anything ambiguous must stay ambiguous: turning an uncertain outcome into a
+  // failure risks a second billed send.
+  for (const unknown of [
+    '',
+    '   ',
+    undefined,
+    null,
+    42,
+    'Sent to 1/1',
+    'Queued',
+    'Request failed with status code 500',
+    'socket hang up',
+  ]) {
+    assert.equal(classifyProviderFailure(unknown), null, JSON.stringify(unknown))
+  }
+})
+
+test('AT account-level rejection (no Recipients) becomes a failure with the real reason', async () => {
+  withProviderEnv()
+  try {
+    for (const [message, expected] of [
+      ['Invalid API Key', 'InvalidApiKey'],
+      ['Insufficient balance', 'InsufficientBalance'],
+      ['User not found', 'InvalidUsername'],
+    ] as const) {
+      const send = atProvider({ SMSMessageData: { Message: message } })
+      const result = await send(PHONE, 'hello')
+      assert.equal(result.success, false, message)
+      assert.match(String(result.providerStatus), new RegExp(`^${expected}: `), message)
+      assert.equal(result.error, 'Provider rejected SMS')
+    }
+  } finally {
+    restoreProviderEnv()
+  }
+})
+
+test('AT non-2xx surfaces through the SDK’s axios error, not as "outcome unknown"', async () => {
+  withProviderEnv()
+  try {
+    const send = atProviderThrowing(
+      Object.assign(new Error('Request failed with status code 401'), {
+        response: { status: 401, data: { SMSMessageData: { Message: 'Invalid API Key' } } },
+      })
+    )
+    const result = await send(PHONE, 'hello')
+    assert.equal(result.success, false)
+    assert.match(String(result.providerStatus), /^InvalidApiKey: Invalid API Key$/)
+  } finally {
+    restoreProviderEnv()
+  }
+})
+
+test('AT raw-body rejection (2xx but not 201) is classified too', async () => {
+  withProviderEnv()
+  try {
+    const send = atProviderThrowing({ SMSMessageData: { Message: 'Insufficient balance' } })
+    const result = await send(PHONE, 'hello')
+    assert.equal(result.success, false)
+    assert.match(String(result.providerStatus), /^InsufficientBalance: /)
+  } finally {
+    restoreProviderEnv()
+  }
+})
+
+test('an SDK-rejected phone number fails instead of hanging pending forever', async () => {
+  withProviderEnv()
+  try {
+    // The SDK validates locally with Joi and never transmits, so failing is safe:
+    // there is no accepted send to mask.
+    const send = atProviderThrowing(new Error('must be a valid phone number; '))
+    const result = await send(PHONE, 'hello')
+    assert.equal(result.success, false)
+    assert.match(String(result.providerStatus), /^InvalidPhoneNumber: /)
+  } finally {
+    restoreProviderEnv()
+  }
+})
+
+test('genuinely ambiguous outcomes still throw and are never marked failed', async () => {
+  withProviderEnv()
+  try {
+    // Empty body: the response may have been lost after acceptance.
+    await assert.rejects(atProvider({ SMSMessageData: {} })(PHONE, 'hello'), /outcome unknown/)
+    // Transport failure with no response at all.
+    await assert.rejects(
+      atProviderThrowing(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }))(PHONE, 'hello'),
+      /outcome unknown/
+    )
+    // A 500 with an unrecognised body.
+    await assert.rejects(
+      atProviderThrowing(
+        Object.assign(new Error('Request failed with status code 500'), {
+          response: { status: 500, data: { SMSMessageData: { Message: 'Internal error' } } },
+        })
+      )(PHONE, 'hello'),
+      /outcome unknown/
+    )
+  } finally {
+    restoreProviderEnv()
+  }
+})
+
+test('the account-level reason reaches failure_reason through the queue', async () => {
+  const reasons: any[] = []
+  const row: any = { id: 'sms-1', recipient: PHONE, message: 'hi', status: 'queued', attemptCount: 0, applicationId: null }
+  const { smsQueue } = loadTsModule<any>('src/lib/sms-queue.ts', {
+    './redis': { redis: { lpush: async () => {}, rpop: async () => null } },
+    './sms-store': {
+      smsStore: {
+        getDueQueued: async () => [row.id],
+        claimForSending: async () => { row.status = 'pending'; return { ...row } },
+        recordProviderAcceptance: async () => true,
+        failExplicitly: async (_id: string, reason?: string) => { reasons.push(reason); return true },
+        updateProviderCost: async () => true,
+      },
+    },
+    './sms': {
+      sendSmsViaProvider: async () => ({
+        success: false,
+        error: 'Provider rejected SMS',
+        providerStatus: 'InvalidApiKey: Invalid API Key',
+      }),
+    },
+    './db': { db: {} },
+    './safe-fetch': { isPlaceholderUrl: () => false },
+    './application-auth': {},
+    './notification-signature': {},
+    './provider-cost': { parseProviderCost: () => null },
+  })
+
+  assert.deepEqual(await smsQueue.processBatch(1), [{ smsId: 'sms-1', success: false, status: 'failed' }])
+  assert.deepEqual(reasons, ['Provider rejected SMS: InvalidApiKey: Invalid API Key'])
+})
