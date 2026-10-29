@@ -4,7 +4,12 @@ import { smsStore, SMS_COST_PLACEHOLDER, SmsDailyLimitError, SmsIdempotencyConfl
 import { smsQueue } from '@/lib/sms-queue'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
 import { findApplicationByApiKey } from '@/lib/application-auth'
-import { SmsInputSchema, MAX_SMS_BODY_BYTES, resolveSmsDailyLimit } from '@/lib/sms-policy'
+import {
+  SmsInputSchema,
+  MAX_SMS_BODY_BYTES,
+  resolveSmsDailyLimit,
+  applicationCodeMatches,
+} from '@/lib/sms-policy'
 import { readTextWithLimit, PayloadTooLargeError } from '@/lib/request-body'
 
 export function OPTIONS(request: Request) {
@@ -81,8 +86,20 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Invalid or missing API key' }, { status: 401 })
     }
     
-    if (applicationCode && application.code !== applicationCode) {
-      return NextResponse.json({ error: 'Application code mismatch' }, { status: 403 })
+    if (!applicationCodeMatches(application.code, applicationCode)) {
+      // Name both sides: the previous message said only "mismatch", so the
+      // caller had no way to tell a casing difference from a wrong app without
+      // reading the database.
+      return NextResponse.json(
+        {
+          error:
+            `Application code mismatch: this API key belongs to application "${application.code}". ` +
+            'Send that value (matching is case-insensitive) or omit applicationCode — the API key ' +
+            'already identifies the application.',
+          expected: application.code,
+        },
+        { status: 403 }
+      )
     }
 
     const keyDecision = await checkRateLimit('sms-key', apiKey, { tokens: 60, window: '1 m' })

@@ -135,6 +135,13 @@ export const config = {
     // is listed explicitly so a future matcher change cannot accidentally move
     // deposit traffic behind the Supabase session gate and re-introduce the
     // HTML 500 that surfaced as "NaJiki gateway error (Status 500)".
-    '/((?!_next/static|_next/image|favicon.ico|manifest.json|manifest.webmanifest|sw.js|icons|logo.svg|robots.txt|api/webhooks/|api/cron/|api/qstash/|api/payments/|api/payments$|api/payments/intent|api/messaging/send|api/messaging/callback|api/health).*)',
+    //
+    // `api/messaging/sms/` is the partner-facing per-message status read. It
+    // authenticates with an API key like `api/messaging/send`, so it must be
+    // reachable without a Supabase session; otherwise the partner receives a
+    // login redirect instead of JSON — the same class of failure that hid the
+    // Africa's Talking delivery-report route behind a permanent 401. The
+    // trailing slash keeps `/api/messaging/sms-admin` out of the exemption.
+    '/((?!_next/static|_next/image|favicon.ico|manifest.json|manifest.webmanifest|sw.js|icons|logo.svg|robots.txt|api/webhooks/|api/cron/|api/qstash/|api/payments/|api/payments$|api/payments/intent|api/messaging/send|api/messaging/callback|api/messaging/sms/|api/health).*)',
   ],
 }

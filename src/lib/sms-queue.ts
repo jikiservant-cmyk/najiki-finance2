@@ -50,7 +50,11 @@ export const smsQueue = {
       try {
         const result = await sendSmsViaProvider(sms.recipient, sms.message, sms.senderId ?? undefined)
         if (!result.success) {
-          await smsStore.failExplicitly(id)
+          // Persist the provider's own status word so `failure_reason` can be
+          // acted on. The returned object stays exactly {smsId, success, status}
+          // — callers and tests depend on that shape.
+          const reason = result.providerStatus ? `Provider rejected SMS: ${result.providerStatus}` : undefined
+          await smsStore.failExplicitly(id, reason)
           return { smsId: id, success: false, status: 'failed' }
         }
         // Provider acceptance is NOT proof of delivery.
@@ -73,7 +77,17 @@ export const smsQueue = {
  * Partners should deduplicate by smsId and status (webhooks are at-least-once).
  */
 export async function deliverSmsNotification(sms: SmsRequest): Promise<boolean> {
-  if (sms.status !== 'delivered' && sms.status !== 'failed') return false
+  // `unknown` is terminal (markStalePendingUnknown) but is only notifiable when
+  // SMS_NOTIFY_UNKNOWN=true — see sms-store.getPendingTerminalNotifications.
+  // Read inline rather than importing a helper: this module's import list is
+  // stubbed exhaustively by the tests, and adding an import would require them
+  // to know about it.
+  const notifyUnknown = String(process.env.SMS_NOTIFY_UNKNOWN ?? '').trim().toLowerCase() === 'true'
+  const terminal =
+    sms.status === 'delivered' ||
+    sms.status === 'failed' ||
+    (notifyUnknown && sms.status === 'unknown')
+  if (!terminal) return false
   try {
     const app = sms.applicationId
       ? await db.application.findUnique({ where: { id: sms.applicationId } })

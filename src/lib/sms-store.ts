@@ -180,11 +180,19 @@ export const smsStore = {
     return result.count === 1
   },
 
-  /** Explicit provider rejection is safe to fail; transport exceptions are NOT. */
-  failExplicitly: async (id: string): Promise<boolean> => {
+  /**
+   * Explicit provider rejection is safe to fail; transport exceptions are NOT.
+   *
+   * `reason` should be the provider's own status word. It is optional so older
+   * callers keep the previous behaviour, but passing it is what makes the stored
+   * `failure_reason` usable — it previously said "Provider rejected SMS" for
+   * every distinct rejection the provider can return.
+   */
+  failExplicitly: async (id: string, reason?: string | null): Promise<boolean> => {
+    const detail = String(reason ?? '').trim().slice(0, 200) || 'Provider rejected SMS'
     const result = await db.smsMessage.updateMany({
       where: { id, status: 'pending' },
-      data: { status: 'failed', failureReason: 'Provider rejected SMS' },
+      data: { status: 'failed', failureReason: detail },
     })
     return result.count === 1
   },
@@ -199,8 +207,16 @@ export const smsStore = {
   },
 
   getPendingTerminalNotifications: async (limit = 20): Promise<SmsRequest[]> => {
+    // `unknown` is terminal too (see markStalePendingUnknown), but it is only
+    // included when SMS_NOTIFY_UNKNOWN=true. Default behaviour is unchanged:
+    // partners that have not implemented handling for it must not start
+    // receiving a status they never expect.
+    const terminal: string[] = ['delivered', 'failed']
+    if (String(process.env.SMS_NOTIFY_UNKNOWN ?? '').trim().toLowerCase() === 'true') {
+      terminal.push('unknown')
+    }
     const rows = await db.smsMessage.findMany({
-      where: { status: { in: ['delivered', 'failed'] }, notificationDeliveredAt: null },
+      where: { status: { in: terminal }, notificationDeliveredAt: null },
       // Never let an unavailable endpoint monopolize the first page forever.
       orderBy: { notificationAttemptedAt: { sort: 'asc', nulls: 'first' } }, take: limit,
     })
