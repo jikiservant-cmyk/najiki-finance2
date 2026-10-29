@@ -319,13 +319,178 @@ Reuse `church.sms_queue`; do not build a second queue. Four requirements:
    A retried request returns `202 { deduplicated: true }` with the original
    `reference` instead of sending again — that is what prevents a double charge.
 2. Store the returned `reference` and `smsId`. `SMS_DELIVERY_UPDATE` carries
-   `reference`, never your queue id.
-3. Keep send state (`pending/processing/sent/failed`) and delivery state
-   (`delivery_status`) in **separate columns**. One column cannot carry two state
-   machines.
+   both, plus `eventType`, `status`, `providerId`, `recipient`, `applicationCode`.
+   Your queue id never appears in the webhook, so `reference` is the join key.
+3. Keep send state and delivery state in **separate columns**. One column cannot
+   carry two state machines.
 4. Stagger `scheduled_at` at insert (~50/minute) and add `broadcast_session_id` so
    a report can be produced per broadcast. Pre-check the wallet covers the whole
    job before enqueuing.
+
+#### Required DDL (against the **live** `church` schema)
+
+The live `sms_queue.status` has a CHECK constraint allowing only
+`pending, processing, sent, failed, cancelled`. It **cannot hold a delivery
+outcome**, so the outcome needs its own column. Every statement below is
+rerun-safe — the constraint is created inside a `DO` block because
+`ADD CONSTRAINT` has no `IF NOT EXISTS`.
+
+```sql
+-- 1. Delivery outcome lives beside the send state, not inside it.
+ALTER TABLE church.sms_queue
+  ADD COLUMN IF NOT EXISTS delivery_status         text,
+  ADD COLUMN IF NOT EXISTS delivery_updated_at     timestamptz,
+  ADD COLUMN IF NOT EXISTS notification_delivered_at timestamptz;
+
+-- 2. Re-runnable: ADD CONSTRAINT has no IF NOT EXISTS, so guard on the catalog.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conname  = 'sms_queue_delivery_status_check'
+       AND conrelid = 'church.sms_queue'::regclass
+  ) THEN
+    ALTER TABLE church.sms_queue
+      ADD CONSTRAINT sms_queue_delivery_status_check
+      CHECK (delivery_status IS NULL
+             OR delivery_status IN ('delivered','failed','unknown'));
+  END IF;
+END
+$$;
+```
+
+#### `najiki_reference` is not unique — check before relying on it
+
+The proposed `UPDATE ... WHERE najiki_reference = $1` would touch **every**
+matching row, and there is currently no unique index on that column. Report
+first; do not remediate blind:
+
+```sql
+-- (a) Are there duplicates at all?
+SELECT najiki_reference, count(*) AS rows, min(created_at), max(created_at)
+  FROM church.sms_queue
+ WHERE najiki_reference IS NOT NULL
+ GROUP BY najiki_reference
+HAVING count(*) > 1
+ ORDER BY rows DESC;
+
+-- (b) If yes, see what the duplicates are before choosing which row owns the outcome.
+SELECT id, najiki_reference, najiki_sms_id, status, created_at
+  FROM church.sms_queue q
+ WHERE najiki_reference IN (
+         SELECT najiki_reference FROM church.sms_queue
+          WHERE najiki_reference IS NOT NULL
+          GROUP BY najiki_reference HAVING count(*) > 1)
+ ORDER BY najiki_reference, created_at;
+```
+
+Two plausible causes, with different repairs:
+
+* **Reused reference after an idempotent retry.** Na'jiki returns the *original*
+  `reference` with `202 { deduplicated: true }` — so if the dispatcher stored the
+  returned reference on the retry row as well, two rows now share one reference.
+  The fix is in the dispatcher (store the reference only on the row that minted
+  it) and the duplicate attempt should be closed as `cancelled`, not deleted.
+* **A genuine data error.** Keep the row whose `najiki_sms_id` matches, null the
+  rest, then enforce uniqueness.
+
+Only after (a) returns zero rows:
+
+```sql
+-- NULLs are distinct in Postgres, so rows that have not been dispatched yet are
+-- unaffected. This makes the webhook's UPDATE unambiguous.
+CREATE UNIQUE INDEX IF NOT EXISTS sms_queue_najiki_reference_key
+  ON church.sms_queue (najiki_reference);
+```
+
+Until that index exists, make the webhook `UPDATE` safe anyway by also matching
+the `smsId` the webhook carries:
+
+```sql
+UPDATE church.sms_queue
+   SET delivery_status        = $2,                    -- delivered | failed | unknown
+       provider_message_id    = COALESCE($3, provider_message_id),
+       last_error             = CASE WHEN $2 = 'failed' THEN $4 ELSE last_error END,
+       delivery_updated_at    = now()
+ WHERE najiki_reference = $1
+   AND ($5::text IS NULL OR najiki_sms_id = $5)        -- $5 = body.smsId
+   AND COALESCE(delivery_status, '') NOT IN ('delivered','failed');
+```
+
+The final predicate is the important one: it makes a replayed delivery idempotent
+and stops a late event rewriting a terminal row.
+
+#### Send state vs delivery state
+
+Conflating these is how a broadcast report starts lying. They are different
+questions with different repairs:
+
+| What happened | `status` (yours) | `delivery_status` (new) |
+|---|---|---|
+| Na'jiki returned 202 | `sent` | `NULL` |
+| Na'jiki `pending` (AT accepted) | `sent` | `NULL` |
+| Na'jiki `delivered` | `sent` | `delivered` |
+| Na'jiki `failed` (carrier rejected) | `sent` | `failed` |
+| Na'jiki **403 / 401 / 429** — never dispatched | `failed` | `NULL` |
+| Na'jiki `unknown` (no DLR in 48 h) | `sent` | `unknown` |
+
+`status = 'failed'` means **our dispatcher could not get a 202** (wrong
+`applicationCode`, bad key, rate limit, daily cap). `delivery_status = 'failed'`
+means **the carrier rejected it** (e.g. `InvalidSenderId`). The first is an
+integration fix, the second is a provider-account fix.
+
+#### Cost caveat
+
+`sms_messages.cost` has a database default of **0**, but `updateProviderCost()`
+only overwrites rows sitting at the placeholder `50`:
+
+```ts
+// src/lib/sms-store.ts:368
+where: { id, cost: SMS_COST_PLACEHOLDER },   // SMS_COST_PLACEHOLDER === 50
+```
+
+Any row inserted with the DB default (a script, a seed, a future code path that
+omits the placeholder) therefore never receives the carrier's reported cost and
+stays 0. Do not trust `SUM(cost)` over non-`delivered` rows, and treat aligning
+the default with the placeholder as a separate fix.
+
+
+---
+
+## 6.4 How to check the claims in this document yourself
+
+Every Na'jiki-side statement above is verifiable in the repository. Database
+metadata alone cannot confirm them — the schema lives in `prisma/schema.prisma`,
+and `@unique` is emitted as a bare `CREATE UNIQUE INDEX`, which is **invisible in
+`information_schema.table_constraints`** (that view lists constraints only).
+
+| Claim | Where |
+|---|---|
+| `sms_messages.reference` is unique | `prisma/schema.prisma:60` (`@unique`), `prisma/migrations/0_init/migration.sql:288` (`CREATE UNIQUE INDEX "sms_messages_reference_key"`) |
+| `cost` DB default is 0 | `prisma/schema.prisma:70` |
+| The real cost is only written over the placeholder 50 | `src/lib/sms-store.ts:48` and `:368` |
+| Stale-pending threshold is 48 h | `src/lib/sms-store.ts:201` |
+| The five statuses | `src/lib/sms-store.ts:19` |
+| Account-level provider failures are classified | `src/lib/sms.ts:61` and `:77` |
+| The application-code match is normalised | `src/lib/sms-policy.ts:70`, used at `src/app/api/messaging/send/route.ts:89` |
+| The status endpoint's response fields | `src/app/api/messaging/sms/[reference]/route.ts:97–130` |
+| No Prisma change on this branch | `git diff --stat main..HEAD -- prisma/` → empty |
+
+Reproduce the test result rather than trusting the number:
+
+```bash
+npm ci && npm test        # 364 tests, 0 fail
+npx eslint .              # clean
+npx tsc --noEmit          # only the pre-existing src/lib/data.ts errors
+```
+
+For the live index question, `pg_indexes` is the right catalog:
+
+```sql
+SELECT indexname, indexdef FROM pg_indexes
+ WHERE schemaname = 'public' AND tablename = 'sms_messages';
+```
+
 
 ---
 
