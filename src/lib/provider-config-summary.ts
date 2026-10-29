@@ -39,6 +39,21 @@ export interface ProviderConfigSummary {
   baseUrl: string
   /** True when the stored blob is the encrypted form rather than legacy plaintext. */
   encrypted: boolean
+  /**
+   * True when the blob IS encrypted but decryption failed — almost always
+   * because `APP_ENCRYPTION_KEY` was replaced after these credentials were
+   * saved.
+   *
+   * This has to be reported explicitly, because the fallback summary is
+   * indistinguishable from a healthy one: `_encrypted` makes `hasApiKey` true,
+   * while `accountNo` is simply empty (the value is inside the blob). The
+   * dashboard would otherwise show "API key set" for a row that no longer
+   * yields credentials at all — and `loadTenantProviderCredentials` swallows
+   * the decrypt error and falls back to the *platform* LivePay account, so
+   * that SACCO's payments silently start settling into the wrong merchant
+   * account instead of failing loudly.
+   */
+  undecryptable?: boolean
 }
 
 function str(value: unknown): string {

@@ -151,6 +151,8 @@ interface TenantProviderConfig {
     accountNo: string
     baseUrl: string
     encrypted: boolean
+    /** Stored encrypted, but will not open under the current APP_ENCRYPTION_KEY. */
+    undecryptable?: boolean
   }
   isActive: boolean
   createdAt: string
@@ -1920,6 +1922,19 @@ export default function SetupPage() {
                           </div>
 
                           {/* Credentials Grid */}
+                          {summary?.undecryptable && (
+                            <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs space-y-1">
+                              <p className="font-semibold text-destructive">
+                                These credentials cannot be decrypted with the current APP_ENCRYPTION_KEY.
+                              </p>
+                              <p className="text-muted-foreground">
+                                They were saved under a different key, so this SACCO is silently falling back to
+                                the platform LivePay account — its payments will settle into the wrong merchant
+                                account. Re-enter its LivePay API key and account number to fix it.
+                              </p>
+                            </div>
+                          )}
+
                           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs bg-muted/40 p-3 rounded-md font-mono">
                             <div>
                               <span className="text-muted-foreground block text-[10px] uppercase font-sans">
