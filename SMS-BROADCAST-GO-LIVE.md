@@ -63,29 +63,61 @@ directions.
 ## 3. Verification
 
 ```
-npm test        343 tests, 343 pass, 0 fail      (325 before, +18 new)
+npm test        357 tests, 357 pass, 0 fail      (325 before, +32 new)
 npx eslint      clean on every changed file
 npx tsc --noEmit 12 errors, all pre-existing in src/lib/data.ts
 ```
+
+Two suites, deliberately different in kind.
+
+**`tests/sms-partner-flow.test.ts` (18)** — each module in isolation: the code
+comparison, the 403 body, the rejection reason, the `unknown` flag, masking.
+
+**`tests/sms-paths-e2e.test.ts` (14)** — the modules **chained**, because that is
+a different claim: the names one module writes are the names the next one reads.
+It drives the real `POST /api/messaging/send` → real `smsStore.createOrGet` →
+real `smsQueue.processBatch` → real Africa's Talking DLR route → real
+`deliverSmsNotification` → real `GET /api/messaging/sms/:reference`. Only the
+database, the socket and the AT SDK are replaced; **HMAC signing is the shipped
+code**, and a test verifies the emitted notification with the documented receiver
+algorithm (plus wrong secret, tampered body and replayed timestamp, each of which
+must fail).
+
+What that surfaces that units cannot:
+
+| Assertion | Why it matters |
+|---|---|
+| submit → send → DLR → notify → read, one reference end to end | the reference the partner joins on is the reference we gave it |
+| the 403 creates **no row** | the actual reason the messaging dashboard was empty — nothing to diagnose |
+| a duplicate DLR cannot rewrite a terminal row | first terminal report wins; the partner is not told twice |
+| a forged DLR is 401 and leaves the row `pending` | an unauthenticated caller cannot settle a message |
+| a partner 500 leaves `notificationDeliveredAt` null | delivery is not claimed when it was not acknowledged |
+| a provider rejection notifies on the **cron tick**, not inline | `processBatch` never blocks on a partner endpoint |
+| `CHURCH` / `Church` / `"  church  "` all resolve in **quick-send** | the dashboard path, which 404'd before the fallback |
+| `unknown` is silent by default and notifies when opted in | the flag behaves at both ends of the chain |
+| daily ceiling returns 429 + `Retry-After` and creates no row | the refusal does not poison the next send |
+
+**Live server check** (`next dev`, real HTTP, no database): the middleware
+exemption was proven on the wire rather than inferred from a regex —
+
+```
+GET  /api/messaging/sms/ANY       401 {"error":"Invalid or missing API key"}   ← the route answered
+GET  /api/messaging/sms-admin     503 {"error":"Auth not configured"}          ← the session gate answered
+GET  /api/messaging/dashboard     503 {"error":"Auth not configured"}          ← the session gate answered
+GET  /api/messaging/sms-admin     503                                          ← prefix safety holds
+POST /api/messaging/send (bad key) 401 {"error":"Invalid or missing API key"}
+POST /api/qstash/sms-cron          401 {"error":"Unauthorized"}
+```
+
+The `sms-admin` / `dashboard` responses are the Supabase gate failing closed in
+this sandbox (no auth env), which is the proof that the gate *ran* on those paths
+and not on the exempted one. A DB outage on the send route also returned 401:
+it fails closed, it does not fail open.
 
 The `src/lib/data.ts` errors and the `next build` type-check failure are
 environmental: `prisma generate` cannot download its engine in this sandbox. They
 are identical with these changes stashed (`git stash` → still 12). Webpack
 compiles the new route successfully.
-
-`tests/sms-partner-flow.test.ts` covers, driving the **real** route handlers:
-
-* `CHURCH`, `Church`, ` church `, `CHURCH\n` all queue (202) and are billed to the
-  stored code; `sacco` is still 403 **and the error names `church`**;
-* omitted `applicationCode` still works; an unknown API key is still 401 and never
-  reaches the code check;
-* status read: own reference 200, another application's reference **404 not 403**,
-  missing key 401, delivery report and partner-acknowledgement surfaced, recipient
-  masked;
-* the provider's status word survives `sendSmsViaProvider` → `failExplicitly`
-  → `failure_reason`, and `processBatch` keeps its exact return shape;
-* `unknown` notifications off by default, on with `SMS_NOTIFY_UNKNOWN=true`,
-  while `delivered`/`failed` are unaffected.
 
 ---
 
