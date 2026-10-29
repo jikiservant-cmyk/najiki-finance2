@@ -101,12 +101,18 @@ export async function sendSmsViaProvider(to: string, message: string, fromSender
       const explicitRejection = /^(failed|rejected|invalidsenderid|invalidphonenumber|insufficientbalance|invalidnumber|invalidphone|invalid)$/i.test(status)
       if (!explicitRejection) throw new Error('Provider outcome unknown')
       console.warn("[Africa's Talking] Provider explicitly rejected SMS")
+      // `providerStatus` carries the provider's own word (InvalidSenderId,
+      // InsufficientBalance, …) to the caller so it can be persisted. Without
+      // it every rejection was stored as the same opaque string and an operator
+      // could not tell an expired sender ID from an empty account balance.
       return {
         success: false,
         providerId: recipientData?.messageId,
         error: 'Provider rejected SMS',
+        providerStatus: status,
       }
     }
+
 
     return { 
       success: true, 

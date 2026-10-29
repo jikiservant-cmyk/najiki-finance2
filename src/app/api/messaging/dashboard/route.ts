@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { smsStore } from '@/lib/sms-store'
 import { db } from '@/lib/db'
 import { requireSuperAdmin } from '@/lib/auth'
+import { maskRecipient } from '@/lib/recipient-mask'
 
 type GroupRow = { _count: number; _sum?: { cost?: number | null } }
 type AppGroupRow = GroupRow & { applicationCode: string; status: string }
@@ -113,6 +114,13 @@ export async function GET() {
       providerCode: m.providerCode === 'africastalking' ? "Africa's Talking" : String(m.providerCode).toUpperCase(),
       createdAt: m.createdAt,
       cost: m.status === 'delivered' ? m.cost : 0,
+      // These three are what turn a red badge into a diagnosis: whether the
+      // provider was ever reached (providerMessageId), how many times we tried
+      // (attemptCount), and why it failed (failureReason). They were stored but
+      // never returned, so an operator could see "failed" and nothing else.
+      attemptCount: m.attemptCount ?? 0,
+      providerMessageId: m.providerMessageId ?? null,
+      failureReason: m.failureReason ?? null,
     }))
 
     return NextResponse.json(
@@ -143,10 +151,4 @@ export async function GET() {
     console.error('Messaging dashboard error:', error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
-}
-
-function maskRecipient(recipient: string): string {
-  const value = String(recipient || '')
-  if (value.length <= 4) return value
-  return `${value.slice(0, 4)}${'*'.repeat(Math.max(value.length - 6, 1))}${value.slice(-2)}`
 }

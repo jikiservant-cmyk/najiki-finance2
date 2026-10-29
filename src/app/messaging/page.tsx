@@ -20,6 +20,7 @@ interface MessagingDashboardData {
     id: string; reference: string; application: string; applicationCode: string
     recipient: string; status: string; providerCode: string
     createdAt: string; cost: number
+    attemptCount?: number; providerMessageId?: string | null; failureReason?: string | null
   }[]
   totalCost: number
 }
@@ -325,7 +326,7 @@ export default function MessagingDashboard() {
                   <table className="w-full text-left">
                     <thead>
                       <tr className="border-b border-border/50">
-                        {['Recipient', 'App', 'Provider', 'Date', 'Status'].map(h => (
+                        {['Recipient', 'App', 'Provider', 'Date', 'Status', 'Detail'].map(h => (
                           <th key={h} className="text-[10px] font-mono tracking-[0.15em] text-muted-foreground uppercase pb-3 pr-4">{h}</th>
                         ))}
                       </tr>
@@ -340,6 +341,14 @@ export default function MessagingDashboard() {
                           <td className="text-xs font-mono text-muted-foreground py-2.5 pr-4">{m.providerCode}</td>
                           <td className="text-xs font-mono text-muted-foreground py-2.5 pr-4">{fmtDate(m.createdAt)}</td>
                           <td className="py-2.5"><span className={`text-[10px] font-mono tracking-wider px-2.5 py-1 rounded-md ${statusColors[m.status] || ''}`}>{m.status}</span></td>
+                          {/* Without this column "failed" is the whole story: the
+                              provider's own reason, whether it was ever reached,
+                              and how many attempts were made were all stored but
+                              never shown. */}
+                          <td className="text-[10px] font-mono text-muted-foreground py-2.5 max-w-[220px] truncate" title={m.failureReason || m.providerMessageId || ''}>
+                            {m.failureReason
+                              || (m.providerMessageId ? `accepted · ${m.attemptCount ?? 0}×` : `not reached · ${m.attemptCount ?? 0}×`)}
+                          </td>
                         </motion.tr>
                       ))}
                     </tbody>

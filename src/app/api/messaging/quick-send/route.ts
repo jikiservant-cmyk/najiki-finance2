@@ -50,8 +50,19 @@ export async function POST(request: Request) {
     }
 
     // 2. Resolve target application
-    const appCode = applicationCode || 'church'
-    const application = await db.application.findFirst({ where: { code: appCode, isActive: true } })
+    //
+    // Exact match first (the common case, one indexed lookup), then a
+    // case-insensitive retry. The dropdown sends the stored code, but a
+    // hand-edited value or one pasted with different casing used to resolve to
+    // nothing and return "Active application not found" — a 404 that reads like
+    // a missing app rather than a formatting difference.
+    const appCode = String(applicationCode || 'church').trim()
+    let application = await db.application.findFirst({ where: { code: appCode, isActive: true } })
+    if (!application) {
+      application = await db.application.findFirst({
+        where: { code: { equals: appCode, mode: 'insensitive' }, isActive: true },
+      })
+    }
     if (!application) return NextResponse.json({ error: 'Active application not found' }, { status: 404 })
 
     // Apply the same atomic application ceiling as partner requests. Admin
