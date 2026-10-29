@@ -44,6 +44,12 @@ function thresholds() {
     stuckPaymentCount: Number(process.env.ALERT_STUCK_PAYMENT_COUNT || 5),
     exhaustedNotifications: Number(process.env.ALERT_EXHAUSTED_NOTIFICATIONS || 1),
     smsQueueBacklog: Number(process.env.ALERT_SMS_QUEUE_BACKLOG || 100),
+    // Count-based backlog alerting cannot see this failure. A single queued
+    // message that never gets claimed means the drain is not running, and that
+    // is a total outage of SMS delivery — not a backlog of 100. Observed live:
+    // four rows, two of them stuck at `queued` for over an hour, well under the
+    // count threshold.
+    smsQueueLagMinutes: Number(process.env.ALERT_SMS_QUEUE_LAG_MINUTES || 15),
     failedSmsCount: Number(process.env.ALERT_FAILED_SMS || 20),
     walletDriftWallets: Number(process.env.ALERT_WALLET_DRIFT_WALLETS || 1),
     retryWorkerLagMinutes: Number(process.env.ALERT_RETRY_WORKER_LAG_MINUTES || 15),
@@ -187,14 +193,44 @@ async function handleAlerts(request: Request) {
 
     // ── 4. SMS backlog / failures ───────────────────────────────────────────
     try {
-      const [queued, failed] = await Promise.all([
+      const [queued, failed, oldestQueued] = await Promise.all([
         db.smsMessage.count({ where: { status: { in: ['queued', 'pending'] } } }),
         db.smsMessage.count({
           where: { status: 'failed', updatedAt: { gte: new Date(Date.now() - 60 * 60 * 1000) } },
         }),
+        // `getDueQueued` applies no backoff and `nextAttemptAt` is never set to a
+        // future date, so a queued row is always due. Age therefore measures the
+        // drain, not the row.
+        db.smsMessage.findFirst({
+          where: { status: 'queued' },
+          orderBy: { createdAt: 'asc' },
+          select: { createdAt: true },
+        }),
       ])
       metrics.smsQueued = queued
       metrics.smsFailedLastHour = failed
+
+      const queueLagMinutes = oldestQueued?.createdAt
+        ? Math.max(0, Math.round((Date.now() - new Date(oldestQueued.createdAt).getTime()) / 60000))
+        : 0
+      metrics.smsOldestQueuedMinutes = queueLagMinutes
+
+      if (queueLagMinutes >= limits.smsQueueLagMinutes) {
+        alerts.push({
+          id: 'sms-queue-stalled',
+          severity: 'critical',
+          title: `Oldest queued SMS has waited ${queueLagMinutes} minutes`,
+          // Deliberately not "backlog": one stuck message blocks every send
+          // behind it, and the failure is otherwise invisible in the dashboard.
+          detail:
+            'Nothing is draining the SMS queue. The workers are QStash schedules, whose ' +
+            'destinations are absolute URLs baked in at registration — a domain move leaves ' +
+            'them pointing at the old host and every run fails silently. Verify with: ' +
+            'npx tsx scripts/setup-cron-schedules.ts --verify',
+          value: queueLagMinutes,
+          threshold: limits.smsQueueLagMinutes,
+        })
+      }
 
       if (queued >= limits.smsQueueBacklog) {
         alerts.push({

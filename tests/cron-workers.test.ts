@@ -381,6 +381,8 @@ type AlertsHarness = {
 function loadAlertsWorker(options: {
   overdueNotifications?: number
   oldestNextRetryAt?: Date | null
+  queuedSmsCount?: number
+  oldestQueuedSmsAt?: Date | null
 } = {}): AlertsHarness {
   const alertsSent: any[] = []
 
@@ -402,6 +404,15 @@ function loadAlertsWorker(options: {
   db.internalNotification.findFirst = async () => {
     const nextRetryAt = options.oldestNextRetryAt ?? null
     return nextRetryAt ? { nextRetryAt } : null
+  }
+
+  // The failed-last-hour counter must stay at zero unless a test asks for it,
+  // otherwise a large queued count would raise an unrelated failure alert.
+  db.smsMessage.count = async (args: any = {}) =>
+    args.where?.status === 'failed' ? 0 : options.queuedSmsCount ?? 0
+  db.smsMessage.findFirst = async () => {
+    const createdAt = options.oldestQueuedSmsAt ?? null
+    return createdAt ? { createdAt } : null
   }
 
   const route = loadTsModule<{ GET: AlertsHarness['GET'] }>('src/app/api/cron/alerts/route.ts', {
@@ -467,6 +478,67 @@ test('cron(alerts): a healthy retry queue raises no stall alert', async () => {
 
     assert.equal(
       (body.alerts ?? []).some((alert: any) => alert.id === 'notification-worker-stalled'),
+      false
+    )
+  })
+})
+
+test('cron(alerts): a single queued SMS that never drains is reported as critical', async () => {
+  await withCronSecret(async () => {
+    const previous = process.env.ALERT_WEBHOOK_URL
+    process.env.ALERT_WEBHOOK_URL = 'https://alerts.najiki.test/hook'
+    // Above the default 15-minute lag threshold, far below the 100-message
+    // backlog threshold on purpose: this is the failure observed live, where two
+    // rows sat at `queued` for an hour and no count-based alert could see it.
+    process.env.ALERT_SMS_QUEUE_LAG_MINUTES = '15'
+    try {
+      const worker = loadAlertsWorker({
+        queuedSmsCount: 2,
+        oldestQueuedSmsAt: new Date(Date.now() - 60 * 60 * 1000),
+      })
+
+      const body: any = await worker.GET(cronRequest('/api/cron/alerts')).then((r) => r.json())
+
+      const stall = (body.alerts ?? []).find((alert: any) => alert.id === 'sms-queue-stalled')
+      assert.ok(stall, 'a queue that is not draining must be reported')
+      assert.equal(stall.severity, 'critical')
+      assert.ok(stall.value >= 59, `reported lag was ${stall.value}`)
+      assert.match(stall.detail, /setup-cron-schedules\.ts --verify/)
+      // The message must not blame a backlog: two rows are not a backlog.
+      assert.doesNotMatch(stall.title, /backlog/i)
+      assert.equal(body.metrics.smsOldestQueuedMinutes >= 59, true)
+      assert.equal(worker.alertsSent.length >= 1, true)
+    } finally {
+      delete process.env.ALERT_SMS_QUEUE_LAG_MINUTES
+      if (previous === undefined) delete process.env.ALERT_WEBHOOK_URL
+      else process.env.ALERT_WEBHOOK_URL = previous
+    }
+  })
+})
+
+test('cron(alerts): a recently queued SMS is not an outage', async () => {
+  await withCronSecret(async () => {
+    const worker = loadAlertsWorker({
+      queuedSmsCount: 2,
+      oldestQueuedSmsAt: new Date(Date.now() - 20 * 1000),
+    })
+
+    const body: any = await worker.GET(cronRequest('/api/cron/alerts')).then((r) => r.json())
+
+    assert.equal(
+      (body.alerts ?? []).some((alert: any) => alert.id === 'sms-queue-stalled'),
+      false
+    )
+    assert.equal(body.metrics.smsOldestQueuedMinutes, 0)
+  })
+})
+
+test('cron(alerts): an empty queue reports no lag', async () => {
+  await withCronSecret(async () => {
+    const worker = loadAlertsWorker({ queuedSmsCount: 0, oldestQueuedSmsAt: null })
+    const body: any = await worker.GET(cronRequest('/api/cron/alerts')).then((r) => r.json())
+    assert.equal(
+      (body.alerts ?? []).some((alert: any) => alert.id === 'sms-queue-stalled'),
       false
     )
   })

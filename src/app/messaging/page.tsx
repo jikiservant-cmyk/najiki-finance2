@@ -179,6 +179,21 @@ export default function MessagingDashboard() {
     ? Math.max(...safeData.dailyVolume.map(d => d.volume), 1) 
     : 1
 
+  // A queued message that has waited is not a backlog, it is every send behind
+  // it: `getDueQueued` applies no backoff and `nextAttemptAt` is never set to a
+  // future date, so a queued row is always due. If one is still queued minutes
+  // later, nothing is calling `/api/qstash/sms-cron` — and that failure is
+  // otherwise completely silent, because the rows look like ordinary work in
+  // progress. The worker schedules are QStash entries whose destination URLs
+  // were baked in at registration, so a domain move breaks them without any
+  // deploy failing.
+  const STALLED_QUEUE_MINUTES = 5
+  const queuedAges = safeData.recentMessages
+    .filter((m) => m.status === 'queued' && m.createdAt)
+    .map((m) => (Date.now() - new Date(m.createdAt).getTime()) / 60000)
+  const queueStalledMinutes = queuedAges.length > 0 ? Math.round(Math.max(...queuedAges)) : 0
+  const queueStalled = queueStalledMinutes >= STALLED_QUEUE_MINUTES
+
   return (
     <main className="min-h-screen relative">
       <FloatingGeometry />
@@ -356,6 +371,18 @@ export default function MessagingDashboard() {
                 <div className="flex items-center justify-between mb-4">
                   <span className="text-[10px] font-mono tracking-[0.2em] text-muted-foreground uppercase">Recent Messages</span>
                 </div>
+                {queueStalled && (
+                  <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs space-y-1">
+                    <p className="font-semibold text-destructive">
+                      The send queue is not being drained — oldest queued message has waited {queueStalledMinutes} minutes.
+                    </p>
+                    <p className="text-muted-foreground">
+                      Queued rows below are not in flight; nothing has claimed them. The worker is a QStash schedule
+                      pointing at an absolute URL, so check it resolves to this deployment:
+                      <span className="font-mono"> scripts/setup-cron-schedules.ts --verify</span>
+                    </p>
+                  </div>
+                )}
                 <div className="overflow-x-auto">
                   <table className="w-full text-left">
                     <thead>
