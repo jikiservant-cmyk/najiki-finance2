@@ -21,6 +21,8 @@ interface MessagingDashboardData {
     recipient: string; status: string; providerCode: string
     createdAt: string; cost: number
     attemptCount?: number; providerMessageId?: string | null; failureReason?: string | null
+    /** Sender ID used for this dispatch; null means the provider default. */
+    senderId?: string | null
   }[]
   totalCost: number
 }
@@ -409,6 +411,7 @@ export default function MessagingDashboard() {
                           <td className="text-[10px] font-mono text-muted-foreground py-2.5 max-w-[220px] truncate" title={m.failureReason || m.providerMessageId || ''}>
                             {m.failureReason
                               || (m.providerMessageId ? `accepted · ${m.attemptCount ?? 0}×` : `not reached · ${m.attemptCount ?? 0}×`)}
+                            {!m.failureReason && m.senderId ? ` · from ${m.senderId}` : ''}
                           </td>
                         </motion.tr>
                       ))}

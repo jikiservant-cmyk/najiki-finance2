@@ -121,6 +121,13 @@ export async function GET() {
       attemptCount: m.attemptCount ?? 0,
       providerMessageId: m.providerMessageId ?? null,
       failureReason: m.failureReason ?? null,
+      // The sender ID the message was dispatched with, or null when the
+      // provider's account default was used. Partner sends may supply one and
+      // dashboard sends never do, so without this the two are
+      // indistinguishable in a list that otherwise looks identical — and an
+      // unapproved sender ID is accepted by the provider and then never
+      // routed, which reads as "sent but the phone never rang".
+      senderId: m.senderId ?? null,
     }))
 
     return NextResponse.json(
