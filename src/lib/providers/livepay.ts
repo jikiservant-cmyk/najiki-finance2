@@ -18,17 +18,103 @@ function cleanEnvUrl(raw?: string | null): string {
   return raw.trim().replace(/^["']+|["']+$/g, '').trim()
 }
 
+export type LivePayProxySource =
+  | 'explicit'
+  | 'LIVEPAY_PROXY_URL'
+  | 'QUOTAGUARDSTATIC_URL'
+  | 'FIXIE_URL'
+
+export function resolveLivePayProxy(explicitProxyUrl?: string | null): {
+  url: string
+  source: LivePayProxySource | null
+} {
+  const explicit = cleanEnvUrl(explicitProxyUrl)
+  if (explicit) return { url: explicit, source: 'explicit' }
+  const envUrl = cleanEnvUrl(process.env.LIVEPAY_PROXY_URL)
+  if (envUrl) return { url: envUrl, source: 'LIVEPAY_PROXY_URL' }
+  const quotaGuard = cleanEnvUrl(process.env.QUOTAGUARDSTATIC_URL)
+  if (quotaGuard) return { url: quotaGuard, source: 'QUOTAGUARDSTATIC_URL' }
+  const fixie = cleanEnvUrl(process.env.FIXIE_URL)
+  if (fixie) return { url: fixie, source: 'FIXIE_URL' }
+  return { url: '', source: null }
+}
+
 export function resolveLivePayProxyUrl(explicitProxyUrl?: string | null): string {
+  return resolveLivePayProxy(explicitProxyUrl).url
+}
+
+/**
+ * The static-IP egress proxy refused the CONNECT tunnel, so the request never
+ * reached LivePay. This is an infrastructure/vendor failure — not LivePay
+ * rejecting the payment and not bad SACCO credentials — and operators need the
+ * HTTP status line plus the exact env var to fix.
+ *
+ * `connectStatus === 0` means we never got an HTTP response from the proxy at
+ * all (connection refused, DNS failure, invalid proxy URL).
+ */
+export class LivePayProxyConnectError extends Error {
+  readonly connectStatus: number
+  readonly statusLine: string
+  readonly proxyHost: string
+  readonly proxySource: string
+
+  constructor(opts: {
+    connectStatus: number
+    statusLine: string
+    proxyHost: string
+    proxySource: string
+  }) {
+    super(describeStaticProxyConnectFailure(opts))
+    this.name = 'LivePayProxyConnectError'
+    this.connectStatus = opts.connectStatus
+    this.statusLine = opts.statusLine
+    this.proxyHost = opts.proxyHost
+    this.proxySource = opts.proxySource
+  }
+}
+
+export function describeStaticProxyConnectFailure(opts: {
+  connectStatus: number
+  statusLine: string
+  proxyHost: string
+  proxySource: string
+}): string {
+  const { connectStatus, statusLine, proxyHost, proxySource } = opts
+  const via = `${proxySource} → ${proxyHost}`
+
+  let action: string
+  if (connectStatus === 402) {
+    action =
+      `The proxy vendor refused service with HTTP 402 Payment Required — its account is out of credits ` +
+      `or billing is past due. Top up the proxy account, or point ${proxySource} at a static-IP proxy with balance.`
+  } else if (connectStatus === 407) {
+    action =
+      `The proxy rejected our credentials with HTTP 407 — fix the username:password embedded in ${proxySource}.`
+  } else if (connectStatus === 403 || connectStatus === 511) {
+    action =
+      `The proxy policy blocked the tunnel (HTTP ${connectStatus}) — check the proxy vendor dashboard ` +
+      `for a suspended account or IP restrictions.`
+  } else if (connectStatus === 0) {
+    action =
+      `No HTTP response from the proxy — verify ${proxySource} is a reachable proxy URL ` +
+      `(http://user:pass@host:port) and that this deployment can connect to it.`
+  } else if (connectStatus >= 500) {
+    action =
+      `The proxy could not reach LivePay (HTTP ${connectStatus}) — likely a transient proxy outage; ` +
+      `check the vendor status page or retry.`
+  } else {
+    action = `The proxy refused the tunnel (HTTP ${connectStatus}) — check ${proxySource} and the proxy vendor account.`
+  }
+
   return (
-    cleanEnvUrl(explicitProxyUrl) ||
-    cleanEnvUrl(process.env.LIVEPAY_PROXY_URL) ||
-    cleanEnvUrl(process.env.QUOTAGUARDSTATIC_URL) ||
-    cleanEnvUrl(process.env.FIXIE_URL)
+    `Static IP proxy error via ${via}: CONNECT failed (${statusLine}). ${action} ` +
+    `LivePay was never contacted, so no PIN was sent.`
   )
 }
 
 function openConnectTunnel(
   proxyUrl: URL,
+  proxySource: string,
   targetHost: string,
   targetPort: number,
   signal?: AbortSignal | null
@@ -36,6 +122,7 @@ function openConnectTunnel(
   return new Promise((resolve, reject) => {
     const proxyIsTls = proxyUrl.protocol === 'https:'
     const proxyPort = proxyUrl.port ? Number(proxyUrl.port) : proxyIsTls ? 443 : 80
+    const proxyHost = `${proxyUrl.hostname}:${proxyPort}`
 
     const socket: net.Socket = proxyIsTls
       ? tls.connect({
@@ -70,7 +157,21 @@ function openConnectTunnel(
       )
     }
 
-    socket.once('error', finishError)
+    // At this stage the only socket is our connection to the proxy itself, so
+    // any error here means we could not even reach the proxy host (refused,
+    // DNS, TLS to proxy) — classify it as a proxy failure, not a LivePay one.
+    const onTunnelSocketError = (err: Error) => {
+      finishError(
+        new LivePayProxyConnectError({
+          connectStatus: 0,
+          statusLine: `connection to proxy failed: ${err.message}`,
+          proxyHost,
+          proxySource,
+        })
+      )
+    }
+
+    socket.once('error', onTunnelSocketError)
 
     const sendConnect = () => {
       const hostAuthority = `${targetHost}:${targetPort}`
@@ -107,12 +208,19 @@ function openConnectTunnel(
         const statusCode = match ? Number(match[1]) : 0
 
         if (statusCode !== 200) {
-          finishError(new Error(`Static IP proxy CONNECT failed (${statusLine || 'invalid response'})`))
+          finishError(
+            new LivePayProxyConnectError({
+              connectStatus: statusCode,
+              statusLine: statusLine || 'invalid response',
+              proxyHost,
+              proxySource,
+            })
+          )
           return
         }
 
         settled = true
-        socket.removeListener('error', finishError)
+        socket.removeListener('error', onTunnelSocketError)
         if (leftover.length > 0) {
           socket.unshift(leftover)
         }
@@ -135,18 +243,31 @@ export async function livePayFetch(
   init?: RequestInit,
   explicitProxyUrl?: string | null
 ): Promise<Response> {
-  const rawProxy = resolveLivePayProxyUrl(explicitProxyUrl)
-  if (!rawProxy) {
+  const proxy = resolveLivePayProxy(explicitProxyUrl)
+  if (!proxy.url) {
     return globalThis.fetch(input, init)
   }
 
-  const proxyUrl = new URL(rawProxy)
+  const proxySource = proxy.source || 'LIVEPAY_PROXY_URL'
+  let proxyUrl: URL
+  try {
+    proxyUrl = new URL(proxy.url)
+  } catch (err: any) {
+    // A malformed proxy URL is an operator config error, not a LivePay outage.
+    throw new LivePayProxyConnectError({
+      connectStatus: 0,
+      statusLine: `invalid proxy URL in ${proxySource}: ${err?.message || 'unparseable URL'}`,
+      proxyHost: '(unparsed)',
+      proxySource,
+    })
+  }
   const targetUrl = typeof input === 'string' ? new URL(input) : input
   const isTargetHttps = targetUrl.protocol === 'https:'
   const targetPort = targetUrl.port ? Number(targetUrl.port) : isTargetHttps ? 443 : 80
 
   const rawTunnelSocket = await openConnectTunnel(
     proxyUrl,
+    proxySource,
     targetUrl.hostname,
     targetPort,
     init?.signal
@@ -366,6 +487,22 @@ export class LivePayProvider implements PaymentProvider {
         failureReason: livePayError || `LivePay rejected (HTTP ${response.status})`,
       }
     } catch (error: any) {
+      // The static-IP proxy refused the tunnel (e.g. HTTP 402 Payment Required
+      // = the proxy vendor account is out of credit). LivePay never saw the
+      // request, so this must NOT be reported as a LivePay/network failure —
+      // it is an infrastructure failure with its own operator action.
+      if (error instanceof LivePayProxyConnectError) {
+        console.error(
+          `[LivePay] collect-money BLOCKED before LivePay by static IP proxy ref=${params.reference} ` +
+            `source=${error.proxySource} host=${error.proxyHost} connectStatus=${error.connectStatus} ` +
+            `status="${error.statusLine}"`
+        )
+        return {
+          success: false,
+          status: 'failed',
+          failureReason: error.message,
+        }
+      }
       const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError' || String(error?.message).includes('timeout')
       console.error(`[LivePay] collect-money fetch failed ref=${params.reference} timeout=${isTimeout} error=${error?.message} stack=${error?.stack?.slice(0,300)}`)
       return {
