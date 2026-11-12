@@ -26,6 +26,7 @@ import { resolveTenantForApplication } from '@/lib/tenant-resolution'
 import { isPlatformFeeType, appRequiresTenantCredentials } from '@/lib/constants'
 import { checkRateLimit, clientIdentifier } from '@/lib/rate-limit'
 import { findApplicationByApiKey } from '@/lib/application-auth'
+import { presentPaymentFailure } from '@/lib/payment-errors'
 
 function generateReference(appCode: string, typeCode?: string): string {
   const time = Date.now().toString(16).slice(-8).toUpperCase()
@@ -430,22 +431,28 @@ export async function handleCreatePaymentIntent(request: Request) {
 
     // Surface provider rejection with an explicit non-2xx status so partner apps
     // never display a fake "waiting for PIN prompt" screen when no PIN was sent.
+    // The status depends on WHO failed: LivePay rejecting the collection is a 422
+    // (fix the request/credentials), while our static proxy or egress being down
+    // is a 502 with an operator action — LivePay was never contacted in that case.
     if (finalStatus === 'failed') {
-      console.error(`[payments] LivePay failed for ${reference} source=${credentialSource} phone=${String(validatedBody.phoneNumber).slice(0,4)}**** reason=${finalFailure}`)
+      const failure = presentPaymentFailure(finalFailure)
+      console.error(
+        `[payments] ${failure.code} for ${reference} source=${credentialSource} phone=${String(validatedBody.phoneNumber).slice(0, 4)}**** status=${failure.httpStatus} reason=${finalFailure}`
+      )
       return NextResponse.json(
         {
-          error: finalFailure
-            ? `Payment provider rejected collection: ${finalFailure}`
-            : 'Payment provider rejected collection request.',
+          error: failure.error,
+          code: failure.code,
+          retryable: failure.retryable,
           paymentId: paymentIntent.id,
           reference: paymentIntent.reference,
           status: finalStatus,
           credentialSource,
           failureReason: finalFailure,
           providerPaymentId: finalProviderId,
-          hint: 'PIN not sent — verify SACCO LivePay Account Number + API Key in Setup and phone number.',
+          hint: failure.hint,
         },
-        { status: 422 }
+        { status: failure.httpStatus }
       )
     }
 

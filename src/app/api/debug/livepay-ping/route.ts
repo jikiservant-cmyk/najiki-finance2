@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server'
 import { requireSuperAdmin } from '@/lib/auth'
 import { getPaymentProvider } from '@/lib/providers'
-import { resolveLivePayProxyUrl } from '@/lib/providers/livepay'
+import { resolveLivePayProxy } from '@/lib/providers/livepay'
+import { classifyPaymentFailure } from '@/lib/payment-errors'
 import { resolveTenantOrPlatformCredentials } from '@/lib/tenant-credentials'
 import { resolveTenantForApplication } from '@/lib/tenant-resolution'
 import { db } from '@/lib/db'
@@ -93,7 +94,9 @@ export async function GET(request: Request) {
     })
 
     const ipBlockMatch = /IP\s+([\d.:a-fA-F]+)\s+not allowed/i.exec(result.failureReason || '')
-    const staticProxyActive = Boolean(resolveLivePayProxyUrl())
+    const proxyConfig = resolveLivePayProxy()
+    const staticProxyActive = Boolean(proxyConfig.url)
+    const proxyTunnelFailed = classifyPaymentFailure(result.failureReason) === 'proxy_unavailable'
 
     return NextResponse.json({
       ok: result.success,
@@ -104,6 +107,7 @@ export async function GET(request: Request) {
       livepayAccount: (creds?.accountNo || process.env.LIVEPAY_ACCOUNT_NO || '').slice(0,4) + '****',
       livepayBaseUrl: creds?.baseUrl || process.env.LIVEPAY_BASE_URL || 'https://livepay.me',
       staticEgressProxyConfigured: staticProxyActive,
+      staticEgressProxySource: proxyConfig.source,
       detectedOutboundIp: ipBlockMatch ? ipBlockMatch[1] : null,
       nextAuthUrl: process.env.NEXTAUTH_URL || null,
       hostedAt: request.headers.get('host'),
@@ -112,7 +116,9 @@ export async function GET(request: Request) {
       willPinFire: result.success && result.status === 'processing',
       hint: result.success
         ? 'LivePay accepted → PIN should fire within 5s to phone. Check phone for USSD *165# prompt.'
-        : ipBlockMatch
+        : proxyTunnelFailed
+          ? `Static IP proxy ${proxyConfig.source || 'LIVEPAY_PROXY_URL'} refused the tunnel BEFORE LivePay: ${result.failureReason} This is proxy-vendor billing/config — not LivePay and not these credentials. Top up the proxy vendor or fix the proxy URL, then re-run this ping.`
+          : ipBlockMatch
           ? staticProxyActive
             ? `Static proxy outbound IP ${ipBlockMatch[1]} is not yet added to LivePay IP Whitelist for account ${(creds?.accountNo || process.env.LIVEPAY_ACCOUNT_NO || '').slice(0,4)}****. Add ${ipBlockMatch[1]} once in partners.livepay.me → Developer Portal → IP Whitelist!`
             : `LivePay account ${(creds?.accountNo || process.env.LIVEPAY_ACCOUNT_NO || '').slice(0,4)}**** blocked dynamic serverless IP ${ipBlockMatch[1]}. Either delete ALL IP entries on that exact LivePay account (LivePay rejects 0.0.0.0/0 CIDR syntax) OR set LIVEPAY_PROXY_URL in Netlify env to a static outbound proxy IP and whitelist that one static IP in LivePay.`
